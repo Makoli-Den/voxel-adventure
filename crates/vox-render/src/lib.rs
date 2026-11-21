@@ -28,7 +28,10 @@ pub trait Renderer {
     ///
     /// # Errors
     /// Returns an error if the GPU or the window surface fails irrecoverably.
-    /// After an error the renderer must not be used again: drop it.
+    /// After an error the renderer must not be used again: drop it. A frame that failed
+    /// halfway may leave a fence that is never signaled, so the next frame would wait for
+    /// it forever, and the freeing of replaced meshes is only proven safe for frames that
+    /// were fully submitted. Dropping is always safe: it waits for the GPU first.
     fn render_frame(&mut self) -> Result<(), RenderError>;
 
     /// Human-readable name of the GPU in use.

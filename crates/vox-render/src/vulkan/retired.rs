@@ -23,6 +23,11 @@
 //! unsubmitted command buffer refers to it. (A command buffer whose submit failed is
 //! never submitted later; the renderer is dropped after an error.) The stamp is
 //! therefore `submitted`, and the resource may be freed once `completed >= stamp`.
+//!
+//! Two more moments prove frames finished without the frame loop's wait: after
+//! `vkDeviceWaitIdle` all submitted frames are done, and a non-blocking poll that finds
+//! every slot's fence signaled proves the same ([`completed_when_polled`]). The second
+//! keeps the list bounded while no frames are drawn, for example in a minimized window.
 
 /// Resources waiting until the GPU can no longer use them.
 pub struct Retired<T> {
@@ -51,6 +56,12 @@ impl<T> Retired<T> {
         }
     }
 
+    /// Whether nothing is waiting.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     /// How many items are still waiting.
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -62,6 +73,26 @@ impl<T> Retired<T> {
 /// frames `0..completed` are known to be finished.
 pub fn can_free(stamp: u64, completed: u64) -> bool {
     completed >= stamp
+}
+
+/// How many frames are known to be finished when the fences of all slots were just
+/// polled without waiting: all `submitted` of them if every fence is signaled, otherwise
+/// nothing new is known (`None`).
+///
+/// Why "every slot fence signaled" proves that every submitted frame finished:
+/// - A slot's fence is reset only right before the submit that signals it again, and a
+///   failed submit ends the renderer's use. So a signaled fence means the last frame
+///   submitted in that slot has finished (or the slot was never used: fences start
+///   signaled).
+/// - Frame `k` uses slot `k % frames_in_flight` (derived from the frame number, see
+///   `frames::slot_index`), so the last `frames_in_flight` submitted frames lie in
+///   distinct slots, and each is the last frame of its slot: all of them finished.
+/// - Every earlier frame `k` had its fence waited on before frame `k + frames_in_flight`
+///   was recorded, which is one of the frames already submitted, so it finished too.
+///
+/// A fence that becomes signaled between two polls only makes the answer more true.
+pub fn completed_when_polled(submitted: u64, all_fences_signaled: bool) -> Option<u64> {
+    all_fences_signaled.then_some(submitted)
 }
 
 /// How many frames are known to be finished right after waiting on the fence of the slot
@@ -129,5 +160,38 @@ mod tests {
         assert_eq!(retired.len(), 1);
         retired.release(7);
         assert_eq!(retired.len(), 0);
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn all_fences_signaled_proves_every_submitted_frame_finished() {
+        assert_eq!(completed_when_polled(12, true), Some(12));
+        assert_eq!(completed_when_polled(0, true), Some(0));
+    }
+
+    #[test]
+    fn one_unsignaled_fence_proves_nothing_new() {
+        assert_eq!(completed_when_polled(12, false), None);
+    }
+
+    #[test]
+    fn a_poll_with_all_fences_signaled_frees_even_the_newest_retired_item() {
+        let mut retired = Retired::new();
+        // Retired after 12 submits, so frames up to 11 may use it; the poll shows all 12 done.
+        retired.retire("old mesh", 12);
+        if let Some(completed) = completed_when_polled(12, true) {
+            retired.release(completed);
+        }
+        assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn a_poll_with_a_busy_fence_keeps_everything() {
+        let mut retired = Retired::new();
+        retired.retire("old mesh", 12);
+        if let Some(completed) = completed_when_polled(12, false) {
+            retired.release(completed);
+        }
+        assert_eq!(retired.len(), 1);
     }
 }
