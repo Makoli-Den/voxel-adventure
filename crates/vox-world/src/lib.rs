@@ -1,4 +1,4 @@
-//! World data: blocks and chunks.
+//! World data: blocks, chunks and the world that holds them.
 //!
 //! This crate knows nothing about the graphics API, mods or networking. Other layers
 //! depend on it, but it depends on none of them (see `CLAUDE.md`, "Architecture").
@@ -8,9 +8,13 @@ mod chunk;
 mod chunk_pos;
 mod mesh;
 mod terrain;
+mod world;
 
 pub use block::BlockId;
 pub use chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, LocalPos};
 pub use chunk_pos::ChunkPos;
-pub use mesh::{ChunkMesh, ChunkVertex, Face, build_mesh, build_mesh_into};
-pub use terrain::{DIRT, GRASS, MAX_SURFACE, MIN_SURFACE, STONE, generate_terrain};
+pub use mesh::{
+    ChunkMesh, ChunkVertex, Face, build_mesh, build_mesh_into, build_mesh_with_neighbours_into,
+};
+pub use terrain::{DIRT, GRASS, MAX_SURFACE, MIN_SURFACE, STONE, generate_chunk, generate_terrain};
+pub use world::{Neighbours, World};
