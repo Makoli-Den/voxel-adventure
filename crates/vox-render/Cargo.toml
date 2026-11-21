@@ -1,0 +1,16 @@
+[package]
+name = "vox-render"
+version = "0.1.0"
+description = "Rendering layer. The only crate that knows about the graphics API."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ash = "0.38.0"
+ash-window = "0.13.0"
+raw-window-handle = "0.6.2"

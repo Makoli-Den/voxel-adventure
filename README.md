@@ -2,10 +2,11 @@
 
 A voxel game: the open world, freedom of action and world generation of Minecraft, combined with the adventure, difficulty and boss fights of Terraria. The top priority is speed: the game must be extremely fast and run on old devices. Mods, texture packs and shader packs are part of the core.
 
-> Status: very early. Right now the repository contains only the project skeleton and the first world data types.
+> Status: very early. The game opens a window, picks a GPU through Vulkan and clears the screen every frame. The world, mods and real rendering are still to come.
 
 ## Stack
 - A custom engine in **Rust**, graphics on **Vulkan** (`ash`). The decision and its reasons: [docs/decisions/0001-rust-vulkan-own-engine.md](docs/decisions/0001-rust-vulkan-own-engine.md)
+- Windowing with `winit`
 - Mods run in a sandbox (WASM or Lua), content is described by data
 - Rules for code, architecture and documentation: [CLAUDE.md](CLAUDE.md)
 
@@ -13,12 +14,13 @@ A voxel game: the open world, freedom of action and world generation of Minecraf
 ```
 crates/
   vox-world/   blocks and chunks; knows nothing about rendering, mods or networking
-  vox-game/    the executable, wires the layers together
+  vox-render/  rendering behind the `Renderer` trait; the only crate that touches Vulkan
+  vox-game/    the executable: window, event loop, wires the layers together
 docs/
   decisions/   records of decisions taken
   performance-notes.md
 ```
-Crates for rendering, mods and networking will appear once there is real code for them.
+Crates for mods and networking will appear once there is real code for them.
 
 ## Commands
 ```powershell

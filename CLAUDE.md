@@ -35,6 +35,15 @@ A voxel game in Rust: the open world and freedom of Minecraft, the adventure, di
 - Core logic is covered by tests.
 - One commit is one complete thought.
 
+## Working with agents
+The main session acts as a conductor; the roles live in `.claude/agents/`.
+- **Roles:** `architect` (plans, ADRs), `render-dev`, `world-dev` (code), `reviewer` (read-only review), `tester` (tests and benchmarks), `researcher` (cheap read-only lookups). More roles, for example for mods and networking, are added when that code exists.
+- **Models follow difficulty:** the strongest model for architecture and Vulkan, a mid-size model for ordinary code and review, the cheapest for lookups. Escalate the model when a task proves harder than expected.
+- **Split by interface, not inside a module.** One writing agent per set of files; never two writers on the same files. Tightly coupled code stays with one author.
+- **Reviewers only read.** Every meaningful change gets an independent review before it is committed.
+- **The conductor verifies.** Agent reports are claims, not facts: before committing, the conductor checks the findings and runs `cargo fmt`, `cargo clippy -D warnings` and `cargo test`.
+- **Memory:** each role reads `.claude/agent-memory/<role>/notes.md` at the start and appends short lessons at the end. The folder is local and not committed; the conductor prunes notes that became false.
+
 ## Documentation
 - Every module has a `//!` comment saying why it exists and what it contains.
 - Every public item has a `///` comment and, where appropriate, an example. `#![warn(missing_docs)]` is enabled.

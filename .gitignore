@@ -8,6 +8,9 @@
 perf.data*
 *.profraw
 
+# Local memory of the agent roles (see CLAUDE.md, "Working with agents")
+/.claude/agent-memory/
+
 # IDE
 .vs/
 .idea/
