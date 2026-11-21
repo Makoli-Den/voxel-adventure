@@ -9,7 +9,7 @@
 pub(crate) mod chunk;
 pub(crate) mod overlay;
 
-use naga::{Scalar, ShaderStage};
+use naga::Scalar;
 
 /// Push-constant bytes every Vulkan 1.0 device guarantees (`maxPushConstantsSize` is at
 /// least this). A pipeline that stays within it needs no capability check.
@@ -60,12 +60,38 @@ impl AttributeFormat {
         }
     }
 
-    /// Bytes the attribute occupies in a vertex.
+    /// Bytes the attribute occupies in a vertex: its components times the bytes each
+    /// one is stored in.
     pub(crate) const fn size(self) -> u32 {
+        self.components() * self.component_size()
+    }
+
+    /// Bytes one component is stored in, in the vertex buffer.
+    const fn component_size(self) -> u32 {
         match self {
-            Self::Uint8x4 | Self::Unorm8x4 => 4 * size_of::<u8>() as u32,
+            Self::Uint8x4 | Self::Unorm8x4 => size_of::<u8>() as u32,
             Self::Uint16 => size_of::<u16>() as u32,
-            Self::Float32x2 => 2 * F32_SIZE,
+            Self::Float32x2 => F32_SIZE,
+        }
+    }
+}
+
+/// A shader stage the pipelines use. Only these two exist in a graphics pipeline built
+/// by the renderer, so every match over it is exhaustive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// The vertex shader.
+    Vertex,
+    /// The fragment shader.
+    Fragment,
+}
+
+impl Stage {
+    /// The stage's name as error messages use it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Vertex => "vertex",
+            Self::Fragment => "fragment",
         }
     }
 }
@@ -85,7 +111,7 @@ pub(crate) struct VertexAttribute {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PushConstants {
     /// The only shader stage that may read them.
-    pub(crate) stage: ShaderStage,
+    pub(crate) stage: Stage,
     /// Size of the range in bytes.
     pub(crate) size: u32,
 }

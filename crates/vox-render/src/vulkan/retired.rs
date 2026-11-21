@@ -1,9 +1,9 @@
 //! Deferred freeing: GPU resources that frames still in flight may read.
 //!
 //! When a chunk mesh or the overlay is replaced or removed, frames that were already
-//! submitted can still draw its buffer. Waiting for the whole device to go idle on every change
-//! would stall the CPU and the GPU, so the old mesh is parked here instead, stamped
-//! with the frame number, and dropped once the fences prove no frame can use it.
+//! submitted can still draw its buffer. Waiting for the whole device to go idle on every
+//! change would stall the CPU and the GPU, so the old buffer is parked here instead,
+//! stamped with the frame number, and dropped once the fences prove no frame can use it.
 //!
 //! This module is pure bookkeeping, generic over what it holds, so the policy is
 //! unit tested without a GPU.

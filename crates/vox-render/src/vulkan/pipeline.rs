@@ -61,12 +61,12 @@ impl Pipeline {
 
     /// Compiles `overlay.vert` and `overlay.frag` from `shader_dir` and builds the
     /// overlay pipeline for `render_pass`: no depth test or write, no culling, and alpha
-    /// blending if `can_blend` (see [`supports_blending`]); otherwise opaque.
+    /// blending if `blending_supported` (see [`supports_blending`]); otherwise opaque.
     pub fn overlay(
         device: &ash::Device,
         render_pass: &RenderPass,
         shader_dir: &Path,
-        can_blend: bool,
+        blending_supported: bool,
     ) -> Result<Self, RenderError> {
         let spec = Spec {
             vertex_file: "overlay.vert",
@@ -74,7 +74,11 @@ impl Pipeline {
             interface: &overlay::INTERFACE,
             cull_mode: vk::CullModeFlags::NONE,
             depth: depth_ignored(),
-            blend: if can_blend { alpha_blended() } else { opaque() },
+            blend: if blending_supported {
+                alpha_blended()
+            } else {
+                opaque()
+            },
         };
         Self::new(device, render_pass, shader_dir, &spec)
     }
@@ -206,8 +210,7 @@ impl Drop for Pipeline {
 ///
 /// Vulkan 1.0 requires it for the common 8-bit formats (`B8G8R8A8_UNORM` among them),
 /// but a surface may offer another format first; enabling blending without this
-/// feature would make the pipeline invalid. Checks the potential format features: those
-/// of optimal and linear tiling together.
+/// feature would make the pipeline or its draws invalid. See [`can_blend`].
 pub fn supports_blending(context: &Context, gpu: &Gpu, format: vk::Format) -> bool {
     // SAFETY: the physical device was enumerated from this live instance.
     let properties = unsafe {
@@ -215,7 +218,18 @@ pub fn supports_blending(context: &Context, gpu: &Gpu, format: vk::Format) -> bo
             .instance()
             .get_physical_device_format_properties(gpu.physical(), format)
     };
-    (properties.optimal_tiling_features | properties.linear_tiling_features)
+    can_blend(properties)
+}
+
+/// Whether a swapchain image with these format properties can be blended into.
+///
+/// Only optimal tiling counts. Pipeline creation looks at the potential features (both
+/// tilings together), but every draw with blending enabled needs the feature on the
+/// image view it renders to (VUID-vkCmdDraw-blendEnable-04727), and swapchain images
+/// use optimal tiling. Optimal alone satisfies both rules.
+fn can_blend(properties: vk::FormatProperties) -> bool {
+    properties
+        .optimal_tiling_features
         .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
 }
 
@@ -329,6 +343,33 @@ impl Drop for ShaderModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn properties(
+        optimal: vk::FormatFeatureFlags,
+        linear: vk::FormatFeatureFlags,
+    ) -> vk::FormatProperties {
+        vk::FormatProperties {
+            linear_tiling_features: linear,
+            optimal_tiling_features: optimal,
+            buffer_features: vk::FormatFeatureFlags::empty(),
+        }
+    }
+
+    #[test]
+    fn blending_needs_the_feature_with_optimal_tiling() {
+        let blend = vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+        let none = vk::FormatFeatureFlags::empty();
+        assert!(can_blend(properties(blend, none)));
+        assert!(can_blend(properties(blend, blend)));
+        assert!(!can_blend(properties(none, none)));
+    }
+
+    #[test]
+    fn blending_only_with_linear_tiling_falls_back_to_opaque() {
+        let blend = vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND;
+        let only_attachment = vk::FormatFeatureFlags::COLOR_ATTACHMENT;
+        assert!(!can_blend(properties(only_attachment, blend)));
+    }
 
     #[test]
     fn overlay_color_is_blended_by_source_alpha() {

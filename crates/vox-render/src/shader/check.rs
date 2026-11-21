@@ -20,7 +20,7 @@ use naga::{
     TypeInner,
 };
 
-use crate::interface::PipelineInterface;
+use crate::interface::{PipelineInterface, Stage};
 
 /// A scalar or vector type: the only types the checks compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,9 +105,9 @@ fn check_push_constants(
     let provided = interface.push_constants;
     match push_constant_size(module)? {
         None => Ok(()),
-        Some(_) if stage != provided.stage => Err(format!(
+        Some(_) if pipeline_stage(stage) != Some(provided.stage) => Err(format!(
             "push constants are only available in the {} stage",
-            stage_name(provided.stage)
+            provided.stage.name()
         )),
         Some(size) if size > provided.size => Err(format!(
             "push constants use {size} bytes, the pipeline provides {} bytes",
@@ -117,12 +117,13 @@ fn check_push_constants(
     }
 }
 
-/// The name of a stage as the error messages use it.
-fn stage_name(stage: ShaderStage) -> &'static str {
+/// The pipeline stage a naga stage stands for, or `None` for the stages no pipeline of
+/// the renderer has (compute, task and mesh shaders), which then match no interface.
+fn pipeline_stage(stage: ShaderStage) -> Option<Stage> {
     match stage {
-        ShaderStage::Vertex => "vertex",
-        ShaderStage::Fragment => "fragment",
-        _ => "compute",
+        ShaderStage::Vertex => Some(Stage::Vertex),
+        ShaderStage::Fragment => Some(Stage::Fragment),
+        ShaderStage::Compute | ShaderStage::Task | ShaderStage::Mesh => None,
     }
 }
 

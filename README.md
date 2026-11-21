@@ -14,7 +14,7 @@ A voxel game: the open world, freedom of action and world generation of Minecraf
 ## Repository layout
 ```
 assets/
-  shaders/     built-in GLSL shaders (chunk.vert, chunk.frag), read and compiled when the game starts
+  shaders/     built-in GLSL shaders (chunk.vert, chunk.frag, overlay.vert, overlay.frag), read and compiled when the game starts
 crates/
   vox-world/   blocks, chunks, the world of chunks, meshing and demo terrain; knows nothing about rendering, mods or networking
   vox-render/  rendering behind the `Renderer` trait; the only crate that touches Vulkan

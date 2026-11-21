@@ -94,9 +94,9 @@ impl VulkanRenderer {
         let depth_format = depth::depth_format(&context, &gpu)?;
         let render_pass = RenderPass::new(gpu.device(), format, depth_format)?;
         let chunk_pipeline = Pipeline::chunk(gpu.device(), &render_pass, shader_dir)?;
-        let can_blend = pipeline::supports_blending(&context, &gpu, format.format);
+        let blending_supported = pipeline::supports_blending(&context, &gpu, format.format);
         let overlay_pipeline =
-            Pipeline::overlay(gpu.device(), &render_pass, shader_dir, can_blend)?;
+            Pipeline::overlay(gpu.device(), &render_pass, shader_dir, blending_supported)?;
         let swapchain = Swapchain::new(
             &context,
             &surface,
@@ -507,7 +507,7 @@ impl Renderer for VulkanRenderer {
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         // SAFETY: the device is alive. Waiting for idle means no GPU work still uses the
-        // objects that the fields destroy next, retired meshes included. A failure here
+        // objects that the fields destroy next, retired buffers included. A failure here
         // cannot be handled in `drop`, and the process is shutting down anyway.
         unsafe {
             let _ = self.gpu.device().device_wait_idle();

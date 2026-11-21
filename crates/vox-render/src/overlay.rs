@@ -11,9 +11,9 @@ use crate::interface::overlay::{PUSH_CONSTANT_SIZE, VERTEX_STRIDE};
 /// One rectangle of the overlay, in window pixels measured from the top-left corner of
 /// the window's drawing area.
 ///
-/// The pixels are those of the image the renderer draws, which follows the size given to
-/// [`crate::Renderer::resize`]; so a rectangle keeps its size in pixels when the window
-/// is resized. Parts outside the window are cut off.
+/// The pixels are those of the current swapchain image, the image the renderer draws
+/// into, whose size is read every frame; so a rectangle keeps its size in pixels when the
+/// window is resized. Parts outside the image are cut off.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OverlayRect {
     /// Left edge, in pixels from the left side of the drawing area, growing to the right.
@@ -37,8 +37,11 @@ pub(crate) const VERTICES_PER_RECT: usize = 6;
 /// The 8-bit value that stands for 1.0 in a normalized color channel.
 const UNORM8_MAX: f32 = u8::MAX as f32;
 
-/// Why a batch whose vertices cannot be counted or held is refused.
+/// Why a batch whose vertices a `u32` cannot count is refused.
 const TOO_MANY_RECTS: &str = "too many rectangles";
+
+/// Why a batch whose vertices cannot be allocated is refused.
+const OUT_OF_MEMORY: &str = "the rectangles do not fit in memory";
 
 /// A batch of rectangles serialized for the GPU.
 #[derive(Debug, PartialEq)]
@@ -54,14 +57,15 @@ pub(crate) struct OverlayVertices {
 ///
 /// # Errors
 /// [`RenderError::InvalidOverlay`] if a coordinate or size is not finite (NaN or
-/// infinite), or the right or bottom edge overflows to infinity, or the batch has more
-/// vertices than a `u32` counts. The whole batch is refused, like a malformed mesh.
+/// infinite), or the right or bottom edge overflows to infinity, or the slice has more
+/// rectangles than a `u32` vertex count covers (checked before anything is allocated),
+/// or its vertices do not fit in memory. The whole batch is refused, like a malformed mesh.
 pub(crate) fn overlay_vertices(rects: &[OverlayRect]) -> Result<OverlayVertices, RenderError> {
-    let capacity = rects
-        .len()
-        .checked_mul(VERTICES_PER_RECT * VERTEX_STRIDE as usize)
-        .ok_or(RenderError::InvalidOverlay(TOO_MANY_RECTS))?;
-    let mut bytes = Vec::with_capacity(capacity);
+    let capacity = byte_capacity(rects.len())?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| RenderError::InvalidOverlay(OUT_OF_MEMORY))?;
     let mut drawn: usize = 0;
     for rect in rects {
         if is_drawn(rect)? {
@@ -69,11 +73,31 @@ pub(crate) fn overlay_vertices(rects: &[OverlayRect]) -> Result<OverlayVertices,
             drawn += 1;
         }
     }
-    let count = drawn
+    // Cannot fail: `byte_capacity` proved that even every rectangle drawn fits a `u32`.
+    let count = vertex_count(drawn)?;
+    Ok(OverlayVertices { bytes, count })
+}
+
+/// Bytes the vertices of `rect_count` rectangles take if every one is drawn: an upper
+/// bound, since skipped rectangles only lower it.
+///
+/// # Errors
+/// [`RenderError::InvalidOverlay`] if that many rectangles have more vertices than a
+/// `u32` counts (the draw call takes a `u32`), or the size overflows `usize`.
+fn byte_capacity(rect_count: usize) -> Result<usize, RenderError> {
+    let vertices = vertex_count(rect_count)?;
+    usize::try_from(vertices)
+        .ok()
+        .and_then(|vertices| vertices.checked_mul(VERTEX_STRIDE as usize))
+        .ok_or(RenderError::InvalidOverlay(TOO_MANY_RECTS))
+}
+
+/// The number of vertices of `rect_count` drawn rectangles, if a `u32` counts it.
+fn vertex_count(rect_count: usize) -> Result<u32, RenderError> {
+    rect_count
         .checked_mul(VERTICES_PER_RECT)
         .and_then(|count| u32::try_from(count).ok())
-        .ok_or(RenderError::InvalidOverlay(TOO_MANY_RECTS))?;
-    Ok(OverlayVertices { bytes, count })
+        .ok_or(RenderError::InvalidOverlay(TOO_MANY_RECTS))
 }
 
 /// Whether `rect` covers any area, or an error if one of its numbers is not finite.
@@ -257,6 +281,36 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_vertex_limit_is_the_largest_count_a_u32_holds() {
+        // u32::MAX / 6 rectangles have 4_294_967_292 vertices; one more is too many.
+        let most = u32::MAX as usize / VERTICES_PER_RECT;
+        assert_eq!(vertex_count(most).unwrap(), 4_294_967_292);
+        assert!(matches!(
+            vertex_count(most + 1),
+            Err(RenderError::InvalidOverlay(TOO_MANY_RECTS))
+        ));
+        assert!(matches!(
+            vertex_count(usize::MAX),
+            Err(RenderError::InvalidOverlay(_))
+        ));
+    }
+
+    #[test]
+    fn the_byte_size_is_checked_before_anything_is_allocated() {
+        assert_eq!(byte_capacity(0).unwrap(), 0);
+        assert_eq!(byte_capacity(2).unwrap(), 2 * 6 * 12);
+        let most = u32::MAX as usize / VERTICES_PER_RECT;
+        assert!(matches!(
+            byte_capacity(most + 1),
+            Err(RenderError::InvalidOverlay(TOO_MANY_RECTS))
+        ));
+        assert!(matches!(
+            byte_capacity(usize::MAX),
+            Err(RenderError::InvalidOverlay(_))
+        ));
     }
 
     #[test]

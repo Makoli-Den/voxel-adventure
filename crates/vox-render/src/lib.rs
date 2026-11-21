@@ -79,10 +79,16 @@ pub trait Renderer {
     /// it, so this never waits for the GPU; it is cheap enough to call several times a
     /// second. The overlay is not counted in [`RenderStats`].
     ///
+    /// If the window's image format cannot blend (Vulkan guarantees blending for the
+    /// common 8-bit formats the renderer prefers, so this is rare), the overlay is drawn
+    /// opaque and alpha is ignored: even a rectangle with alpha 0 is drawn solid.
+    ///
     /// # Errors
-    /// Returns [`RenderError::InvalidOverlay`] if a coordinate or size is NaN or infinite
-    /// (the whole batch is refused), or another error if the GPU cannot allocate or fill
-    /// the buffer. The previous overlay is then kept.
+    /// Returns [`RenderError::InvalidOverlay`] if a coordinate or size is NaN or infinite,
+    /// if there are too many rectangles (more than `u32::MAX / 6`, the vertex count a
+    /// single draw takes, checked before anything is allocated), or if their vertices do
+    /// not fit in memory; the whole batch is refused. Another error is returned if the GPU
+    /// cannot allocate or fill the buffer. The previous overlay is kept in every case.
     fn set_overlay(&mut self, rects: &[OverlayRect]) -> Result<(), RenderError>;
 
     /// What the renderer drew and how long the GPU took. Cheap: returns a copy.

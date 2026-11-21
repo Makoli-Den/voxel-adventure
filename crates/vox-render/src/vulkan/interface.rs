@@ -5,9 +5,8 @@
 //! cannot drift apart.
 
 use ash::vk;
-use naga::ShaderStage;
 
-use crate::interface::{AttributeFormat, PipelineInterface};
+use crate::interface::{AttributeFormat, PipelineInterface, Stage};
 
 /// The vertex buffer binding: one tightly packed vertex after another.
 pub fn vertex_bindings(interface: &PipelineInterface) -> [vk::VertexInputBindingDescription; 1] {
@@ -47,9 +46,8 @@ pub fn push_constant_ranges(interface: &PipelineInterface) -> [vk::PushConstantR
 /// the range.
 pub fn push_constant_stages(interface: &PipelineInterface) -> vk::ShaderStageFlags {
     match interface.push_constants.stage {
-        ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
-        ShaderStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
-        _ => vk::ShaderStageFlags::COMPUTE,
+        Stage::Vertex => vk::ShaderStageFlags::VERTEX,
+        Stage::Fragment => vk::ShaderStageFlags::FRAGMENT,
     }
 }
 

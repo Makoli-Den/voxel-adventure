@@ -25,10 +25,8 @@
 //! A `mat4` followed by a `vec4` has these offsets under the std430 rules push
 //! constants use, so a shader can declare the block as written in the table.
 
-use naga::ShaderStage;
-
 use super::{
-    AttributeFormat, GUARANTEED_PUSH_CONSTANT_SIZE, PipelineInterface, PushConstants,
+    AttributeFormat, GUARANTEED_PUSH_CONSTANT_SIZE, PipelineInterface, PushConstants, Stage,
     VertexAttribute,
 };
 
@@ -68,7 +66,7 @@ pub(crate) const INTERFACE: PipelineInterface = PipelineInterface {
     vertex_stride: VERTEX_STRIDE,
     attributes: &ATTRIBUTES,
     push_constants: PushConstants {
-        stage: ShaderStage::Vertex,
+        stage: Stage::Vertex,
         size: PUSH_CONSTANT_SIZE,
     },
 };

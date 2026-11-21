@@ -22,11 +22,9 @@
 //! The vertex shader maps a pixel to clip space as `pixel / size * 2 - 1` on both axes.
 //! Vulkan clip space has y pointing down, like the pixels, so nothing is flipped.
 
-use naga::ShaderStage;
-
 use super::{
     AttributeFormat, F32_SIZE, GUARANTEED_PUSH_CONSTANT_SIZE, PipelineInterface, PushConstants,
-    VertexAttribute,
+    Stage, VertexAttribute,
 };
 
 /// Byte offset of the color inside a vertex, right after the position.
@@ -60,7 +58,7 @@ pub(crate) const INTERFACE: PipelineInterface = PipelineInterface {
     vertex_stride: VERTEX_STRIDE,
     attributes: &ATTRIBUTES,
     push_constants: PushConstants {
-        stage: ShaderStage::Vertex,
+        stage: Stage::Vertex,
         size: PUSH_CONSTANT_SIZE,
     },
 };
@@ -78,6 +76,6 @@ mod tests {
     #[test]
     fn push_constants_are_one_vec2() {
         assert_eq!(PUSH_CONSTANT_SIZE, 8);
-        assert_eq!(INTERFACE.push_constants.stage, ShaderStage::Vertex);
+        assert_eq!(INTERFACE.push_constants.stage, Stage::Vertex);
     }
 }
