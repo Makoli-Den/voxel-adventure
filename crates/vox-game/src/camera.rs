@@ -12,8 +12,10 @@ use glam::camera::rh::{proj::vulkan, view};
 const FIELD_OF_VIEW_DEGREES: f32 = 70.0;
 /// Distance of the near clipping plane, in blocks.
 const NEAR: f32 = 0.1;
-/// Distance of the far clipping plane, in blocks.
-const FAR: f32 = 500.0;
+/// Distance of the far clipping plane, in blocks. It must cover the loaded area from any point
+/// inside it (`VIEW_RADIUS` in `main.rs`: 17 chunks of 32 blocks across, a diagonal of about
+/// 770 blocks), otherwise the far edge of the world is cut off when the camera flies.
+const FAR: f32 = 1000.0;
 /// Largest pitch, one degree short of straight up or down, where "up" would become ambiguous.
 const MAX_PITCH: f32 = FRAC_PI_2 - PI / 180.0;
 
