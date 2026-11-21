@@ -24,6 +24,19 @@ pub fn surface_format(surface: &Surface, gpu: &Gpu) -> Result<vk::SurfaceFormatK
     choose_format(&query_formats(surface, gpu)?)
 }
 
+/// Asks the driver which present modes the surface offers right now.
+fn query_present_modes(
+    surface: &Surface,
+    gpu: &Gpu,
+) -> Result<Vec<vk::PresentModeKHR>, RenderError> {
+    // SAFETY: the physical device and the surface are alive and belong to the same instance.
+    Ok(unsafe {
+        surface
+            .loader()
+            .get_physical_device_surface_present_modes(gpu.physical(), surface.handle())?
+    })
+}
+
 /// Asks the driver which image formats the surface offers right now.
 fn query_formats(surface: &Surface, gpu: &Gpu) -> Result<Vec<vk::SurfaceFormatKHR>, RenderError> {
     // SAFETY: the physical device and the surface are alive and belong to the same instance.
@@ -90,6 +103,7 @@ impl Swapchain {
                 "the surface no longer offers the swapchain image format",
             ));
         }
+        let present_mode = choose_present_mode(&query_present_modes(surface, gpu)?);
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface.handle())
             .min_image_count(choose_image_count(&capabilities))
@@ -101,8 +115,7 @@ impl Swapchain {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            // FIFO is the only present mode every driver must support (vsync).
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(old.map_or(vk::SwapchainKHR::null(), |s| s.handle));
 
@@ -314,6 +327,23 @@ fn choose_extent(capabilities: &vk::SurfaceCapabilitiesKHR, size: (u32, u32)) ->
     }
 }
 
+/// Prefers MAILBOX, and falls back to FIFO, the one mode every driver must support.
+///
+/// With FIFO, the present call can block while Windows resizes the window: the compositor
+/// stops taking frames and waits for the window thread, the window thread waits in the
+/// present call, and the game hangs for good. Measured on this project's test machine,
+/// 10 to 30 percent of runs with rapid window resizing hung with FIFO, and none of 14 did
+/// with MAILBOX (see decision 0005). MAILBOX never blocks in present and still avoids
+/// tearing: the newest finished frame is shown at every refresh. Because it does not
+/// wait for the refresh, the game has to cap its own frame rate.
+fn choose_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+        vk::PresentModeKHR::MAILBOX
+    } else {
+        vk::PresentModeKHR::FIFO
+    }
+}
+
 /// One image more than the minimum, so we never wait on the driver; capped at the maximum.
 fn choose_image_count(capabilities: &vk::SurfaceCapabilitiesKHR) -> u32 {
     let wanted = capabilities.min_image_count + 1;
@@ -332,6 +362,19 @@ mod tests {
             format,
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         }
+    }
+
+    #[test]
+    fn present_mode_prefers_mailbox() {
+        let modes = [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX];
+        assert_eq!(choose_present_mode(&modes), vk::PresentModeKHR::MAILBOX);
+    }
+
+    #[test]
+    fn present_mode_falls_back_to_fifo() {
+        let modes = [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::IMMEDIATE];
+        assert_eq!(choose_present_mode(&modes), vk::PresentModeKHR::FIFO);
+        assert_eq!(choose_present_mode(&[]), vk::PresentModeKHR::FIFO);
     }
 
     #[test]
