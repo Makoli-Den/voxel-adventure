@@ -20,6 +20,9 @@ pub enum RenderError {
     /// Mesh data from the caller is malformed, for example an index points past the
     /// last vertex. The text says what is wrong.
     InvalidMesh(&'static str),
+    /// Overlay data from the caller is malformed, for example a rectangle coordinate is
+    /// NaN or infinite. The text says what is wrong.
+    InvalidOverlay(&'static str),
 }
 
 impl fmt::Display for RenderError {
@@ -30,6 +33,7 @@ impl fmt::Display for RenderError {
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Shader(details) => write!(f, "shader error in {details}"),
             Self::InvalidMesh(what) => write!(f, "invalid mesh: {what}"),
+            Self::InvalidOverlay(what) => write!(f, "invalid overlay: {what}"),
         }
     }
 }
@@ -38,9 +42,11 @@ impl Error for RenderError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Backend(e) => Some(e.as_ref()),
-            Self::NoSuitableGpu | Self::Unsupported(_) | Self::Shader(_) | Self::InvalidMesh(_) => {
-                None
-            }
+            Self::NoSuitableGpu
+            | Self::Unsupported(_)
+            | Self::Shader(_)
+            | Self::InvalidMesh(_)
+            | Self::InvalidOverlay(_) => None,
         }
     }
 }
@@ -53,5 +59,11 @@ mod tests {
     fn invalid_mesh_names_the_problem() {
         let text = RenderError::InvalidMesh("an index points past the last vertex").to_string();
         assert_eq!(text, "invalid mesh: an index points past the last vertex");
+    }
+
+    #[test]
+    fn invalid_overlay_names_the_problem() {
+        let text = RenderError::InvalidOverlay("a size is NaN").to_string();
+        assert_eq!(text, "invalid overlay: a size is NaN");
     }
 }

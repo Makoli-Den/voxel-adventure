@@ -81,9 +81,9 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         // SAFETY: the renderer drops a buffer only when no submitted work can still read
-        // it: either after waiting for the device to go idle, or, for replaced meshes,
-        // once the fences show that every frame that could use it has finished (see
-        // `retired.rs`). The buffer goes before its memory. Null handles are ignored.
+        // it: either after waiting for the device to go idle, or, for replaced meshes and
+        // overlays, once the fences show that every frame that could use it has finished
+        // (see `retired.rs`). The buffer goes before its memory. Null handles are ignored.
         unsafe {
             self.device.destroy_buffer(self.handle, None);
             self.device.free_memory(self.memory, None);

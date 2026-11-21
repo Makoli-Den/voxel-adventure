@@ -21,6 +21,7 @@ use naga::valid::{Capabilities, ModuleInfo, ValidationFlags, Validator};
 use naga::{Module, ShaderStage};
 
 use crate::RenderError;
+use crate::interface::PipelineInterface;
 
 /// SPIR-V words of the vertex and fragment stage of one pipeline.
 pub(crate) struct PipelineShaders {
@@ -30,16 +31,18 @@ pub(crate) struct PipelineShaders {
     pub(crate) fragment: Vec<u32>,
 }
 
-/// Reads and compiles the vertex and fragment shader files of the chunk pipeline.
+/// Reads and compiles the vertex and fragment shader files of one pipeline.
 ///
-/// Both are validated, checked against the pipeline interface (`crate::interface`),
-/// and checked against each other: every fragment input must be a vertex output.
+/// Both are validated, checked against `interface`, the description of what that
+/// pipeline provides (see `crate::interface`), and checked against each other: every
+/// fragment input must be a vertex output.
 pub(crate) fn load_pipeline_shaders(
     vertex_path: &Path,
     fragment_path: &Path,
+    interface: &PipelineInterface,
 ) -> Result<PipelineShaders, RenderError> {
-    let vertex = load(vertex_path, ShaderStage::Vertex)?;
-    let fragment = load(fragment_path, ShaderStage::Fragment)?;
+    let vertex = load(vertex_path, ShaderStage::Vertex, interface)?;
+    let fragment = load(fragment_path, ShaderStage::Fragment, interface)?;
     link(&vertex, &fragment)?;
     Ok(PipelineShaders {
         vertex: vertex.to_spirv()?,
@@ -63,18 +66,27 @@ impl Compiled {
     }
 }
 
-/// Reads the GLSL file at `path` and compiles it for `stage`.
-fn load(path: &Path, stage: ShaderStage) -> Result<Compiled, RenderError> {
+/// Reads the GLSL file at `path` and compiles it for `stage` of the pipeline `interface` describes.
+fn load(
+    path: &Path,
+    stage: ShaderStage,
+    interface: &PipelineInterface,
+) -> Result<Compiled, RenderError> {
     let name = path.display().to_string();
     let source = fs::read_to_string(path)
         .map_err(|error| shader_error(&name, &format!("cannot read the file: {error}")))?;
-    compile_glsl(&source, stage, &name)
+    compile_glsl(&source, stage, interface, &name)
 }
 
-/// Parses and validates GLSL 450 (Vulkan style), then checks it against the pipeline.
+/// Parses and validates GLSL 450 (Vulkan style), then checks it against `interface`.
 ///
 /// `name` labels the shader in error messages, normally its file path.
-fn compile_glsl(source: &str, stage: ShaderStage, name: &str) -> Result<Compiled, RenderError> {
+fn compile_glsl(
+    source: &str,
+    stage: ShaderStage,
+    interface: &PipelineInterface,
+    name: &str,
+) -> Result<Compiled, RenderError> {
     let module = glsl::Frontend::default()
         .parse(&glsl::Options::from(stage), source)
         .map_err(|errors| shader_error(name, &errors.emit_to_string(source)))?;
@@ -83,7 +95,8 @@ fn compile_glsl(source: &str, stage: ShaderStage, name: &str) -> Result<Compiled
     let info = Validator::new(ValidationFlags::all(), allowed_capabilities())
         .validate(&module)
         .map_err(|error| shader_error(name, &error.emit_to_string_with_path(source, name)))?;
-    check::check_stage(&module, stage).map_err(|message| shader_error(name, &message))?;
+    check::check_stage(&module, stage, interface)
+        .map_err(|message| shader_error(name, &message))?;
     Ok(Compiled {
         module,
         info,
@@ -136,6 +149,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::interface::chunk::INTERFACE as CHUNK;
+    use crate::interface::overlay::INTERFACE as OVERLAY;
 
     /// First word of every SPIR-V module.
     const SPIRV_MAGIC: u32 = 0x0723_0203;
@@ -149,28 +164,64 @@ mod tests {
         assert_eq!(words[0], SPIRV_MAGIC);
     }
 
-    /// The error text of compiling `source`, which must fail.
+    /// The error text of compiling `source` for the chunk pipeline, which must fail.
     fn compile_error(source: &str, stage: ShaderStage) -> String {
-        match compile_glsl(source, stage, "pack.glsl") {
+        compile_error_for(source, stage, &CHUNK)
+    }
+
+    /// The error text of compiling `source` for the pipeline `interface` describes,
+    /// which must fail.
+    fn compile_error_for(
+        source: &str,
+        stage: ShaderStage,
+        interface: &PipelineInterface,
+    ) -> String {
+        match compile_glsl(source, stage, interface, "pack.glsl") {
             Ok(_) => panic!("the shader was accepted"),
             Err(error) => error.to_string(),
         }
     }
 
-    /// The error text of linking two shaders that each compile, which must fail.
+    /// Whether `source` compiles for the pipeline `interface` describes.
+    fn compiles_for(source: &str, stage: ShaderStage, interface: &PipelineInterface) -> bool {
+        compile_glsl(source, stage, interface, "pack.glsl").is_ok()
+    }
+
+    /// The error text of linking two chunk shaders that each compile, which must fail.
     fn link_error(vertex: &str, fragment: &str) -> String {
-        let vertex = compile_glsl(vertex, ShaderStage::Vertex, "pack.vert").unwrap();
-        let fragment = compile_glsl(fragment, ShaderStage::Fragment, "pack.frag").unwrap();
+        link_error_for(vertex, fragment, &CHUNK)
+    }
+
+    /// The error text of linking two shaders that each compile for `interface`, which must fail.
+    fn link_error_for(vertex: &str, fragment: &str, interface: &PipelineInterface) -> String {
+        let vertex = compile_glsl(vertex, ShaderStage::Vertex, interface, "pack.vert").unwrap();
+        let fragment =
+            compile_glsl(fragment, ShaderStage::Fragment, interface, "pack.frag").unwrap();
         link(&vertex, &fragment).unwrap_err().to_string()
+    }
+
+    /// Compiles and links the real shader files `name.vert` and `name.frag`.
+    fn assert_real_shaders_compile(name: &str, interface: &PipelineInterface) {
+        let dir = shader_dir();
+        let vertex = dir.join(format!("{name}.vert"));
+        let fragment = dir.join(format!("{name}.frag"));
+        let shaders = load_pipeline_shaders(&vertex, &fragment, interface).unwrap();
+        assert_is_spirv(&shaders.vertex);
+        assert_is_spirv(&shaders.fragment);
     }
 
     #[test]
     fn real_shaders_compile_and_link() {
+        assert_real_shaders_compile("chunk", &CHUNK);
+        assert_real_shaders_compile("overlay", &OVERLAY);
+    }
+
+    #[test]
+    fn chunk_shaders_do_not_fit_the_overlay_pipeline() {
         let dir = shader_dir();
-        let shaders =
-            load_pipeline_shaders(&dir.join("chunk.vert"), &dir.join("chunk.frag")).unwrap();
-        assert_is_spirv(&shaders.vertex);
-        assert_is_spirv(&shaders.fragment);
+        let result =
+            load_pipeline_shaders(&dir.join("chunk.vert"), &dir.join("chunk.frag"), &OVERLAY);
+        assert!(matches!(result, Err(RenderError::Shader(_))));
     }
 
     #[test]
@@ -183,7 +234,7 @@ mod tests {
     #[test]
     fn broken_glsl_reports_the_file_name() {
         let source = "#version 450\nvoid main() { this is not glsl }\n";
-        let Err(error) = compile_glsl(source, ShaderStage::Fragment, "broken.frag") else {
+        let Err(error) = compile_glsl(source, ShaderStage::Fragment, &CHUNK, "broken.frag") else {
             panic!("broken GLSL was accepted");
         };
         assert!(matches!(&error, RenderError::Shader(text) if text.contains("broken.frag")));
@@ -193,7 +244,7 @@ mod tests {
     fn missing_file_is_a_shader_error() {
         let dir = shader_dir();
         let missing = dir.join("does_not_exist.vert");
-        let Err(error) = load_pipeline_shaders(&missing, &dir.join("chunk.frag")) else {
+        let Err(error) = load_pipeline_shaders(&missing, &dir.join("chunk.frag"), &CHUNK) else {
             panic!("a missing file was accepted");
         };
         let text = error.to_string();
@@ -220,7 +271,7 @@ mod tests {
         let source = "#version 450
             layout(push_constant) uniform Draw { mat4 m; vec4 origin; } draw;
             void main() { gl_Position = draw.m * draw.origin; }";
-        assert!(compile_glsl(source, ShaderStage::Vertex, "pack.glsl").is_ok());
+        assert!(compiles_for(source, ShaderStage::Vertex, &CHUNK));
     }
 
     #[test]
@@ -305,6 +356,96 @@ mod tests {
         let text = link_error(vertex, fragment);
         assert!(
             text.contains("location 0") && text.contains("type"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn overlay_vertex_shader_with_its_inputs_and_window_size_is_accepted() {
+        let source = "#version 450
+            layout(push_constant) uniform Screen { vec2 size; } screen;
+            layout(location = 0) in vec2 position;
+            layout(location = 1) in vec4 color;
+            layout(location = 0) out vec4 v_color;
+            void main() { v_color = color; gl_Position = vec4(position / screen.size, 0.0, 1.0); }";
+        assert!(compiles_for(source, ShaderStage::Vertex, &OVERLAY));
+    }
+
+    #[test]
+    fn overlay_unknown_vertex_input_location_is_rejected() {
+        let source = "#version 450
+            layout(location = 2) in vec2 extra;
+            void main() { gl_Position = vec4(extra, 0.0, 1.0); }";
+        let text = compile_error_for(source, ShaderStage::Vertex, &OVERLAY);
+        assert!(
+            text.contains("location 2") && text.contains("0, 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn overlay_color_as_integers_is_rejected() {
+        // The color arrives normalized, as floats; the chunk pipeline's `uvec4` is wrong here.
+        let source = "#version 450
+            layout(location = 1) in uvec4 color;
+            void main() { gl_Position = vec4(color); }";
+        let text = compile_error_for(source, ShaderStage::Vertex, &OVERLAY);
+        assert!(
+            text.contains("location 1") && text.contains("`vec4`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn overlay_position_as_vec3_is_rejected() {
+        let source = "#version 450
+            layout(location = 0) in vec3 position;
+            void main() { gl_Position = vec4(position, 1.0); }";
+        let text = compile_error_for(source, ShaderStage::Vertex, &OVERLAY);
+        assert!(
+            text.contains("location 0") && text.contains("`vec2`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn overlay_push_constants_past_the_window_size_are_rejected() {
+        // 16 bytes: the chunk pipeline would accept this, the overlay has only 8.
+        let source = "#version 450
+            layout(push_constant) uniform Screen { vec4 size; } screen;
+            void main() { gl_Position = screen.size; }";
+        assert!(compiles_for(source, ShaderStage::Vertex, &CHUNK));
+        let text = compile_error_for(source, ShaderStage::Vertex, &OVERLAY);
+        assert!(
+            text.contains("16 bytes") && text.contains("8 bytes"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn overlay_push_constants_in_the_fragment_stage_are_rejected() {
+        let source = "#version 450
+            layout(push_constant) uniform Screen { vec2 size; } screen;
+            layout(location = 0) out vec4 out_color;
+            void main() { out_color = vec4(screen.size, 0.0, 1.0); }";
+        let text = compile_error_for(source, ShaderStage::Fragment, &OVERLAY);
+        assert!(text.contains("vertex stage"), "{text}");
+    }
+
+    #[test]
+    fn overlay_fragment_input_without_vertex_output_is_rejected() {
+        let vertex = "#version 450
+            layout(location = 0) in vec2 position;
+            layout(location = 1) in vec4 color;
+            layout(location = 0) out vec4 v_color;
+            void main() { v_color = color; gl_Position = vec4(position, 0.0, 1.0); }";
+        let fragment = "#version 450
+            layout(location = 1) in vec4 v_tint;
+            layout(location = 0) out vec4 out_color;
+            void main() { out_color = v_tint; }";
+        let text = link_error_for(vertex, fragment, &OVERLAY);
+        assert!(
+            text.contains("pack.frag") && text.contains("location 1"),
             "{text}"
         );
     }

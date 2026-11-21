@@ -6,6 +6,7 @@
 
 mod error;
 mod interface;
+mod overlay;
 mod shader;
 mod stats;
 mod vulkan;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 pub use error::RenderError;
+pub use overlay::OverlayRect;
 pub use stats::RenderStats;
 
 /// What the game needs from a renderer.
@@ -65,7 +67,27 @@ pub trait Renderer {
     /// renderer applies it unchanged.
     fn set_camera(&mut self, view_projection: [[f32; 4]; 4]);
 
+    /// Replaces the overlay. The rectangles are drawn on top of everything else, in slice
+    /// order (later ones over earlier ones), blended by their alpha. An empty slice removes
+    /// the overlay.
+    ///
+    /// Coordinates are window pixels from the top-left corner of the drawing area, see
+    /// [`OverlayRect`]. Every frame maps them with the current swapchain size, so after a
+    /// resize the rectangles keep their size in pixels and nothing needs to be set again.
+    /// Rectangles with a width or height of zero or less are skipped. The previous
+    /// overlay's GPU memory is freed a few frames later, once no frame in flight can use
+    /// it, so this never waits for the GPU; it is cheap enough to call several times a
+    /// second. The overlay is not counted in [`RenderStats`].
+    ///
+    /// # Errors
+    /// Returns [`RenderError::InvalidOverlay`] if a coordinate or size is NaN or infinite
+    /// (the whole batch is refused), or another error if the GPU cannot allocate or fill
+    /// the buffer. The previous overlay is then kept.
+    fn set_overlay(&mut self, rects: &[OverlayRect]) -> Result<(), RenderError>;
+
     /// What the renderer drew and how long the GPU took. Cheap: returns a copy.
+    ///
+    /// The overlay ([`Self::set_overlay`]) is not part of the counts.
     ///
     /// The draw counts describe the most recently recorded frame: the last call to
     /// [`Self::render_frame`] that built GPU commands, whether or not presenting it
@@ -85,8 +107,8 @@ pub trait Renderer {
 /// The renderer keeps the `Arc` alive for as long as it exists, which guarantees
 /// the native window outlives the surface created from it.
 ///
-/// `shader_dir` is the folder with the GLSL shader files (`chunk.vert`,
-/// `chunk.frag`). They are read and compiled once, here.
+/// `shader_dir` is the folder with the GLSL shader files (`chunk.vert`, `chunk.frag`,
+/// `overlay.vert`, `overlay.frag`). They are read and compiled once, here.
 ///
 /// # Errors
 /// Returns an error if Vulkan is unavailable, no GPU can present to the window,
