@@ -17,7 +17,7 @@ Read `CLAUDE.md` first and follow it exactly. The points that matter most here:
 - Speed matters, but optimize by measurement (`criterion`). Mark hot paths with `// HOT PATH:`. No allocations in hot loops.
 
 ## Working method
-- Make the smallest change that does the job. Write tests for every piece of logic; the world core is cheap to test.
+- Make the smallest change that does the job. Name every number that has a meaning (see "No magic values" in CLAUDE.md). Write tests for every piece of logic; the world core is cheap to test.
 - After changing code run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`. Fix everything before reporting.
 - Do not commit. The conductor commits after review.
 

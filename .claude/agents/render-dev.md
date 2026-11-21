@@ -16,7 +16,7 @@ Read `CLAUDE.md` first and follow it exactly. The points that matter most here:
 - Speed matters, but optimize by measurement. Mark hot paths with `// HOT PATH:` and explain why.
 
 ## Working method
-- Make the smallest change that does the job. Keep functions short and names clear.
+- Make the smallest change that does the job. Name every number that has a meaning (see "No magic values" in CLAUDE.md). Keep functions short and names clear.
 - After changing code run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`. Fix everything before reporting.
 - Pure logic (choosing formats, extents, counts) gets unit tests. GPU code cannot be unit tested; say how you checked it instead.
 - Do not commit. The conductor commits after review.
