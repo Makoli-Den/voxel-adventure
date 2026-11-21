@@ -19,12 +19,15 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    /// Creates a buffer for `usage` holding a copy of `data`. `data` must not be empty.
+    /// Creates a buffer for `usage` holding a copy of `data`.
+    ///
+    /// Empty `data` is an error: Vulkan forbids buffers of zero bytes.
     pub fn with_data(
         gpu: &Gpu,
         usage: vk::BufferUsageFlags,
         data: &[u8],
     ) -> Result<Self, RenderError> {
+        let size = buffer_size(data)?;
         let device = gpu.device();
         // Start with null handles: if a later call fails, `Drop` destroys whatever
         // was created so far (destroying or freeing a null handle is a no-op).
@@ -33,13 +36,12 @@ impl Buffer {
             handle: vk::Buffer::null(),
             memory: vk::DeviceMemory::null(),
         };
-        let size = data.len() as vk::DeviceSize;
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // SAFETY: the device is alive and `info` outlives the call. A zero size is
-        // invalid; callers never pass empty data (see `GpuMesh::new`).
+        // SAFETY: the device is alive and `info` outlives the call. `size` is not zero,
+        // `buffer_size` checked that above.
         buffer.handle = unsafe { device.create_buffer(&info, None)? };
         // SAFETY: the buffer was just created from this device.
         let requirements = unsafe { device.get_buffer_memory_requirements(buffer.handle) };
@@ -85,5 +87,28 @@ impl Drop for Buffer {
             self.device.destroy_buffer(self.handle, None);
             self.device.free_memory(self.memory, None);
         }
+    }
+}
+
+/// The size of a buffer holding `data`, or an error for empty data.
+fn buffer_size(data: &[u8]) -> Result<vk::DeviceSize, RenderError> {
+    if data.is_empty() {
+        return Err(RenderError::Unsupported("a GPU buffer of zero bytes"));
+    }
+    Ok(data.len() as vk::DeviceSize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_data_is_rejected() {
+        assert!(matches!(buffer_size(&[]), Err(RenderError::Unsupported(_))));
+    }
+
+    #[test]
+    fn size_is_the_data_length() {
+        assert_eq!(buffer_size(&[1, 2, 3]).unwrap(), 3);
     }
 }

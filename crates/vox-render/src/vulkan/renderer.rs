@@ -13,9 +13,10 @@ use super::depth;
 use super::frames::{FrameSlot, Frames};
 use super::gpu::Gpu;
 use super::mesh::GpuMesh;
-use super::pipeline::{CAMERA_PUSH_SIZE, Pipeline};
+use super::pipeline::Pipeline;
 use super::render_pass::RenderPass;
 use super::swapchain::{self, Swapchain};
+use crate::interface::PUSH_CONSTANT_SIZE;
 use crate::{RenderError, Renderer};
 
 /// The sky: everything the mesh does not cover is cleared to this color.
@@ -46,7 +47,7 @@ pub struct VulkanRenderer {
     /// Set when the swapchain no longer matches the window and must be rebuilt.
     needs_recreate: bool,
     /// The view-projection matrix as push-constant bytes, see [`camera_bytes`].
-    camera: [u8; CAMERA_PUSH_SIZE as usize],
+    camera: [u8; PUSH_CONSTANT_SIZE as usize],
 }
 
 impl VulkanRenderer {
@@ -362,8 +363,8 @@ const IDENTITY: [[f32; 4]; 4] = [
 
 /// Packs a column-major matrix into the bytes of a GLSL `mat4` push constant:
 /// columns one after another, each float little-endian like the GPU reads it.
-fn camera_bytes(matrix: &[[f32; 4]; 4]) -> [u8; CAMERA_PUSH_SIZE as usize] {
-    let mut bytes = [0; CAMERA_PUSH_SIZE as usize];
+fn camera_bytes(matrix: &[[f32; 4]; 4]) -> [u8; PUSH_CONSTANT_SIZE as usize] {
+    let mut bytes = [0; PUSH_CONSTANT_SIZE as usize];
     let floats = matrix.iter().flatten();
     for (chunk, value) in bytes.chunks_exact_mut(4).zip(floats) {
         chunk.copy_from_slice(&value.to_le_bytes());

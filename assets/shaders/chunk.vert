@@ -9,7 +9,7 @@ layout(push_constant) uniform Camera {
 
 // xyz: corner position in blocks (0..32), w: face index (order of vox_world::Face::ALL).
 layout(location = 0) in uvec4 in_pos_face;
-// Block id from the registry.
+// Block id, the number a chunk stores for the block.
 layout(location = 1) in uint in_block;
 
 layout(location = 0) out vec3 v_color;
@@ -18,7 +18,10 @@ layout(location = 0) out vec3 v_color;
 // darkest, and every side differs, so block edges read clearly without lighting.
 const float FACE_SHADE[6] = float[6](0.80, 0.65, 1.00, 0.50, 0.90, 0.72);
 
-// Base colors for block ids 0..3. Id 0 is air and never meshed.
+// Temporary base colors for block ids 0..3, until textures and the block registry
+// exist. The ids must match the ones the demo scene uses (vox-game's demo module:
+// 1 grass, 2 dirt, 3 stone); keep them in step with vox-world's terrain ids when
+// those appear. Id 0 is air and never meshed.
 const vec3 PALETTE[4] = vec3[4](
     vec3(1.00, 0.00, 1.00), // air (unused)
     vec3(0.36, 0.66, 0.24), // 1: grass

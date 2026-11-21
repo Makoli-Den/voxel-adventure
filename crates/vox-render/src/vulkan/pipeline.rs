@@ -7,14 +7,11 @@ use ash::vk;
 use super::mesh;
 use super::render_pass::RenderPass;
 use crate::RenderError;
-use crate::shader::{self, ShaderStage};
+use crate::interface::PUSH_CONSTANT_SIZE;
+use crate::shader;
 
 /// Entry point name of every shader stage; GLSL always calls it `main`.
 const ENTRY_POINT: &std::ffi::CStr = c"main";
-
-/// Size of the push constants: one column-major `mat4`, the camera's view-projection.
-/// Vulkan 1.0 guarantees at least 128 bytes.
-pub const CAMERA_PUSH_SIZE: u32 = 64;
 
 /// The chunk pipeline and its layout (no descriptor sets, one push-constant range).
 ///
@@ -33,12 +30,14 @@ impl Pipeline {
         render_pass: &RenderPass,
         shader_dir: &Path,
     ) -> Result<Self, RenderError> {
-        // Compile first: a broken shader fails before any Vulkan object exists.
-        let vertex_code = shader::load_spirv(&shader_dir.join("chunk.vert"), ShaderStage::Vertex)?;
-        let fragment_code =
-            shader::load_spirv(&shader_dir.join("chunk.frag"), ShaderStage::Fragment)?;
-        let vertex = ShaderModule::new(device, &vertex_code)?;
-        let fragment = ShaderModule::new(device, &fragment_code)?;
+        // Compile and check first: a broken or mismatched shader fails before any
+        // Vulkan object exists.
+        let code = shader::load_pipeline_shaders(
+            &shader_dir.join("chunk.vert"),
+            &shader_dir.join("chunk.frag"),
+        )?;
+        let vertex = ShaderModule::new(device, &code.vertex)?;
+        let fragment = ShaderModule::new(device, &code.fragment)?;
 
         // Start with null handles: if a later call fails, `Drop` destroys whatever
         // was created so far (destroying a null handle is a no-op).
@@ -50,7 +49,7 @@ impl Pipeline {
         let push_ranges = [vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::VERTEX,
             offset: 0,
-            size: CAMERA_PUSH_SIZE,
+            size: PUSH_CONSTANT_SIZE,
         }];
         let layout_info =
             vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges);
@@ -189,9 +188,14 @@ impl ShaderModule {
         let create_info = vk::ShaderModuleCreateInfo::default().code(code);
         // SAFETY: the device is alive, and `code` is SPIR-V produced and validated by naga.
         // Vulkan also requires that the module uses only capabilities the device has
-        // enabled. That holds because the validator in `shader.rs` allows only push
-        // constants, which are core Vulkan 1.0, so only core SPIR-V features can appear.
-        // Do not widen that set without enabling the matching device features.
+        // enabled, and the pipeline built from it requires that its interface matches
+        // the pipeline layout and vertex input. Both hold because `shader::load_pipeline_shaders`
+        // admits only core capabilities (push constants are the one optional naga
+        // capability, and they are core Vulkan 1.0) AND checks the interface against
+        // `crate::interface`: no descriptor resources, push constants only in the vertex
+        // stage and within the layout's range, only the vertex attributes the pipeline
+        // feeds with their exact types, and fragment inputs that the vertex stage writes.
+        // Do not widen either without changing the device features or the pipeline.
         let handle = unsafe { device.create_shader_module(&create_info, None)? };
         Ok(Self {
             device: device.clone(),

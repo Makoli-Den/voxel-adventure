@@ -5,6 +5,7 @@
 //! replaced (for example by a fallback for old devices) without touching other layers.
 
 mod error;
+mod interface;
 mod shader;
 mod vulkan;
 
@@ -39,8 +40,9 @@ pub trait Renderer {
     /// mesh draws nothing, and so does a renderer that has never been given a mesh.
     ///
     /// # Errors
-    /// Returns an error if an index points past the last vertex, or if the GPU cannot
-    /// allocate or fill the buffers. The previous mesh is then kept.
+    /// Returns [`RenderError::InvalidMesh`] if the data is malformed (an index points
+    /// past the last vertex), or another error if the GPU cannot allocate or fill the
+    /// buffers. The previous mesh is then kept.
     fn set_mesh(&mut self, mesh: &vox_world::ChunkMesh) -> Result<(), RenderError>;
 
     /// Sets the combined view-projection matrix, column-major, exactly `glam::Mat4::to_cols_array_2d()`.
