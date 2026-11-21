@@ -5,6 +5,10 @@
 /// Chunks store only numbers. The mapping between numbers and block names is kept
 /// by a registry, so a world does not break when the set of mods changes.
 /// `u16` allows up to 65,536 block kinds and costs 2 bytes per block in a chunk.
+///
+/// `#[repr(transparent)]` guarantees the same layout as a plain `u16`, which matters
+/// because vertices that contain a `BlockId` are uploaded to the GPU as raw bytes.
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u16);
 

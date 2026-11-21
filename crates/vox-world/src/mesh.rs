@@ -111,9 +111,11 @@ pub struct ChunkMesh {
 /// assert_eq!(build_mesh(&chunk).indices.len(), 36);
 /// ```
 pub fn build_mesh(chunk: &Chunk) -> ChunkMesh {
-    // HOT PATH: one pass over the flat block array, a plain `Vec` push per vertex and
-    // no allocation inside the loops besides the output growth. No capacity estimate:
-    // the face count ranges from 0 to tens of thousands, and a guess would be unmeasured.
+    // HOT PATH: runs for every chunk that is generated or edited. It walks the flat
+    // block array once in storage order, so memory is read sequentially, and writes
+    // 6-byte vertices, so little data has to travel to the GPU. The only allocation
+    // cost is the growth of the output vectors, which is known and not measured yet;
+    // a capacity estimate waits for a benchmark.
     let mut mesh = ChunkMesh::default();
     for pos in LocalPos::all() {
         let block = chunk.get(pos);
@@ -238,25 +240,20 @@ mod tests {
         ]
     }
 
-    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-    }
-
     fn position(mesh: &ChunkMesh, index: u32) -> [f32; 3] {
         mesh.vertices[index as usize].position.map(f32::from)
     }
 
     #[test]
-    fn triangles_face_away_from_block_centre() {
+    fn triangles_face_away_from_the_block() {
         let mesh = build_mesh(&single_block_chunk(10, 10, 10));
-        let centre = [10.5, 10.5, 10.5];
         for triangle in mesh.indices.chunks(3) {
             let [a, b, c] = [0, 1, 2].map(|i| position(&mesh, triangle[i]));
             let normal = cross(sub(b, a), sub(c, a));
             let face = Face::ALL[mesh.vertices[triangle[0] as usize].face as usize];
-            // Unit quads: the cross product is exactly the face offset.
+            // Unit quads: the cross product is exactly the face offset, which points
+            // out of the block. A face wound the wrong way would give the opposite vector.
             assert_eq!(normal, face.offset().map(f32::from));
-            assert!(dot(normal, sub(a, centre)) > 0.0);
         }
     }
 

@@ -19,3 +19,6 @@ perf.data*
 # OS
 .DS_Store
 Thumbs.db
+
+# Temporary git worktrees created for agent work
+/.claude/worktrees/
