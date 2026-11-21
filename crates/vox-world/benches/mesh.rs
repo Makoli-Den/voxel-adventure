@@ -10,10 +10,16 @@ use std::hint::black_box;
 use std::mem::size_of;
 
 use criterion::{Criterion, Throughput};
-use vox_world::{BlockId, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkVertex, LocalPos};
-use vox_world::{build_mesh, build_mesh_into, generate_terrain};
+use vox_world::{
+    BlockId, CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, LocalPos,
+};
+use vox_world::{Neighbours, build_mesh, build_mesh_into, build_mesh_with_neighbours_into};
+use vox_world::{generate_chunk, generate_terrain};
 
 const STONE: BlockId = BlockId(1);
+/// Coordinate of the middle of the chunk along an axis: far from every border, so the
+/// single block of `single_block_chunk` has all six neighbours inside the chunk.
+const MIDDLE: usize = CHUNK_SIZE / 2;
 /// The seed of the realistic case. `terrain_mesh_has_the_pinned_number_of_quads` uses it too.
 const SEED: u32 = 1;
 
@@ -25,7 +31,7 @@ fn empty_chunk() -> Chunk {
 /// One block in the middle: the fixed cost of a mesh with almost no output.
 fn single_block_chunk() -> Chunk {
     let mut chunk = Chunk::new();
-    if let Some(pos) = LocalPos::new(16, 16, 16) {
+    if let Some(pos) = LocalPos::new(MIDDLE, MIDDLE, MIDDLE) {
         chunk.set(pos, STONE);
     }
     chunk
@@ -52,8 +58,8 @@ fn chunk_where(solid: impl Fn(LocalPos) -> bool) -> Chunk {
 }
 
 /// The mesher cases in the order they appear in the report.
-fn mesh_cases() -> [(&'static str, Chunk); 5] {
-    [
+fn mesh_cases() -> Vec<(&'static str, Chunk)> {
+    vec![
         ("empty", empty_chunk()),
         ("single_block", single_block_chunk()),
         ("terrain_seed_1", generate_terrain(SEED)),
@@ -74,7 +80,7 @@ fn print_mesh_stats() {
         println!(
             "{:<16} {:>8} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
             name,
-            mesh.indices.len() / 6,
+            mesh.quad_count(),
             mesh.vertices.len(),
             mesh_bytes(&mesh),
             mesh.vertices.capacity(),
@@ -126,6 +132,30 @@ fn bench_mesh_reused(c: &mut Criterion) {
     group.finish();
 }
 
+/// Times `build_mesh_with_neighbours_into` on the origin terrain chunk with all six
+/// neighbours present, on one reused mesh. Compare with `mesh_reused/terrain_seed_1`: the
+/// difference is the cost of looking into the neighbouring chunks.
+fn bench_mesh_neighbours(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mesh_neighbours");
+    group.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
+    let chunk = generate_terrain(SEED);
+    let around = Face::ALL.map(|face| generate_chunk(SEED, ChunkPos::ORIGIN.neighbour(face)));
+    let neighbours = Neighbours::new(around.each_ref().map(Some));
+    let mut mesh = ChunkMesh::default();
+    build_mesh_with_neighbours_into(&chunk, &neighbours, &mut mesh);
+    println!(
+        "terrain_seed_1 with neighbours: {} quads",
+        mesh.quad_count()
+    );
+    group.bench_function("terrain_seed_1", |b| {
+        b.iter(|| {
+            build_mesh_with_neighbours_into(black_box(&chunk), black_box(&neighbours), &mut mesh);
+            black_box(&mesh);
+        })
+    });
+    group.finish();
+}
+
 /// Times `generate_terrain` alone (noise, column fill and the allocation of the chunk).
 fn bench_terrain(c: &mut Criterion) {
     let mut group = c.benchmark_group("terrain");
@@ -133,15 +163,25 @@ fn bench_terrain(c: &mut Criterion) {
     group.bench_function("generate_seed_1", |b| {
         b.iter(|| generate_terrain(black_box(SEED)))
     });
+    // A chunk away from the origin, with a negative coordinate: the same work, other noise cells.
+    group.bench_function("generate_chunk_far", |b| {
+        b.iter(|| generate_chunk(black_box(SEED), black_box(ChunkPos::new(3, 0, -2))))
+    });
     group.finish();
 }
 
 // `criterion_group!` generates a public function without a doc comment.
 #[allow(missing_docs)]
 mod groups {
-    use super::{bench_mesh, bench_mesh_reused, bench_terrain};
+    use super::{bench_mesh, bench_mesh_neighbours, bench_mesh_reused, bench_terrain};
     use criterion::criterion_group;
-    criterion_group!(benches, bench_mesh, bench_mesh_reused, bench_terrain);
+    criterion_group!(
+        benches,
+        bench_mesh,
+        bench_mesh_reused,
+        bench_mesh_neighbours,
+        bench_terrain
+    );
 }
 
 /// A custom `main` instead of `criterion_main!`, only to print the mesh sizes first.

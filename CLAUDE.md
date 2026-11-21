@@ -20,6 +20,7 @@ A voxel game in Rust: the open world and freedom of Minecraft, the adventure, di
 - **SOLID**, Rust style: a module, struct or function has one responsibility; depend on traits, not on concrete implementations; extend with new types instead of editing old ones; keep interfaces narrow.
 - Readability beats cleverness. Short functions, clear names, no "smart" code.
 - Name the same thing the same way everywhere.
+- **No magic values.** Every number, size, color or string that carries a meaning gets a named `const` (or a documented parameter) with a doc comment saying what it is and why it has that value. Only 0, 1, 2 and obvious arithmetic (halving, `3.0 - 2.0 * t` of a smoothstep) may stay as literals. A derived value is computed from the constants it comes from (`Face::ALL.len()`, `CHUNK_SIZE / 2`), never repeated as a second number. Tests may use literals where the value is the point of the test. A well-known algorithm with fixed constants (a hash) keeps them in one small function whose doc names the algorithm and its source.
 
 ## Speed
 - Speed is the main goal, but **we optimize by measurement, not by guessing.** First simple, correct code, then a benchmark (`criterion`) and profiling, then optimization where the bottleneck was measured.
@@ -42,6 +43,7 @@ The main session acts as a conductor; the roles live in `.claude/agents/`.
 - **Split by interface, not inside a module.** One writing agent per set of files; never two writers on the same files. Tightly coupled code stays with one author.
 - **Reviewers only read.** Every meaningful change gets an independent review before it is committed.
 - **The conductor verifies.** Agent reports are claims, not facts: before committing, the conductor checks the findings and runs `cargo fmt`, `cargo clippy -D warnings` and `cargo test`.
+- **Tests that open the game window are few and quiet.** Every one is disruptive: a window opens, may take focus and changes size. Run them only when the change touches the window, presentation or input, once per such change plus the final check, start the game with its console hidden (`Start-Process -WindowStyle Hidden`), place it without stealing focus (`SetWindowPos` with `SWP_NOACTIVATE`), and say in the report what was opened and why. Everything that can be checked without a window (unit tests, logs, benchmarks) is checked that way.
 - **Memory:** each role reads `.claude/agent-memory/<role>/notes.md` at the start and appends short lessons at the end. The folder is local and not committed; the conductor prunes notes that became false.
 
 ## Documentation

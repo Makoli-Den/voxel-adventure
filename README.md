@@ -2,7 +2,7 @@
 
 A voxel game: the open world, freedom of action and world generation of Minecraft, combined with the adventure, difficulty and boss fights of Terraria. The top priority is speed: the game must be extremely fast and run on old devices. Mods, texture packs and shader packs are part of the core.
 
-> Status: very early. The game opens a window, picks a GPU through Vulkan, generates one chunk of hilly terrain and lets you fly over it (depth buffer, per-face shading), with shaders that are loaded from files and compiled at startup. Many chunks, textures, collision and mods are still to come.
+> Status: very early. The game opens a window, picks a GPU through Vulkan, generates a 17 by 17 area of hilly terrain chunks on all cores (faces between chunks are hidden), draws it and lets you fly over it (depth buffer, per-face shading), with shaders that are loaded from files and compiled at startup. Streaming chunks while you fly, textures, collision and mods are still to come.
 
 ## Stack
 - A custom engine in **Rust**, graphics on **Vulkan** (`ash`). The decision and its reasons: [docs/decisions/0001-rust-vulkan-own-engine.md](docs/decisions/0001-rust-vulkan-own-engine.md)
@@ -16,7 +16,7 @@ A voxel game: the open world, freedom of action and world generation of Minecraf
 assets/
   shaders/     built-in GLSL shaders (chunk.vert, chunk.frag), read and compiled when the game starts
 crates/
-  vox-world/   blocks, chunks, meshing and demo terrain; knows nothing about rendering, mods or networking
+  vox-world/   blocks, chunks, the world of chunks, meshing and demo terrain; knows nothing about rendering, mods or networking
   vox-render/  rendering behind the `Renderer` trait; the only crate that touches Vulkan
   vox-game/    the executable: window, event loop, wires the layers together
 docs/

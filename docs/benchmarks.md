@@ -36,6 +36,8 @@ closure; inputs and outputs go through `std::hint::black_box`. Source:
 | `mesh/checkerboard` | blocks where `x + y + z` is even | Worst case: no two solid blocks touch, almost every face is emitted. |
 | `terrain/generate_seed_1` | seed 1 | Cost of generating the chunk (noise, column fill, allocating the chunk). |
 | `mesh_reused/terrain_seed_1`, `solid`, `checkerboard` | same chunks | `build_mesh_into` on one warmed-up mesh: the steady state of a worker, without allocation. |
+| `mesh_neighbours/terrain_seed_1` | the origin terrain chunk with all six neighbouring terrain chunks present | `build_mesh_with_neighbours_into` on a warmed-up mesh: the cost of looking into neighbouring chunks, to compare with `mesh_reused/terrain_seed_1`. |
+| `terrain/generate_chunk_far` | `generate_chunk(1, ChunkPos::new(3, 0, -2))` | Chunk generation away from the origin, with a negative coordinate. |
 
 Throughput is set to the number of blocks in the chunk, so "blocks per second" counts air
 blocks too; it is a way to compare cases, not a count of solid blocks processed.
@@ -155,6 +157,65 @@ caller that needs a fresh mesh each time gets nothing. Next steps that follow fr
 a capacity estimate for the first call, and note that reused meshes of different sizes keep
 the largest capacity they ever reached.
 
+### 3. Chunks next to each other (2026-11-21)
+
+`generate_chunk` samples the noise at world coordinates and `build_mesh_with_neighbours_into`
+reads the neighbouring chunk for faces on the border (decision 0006). `build_mesh_into` is now
+the same function called with no neighbours. Medians of each of three consecutive runs on a
+quiet machine, before and after the change (same session; the machine was 5 to 15 percent
+slower than at the baseline above, and drifted during the last run, see below):
+
+| Case | Before (3 runs) | After (3 runs) |
+|---|---|---|
+| `mesh/empty` | 11.91 / 12.08 / 12.37 us | 11.56 / 12.24 / 13.74 us |
+| `mesh/single_block` | 11.63 / 11.96 / 12.07 us | 11.96 / 13.10 / 14.19 us |
+| `mesh/terrain_seed_1` | 254.3 / 262.1 / 262.8 us | 217.9 / 242.2 / 251.6 us |
+| `mesh/solid` | 399.2 / 409.3 / 413.1 us | 407.0 / 429.9 / 442.1 us |
+| `mesh/checkerboard` | 2.05 / 2.28 / 2.87 ms | 1.96 / 2.47 / 2.98 ms |
+| `mesh_reused/terrain_seed_1` | 224.2 / 226.5 / 230.6 us | 206.9 / 208.9 / 233.5 us |
+| `mesh_reused/solid` | 379.6 / 385.0 / 387.1 us | 353.5 / 370.6 / 375.7 us |
+| `mesh_reused/checkerboard` | 0.98 / 1.04 / 1.34 ms | 0.95 / 0.96 / 1.18 ms |
+| `mesh_neighbours/terrain_seed_1` | new case | 197.8 / 222.5 / 247.6 us (1,642 quads) |
+| `terrain/generate_seed_1` | 38.7 / 39.1 / 40.3 us | 46.3 / 48.2 / 49.2 us |
+| `terrain/generate_chunk_far` | new case | 46.1 / 49.8 / 51.9 us |
+
+- **The existing mesher cases are not distinguishable from noise.** The `mesh_reused/*` ranges
+  overlap or lie lower. `mesh/single_block` and `mesh/solid` look a little higher after (13.1 - 14.2
+  against 11.6 - 12.1 us, and 407 - 442 against 399 - 413 us), but `mesh/empty`, which runs none of
+  the changed code, also moved up in the same runs (13.7 us in the last run), and the interleaved
+  `mesh_reused/solid`, the same work without allocation, was lower. With three runs and 5 to 15 percent
+  of drift this cannot be settled either way. The common path (a neighbour inside the chunk) is the
+  same code as before.
+- **Neighbour-aware meshing costs nothing that can be measured here.** `mesh_neighbours/terrain_seed_1`
+  (198 - 248 us) lies inside the range of `mesh_reused/terrain_seed_1` (207 - 234 us). The runs of
+  the neighbour case are wide (the ranges are 25 percent apart), so a difference of a few percent
+  would not show. Note that the two cases do not produce the same output: with its neighbours the
+  chunk has 1,642 quads instead of 4,848 (its sides are mostly hidden by the stone next to it), so
+  there is less to write while more border faces take the slower path. The two effects may cancel.
+- **Terrain generation was about 20 percent slower right after this change** (38.7 - 40.3 to
+  46.3 - 49.2 us, ranges do not overlap). The cause was a hypothesis until experiment 4 below
+  measured it: the per-block work in `fill_column`, not the noise. A first version of the noise with
+  `div_euclid` and `rem_euclid` took 61 - 74 us, so the shift and mask (valid because every cell
+  size is a power of two, a const assertion guards this) were kept. The numbers in the table above
+  are from before experiment 4; see there for the final ones.
+
+### 4. Filling a column by layers: kept
+
+`fill_column` first decided the block of every height with a four-way `block_for`, a saturating add
+and a `LocalPos::new`. It now works out the layer boundaries once per column (stone below
+`stone_end`, dirt up to `dirt_end`, one grass block), clamped to the chunk, and fills each layer with
+a plain loop. Output is identical (all terrain tests and pinned numbers pass unchanged). Three runs
+before and after in the same session (medians of each run, range lowest - highest):
+
+| Case | Before (3 runs) | After (3 runs) | Verdict |
+|---|---|---|---|
+| `terrain/generate_seed_1` | 45.3 / 44.2 / 44.9 us (44.2 - 45.3) | 29.3 / 29.4 / 26.8 us (26.8 - 29.4) | 35 to 40 percent faster, ranges apart |
+| `terrain/generate_chunk_far` | 44.8 / 45.8 / 47.8 us (44.8 - 47.8) | 29.2 / 30.1 / 27.8 us (27.8 - 30.1) | 33 to 42 percent faster, ranges apart |
+
+Both cases pass the keep rule. The new figures are also lower than the 38.7 - 40.3 us of before the
+multi-chunk change (measured an hour earlier, so only roughly comparable): the old code branched
+per block as well.
+
 ## What this does and does not tell us
 
 - One machine, one CPU (a desktop Ryzen with a large cache). An old low-end device, which is
@@ -163,9 +224,10 @@ the largest capacity they ever reached.
   bandwidth and for the allocator is not measured.
 - One chunk size (32) and one terrain seed. Other seeds change the number of faces by tens of
   percent, not by orders of magnitude.
-- No neighbour lookups across chunk borders: the mesher treats outside as air, so border
-  faces are always emitted. A mesher that reads neighbouring chunks will be slower and these
-  numbers will not carry over.
+- `mesh/*` and `mesh_reused/*` mesh a chunk without neighbours (outside is air). Only
+  `mesh_neighbours/terrain_seed_1` looks into neighbouring chunks, and only for one terrain
+  chunk surrounded by terrain. A chunk at a different height, beside air or beside a chunk
+  that is not loaded, takes other paths.
 - The vertices are not uploaded to a GPU; the benchmark ends at the `Vec`s. Page faults and
   allocator work for the fresh vectors are included, because every iteration allocates a new mesh.
 - The terrain generator benchmark includes allocating and zeroing the chunk (64 KiB).

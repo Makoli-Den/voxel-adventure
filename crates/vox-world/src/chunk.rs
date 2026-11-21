@@ -63,6 +63,21 @@ impl LocalPos {
         Self::new(x as usize, y as usize, z as usize)
     }
 
+    /// Returns the position shifted by `offset` with wrap-around: leaving the chunk on
+    /// one side comes back in on the opposite side.
+    ///
+    /// For a block on the border and an offset that points out of the chunk, this is the
+    /// position of the touching block inside the neighbouring chunk. The mask keeps every
+    /// coordinate below [`CHUNK_SIZE`], so the invariant of `LocalPos` holds.
+    pub(crate) fn wrapped(self, offset: [i8; 3]) -> Self {
+        const MASK: u8 = (CHUNK_SIZE - 1) as u8;
+        Self {
+            x: self.x.wrapping_add_signed(offset[0]) & MASK,
+            y: self.y.wrapping_add_signed(offset[1]) & MASK,
+            z: self.z.wrapping_add_signed(offset[2]) & MASK,
+        }
+    }
+
     /// Iterates over every position of the chunk in storage order.
     pub fn all() -> impl Iterator<Item = Self> {
         (0..CHUNK_VOLUME).map(Self::from_index)
@@ -178,6 +193,14 @@ mod tests {
         assert_eq!(p.offset([1, 0, -1]), Some(pos(1, 31, 4)));
         assert_eq!(p.offset([-1, 0, 0]), None);
         assert_eq!(p.offset([0, 1, 0]), None);
+    }
+
+    #[test]
+    fn wrapped_comes_back_in_on_the_opposite_side() {
+        let p = pos(0, 31, 5);
+        assert_eq!(p.wrapped([-1, 0, 0]), pos(31, 31, 5));
+        assert_eq!(p.wrapped([0, 1, 0]), pos(0, 0, 5));
+        assert_eq!(p.wrapped([1, 0, -1]), pos(1, 31, 4));
     }
 
     #[test]

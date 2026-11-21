@@ -26,7 +26,10 @@ pub struct Frames {
     pool: vk::CommandPool,
     slots: Vec<FrameSlot>,
     render_finished: Vec<vk::Semaphore>,
-    current: usize,
+    /// How many frames have been submitted; the number of the next frame. Frame `k`
+    /// always uses slot [`slot_index`]`(k)`; the slot is derived, never stored, so the
+    /// two cannot drift apart.
+    submitted: u64,
 }
 
 impl Frames {
@@ -42,7 +45,7 @@ impl Frames {
             pool: vk::CommandPool::null(),
             slots: Vec::with_capacity(FRAMES_IN_FLIGHT),
             render_finished: Vec::new(),
-            current: 0,
+            submitted: 0,
         };
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -67,14 +70,36 @@ impl Frames {
 
     /// The resources of the frame being prepared now.
     pub fn current_slot(&self) -> FrameSlot {
-        // Indexing is safe: `current` is always kept below `FRAMES_IN_FLIGHT`,
+        // Indexing is safe: `slot_index` is always below `FRAMES_IN_FLIGHT`,
         // and `new` creates exactly that many slots.
-        self.slots[self.current]
+        self.slots[slot_index(self.submitted)]
     }
 
-    /// Moves on to the next frame in flight.
+    /// Moves on to the next frame in flight. Call once per submitted frame, right after
+    /// the submit.
     pub fn advance(&mut self) {
-        self.current = (self.current + 1) % FRAMES_IN_FLIGHT;
+        self.submitted += 1;
+    }
+
+    /// Whether the fence of every slot is signaled right now. Does not wait.
+    ///
+    /// Each fence is signaled by the last frame submitted in its slot (or was created
+    /// signaled), so `true` means each of the last [`FRAMES_IN_FLIGHT`] frames finished.
+    pub fn all_fences_signaled(&self) -> Result<bool, RenderError> {
+        for slot in &self.slots {
+            // SAFETY: the fence belongs to this device and stays alive as long as `self`.
+            let signaled = unsafe { self.device.get_fence_status(slot.in_flight)? };
+            if !signaled {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// How many frames have been submitted so far, which is also the number of the
+    /// frame being prepared now (frames are numbered from 0).
+    pub fn submitted(&self) -> u64 {
+        self.submitted
     }
 
     /// The semaphore signaled when rendering to the swapchain image `image_index` is done.
@@ -140,6 +165,12 @@ impl Frames {
     }
 }
 
+/// The slot frame number `frame` uses: frames take turns through the slots.
+pub fn slot_index(frame: u64) -> usize {
+    // Lossless: the remainder is below `FRAMES_IN_FLIGHT`, a small `usize`.
+    (frame % FRAMES_IN_FLIGHT as u64) as usize
+}
+
 impl Drop for Frames {
     fn drop(&mut self) {
         // SAFETY: the renderer waits for the device to go idle before dropping this.
@@ -152,5 +183,35 @@ impl Drop for Frames {
             // Destroying the pool also frees its command buffers.
             self.device.destroy_command_pool(self.pool, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_take_turns_through_the_slots() {
+        let slots: Vec<usize> = (0..5).map(slot_index).collect();
+        assert_eq!(slots, [0, 1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn the_last_frames_in_flight_use_distinct_slots() {
+        // The fence-status shortcut in `retired` relies on this: the last
+        // FRAMES_IN_FLIGHT frames each own a different slot.
+        for submitted in FRAMES_IN_FLIGHT as u64..20 {
+            let mut used: Vec<usize> = (submitted - FRAMES_IN_FLIGHT as u64..submitted)
+                .map(slot_index)
+                .collect();
+            used.sort_unstable();
+            used.dedup();
+            assert_eq!(used.len(), FRAMES_IN_FLIGHT);
+        }
+    }
+
+    #[test]
+    fn slot_index_stays_in_range_for_huge_frame_numbers() {
+        assert!(slot_index(u64::MAX) < FRAMES_IN_FLIGHT);
     }
 }

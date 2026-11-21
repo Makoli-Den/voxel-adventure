@@ -7,7 +7,7 @@ Source of ideas: a breakdown of the video "My game is 262,000 times faster than 
 2. Faces hidden by neighbouring blocks are not generated.
 3. Frustum culling, and disabling mesh sides that face away from the camera.
 4. Compact vertices: positions stored in bytes.
-5. Cubic chunks, so the world is infinite in height as well.
+5. Cubic chunks, so the world is infinite in height as well. (Done: `ChunkPos` has three coordinates and `World` stores chunks by it, see decision 0006. Faces hidden by a neighbouring chunk are skipped too, item 2.)
 6. Chunk generation and mesh building run off the main thread.
 7. Chunk LOD: distant chunks at lower resolution, merged into larger meshes.
 8. Greedy meshing.

@@ -7,6 +7,7 @@
 mod camera;
 mod controls;
 mod pacing;
+mod world_loader;
 
 use std::error::Error;
 use std::fmt::Display;
@@ -17,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use glam::Vec3;
 use vox_render::{Renderer, create_renderer};
-use vox_world::{build_mesh, generate_terrain};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -29,8 +29,19 @@ use controls::Controls;
 
 /// Seed of the terrain that is generated at startup.
 const WORLD_SEED: u32 = 1;
-/// How fast the camera flies, in blocks per second.
-const MOVE_SPEED: f32 = 12.0;
+/// How far the loaded area reaches from the origin chunk along X and Z, in chunks. The
+/// camera's far plane (`FAR` in `camera.rs`) has to cover the area, so the two go together.
+const VIEW_RADIUS: i32 = 8;
+/// Where the camera starts: above the loaded area, back from the origin chunk (the terrain
+/// lies at heights 8 to 24), so a large part of the area is in view.
+const CAMERA_START: Vec3 = Vec3::new(16.0, 60.0, 90.0);
+/// The camera's start yaw in radians; 0 looks along -Z, towards the loaded area.
+const CAMERA_START_YAW: f32 = 0.0;
+/// The camera's start pitch in radians; negative looks down at the terrain.
+const CAMERA_START_PITCH: f32 = -0.35;
+/// How fast the camera flies, in blocks per second. The loaded area is hundreds of blocks
+/// across, so this is brisk.
+const MOVE_SPEED: f32 = 40.0;
 /// How far the camera turns per pixel of mouse motion, in radians.
 const LOOK_SENSITIVITY: f32 = 0.0025;
 /// Longest frame time that is taken into account, in seconds. After a stall (a window
@@ -60,8 +71,7 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            // Above and in front of the chunk, looking at it from a distance and slightly down.
-            camera: Camera::new(Vec3::new(16.0, 34.0, 58.0), 0.0, -0.45),
+            camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
             controls: Controls::default(),
             last_frame: Instant::now(),
             frame_interval: pacing::frame_interval(None),
@@ -82,7 +92,16 @@ impl App {
         let mut renderer =
             create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
         println!("Rendering on: {}", renderer.device_name());
-        renderer.set_mesh(&build_mesh(&generate_terrain(WORLD_SEED)))?;
+        let loaded = world_loader::load_area(WORLD_SEED, VIEW_RADIUS);
+        let uploading = Instant::now();
+        for (pos, mesh) in &loaded.meshes {
+            renderer.set_chunk_mesh(*pos, mesh)?;
+        }
+        println!(
+            "World: {}, uploaded in {:.1?}",
+            loaded.stats,
+            uploading.elapsed()
+        );
         renderer.set_camera(self.camera.view_projection(size.width, size.height));
 
         self.window = Some(window);
