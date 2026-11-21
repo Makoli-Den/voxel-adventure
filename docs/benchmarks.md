@@ -91,6 +91,37 @@ this predicts about 118 us of neighbour checks, 91 us of quad emission and 11 us
 which sums to the measured 220 us. This is a model fitted to three measurements, not a
 profile; it says where the time probably goes, not by how much to the percent.
 
+**The model was tested and its main claim did not hold** (see the first experiment below):
+making the neighbour check cheaper did not speed up the case that consists almost only of
+neighbour checks. Treat the 54 percent figure as wrong. The fit mixed the neighbour test with
+everything else that scales with the number of solid blocks (reading the block, branching
+per face), so the neighbour check alone is much cheaper than 1.2 ns, probably because the
+compiler already removes most of its bounds work. Only a profiler can say where the time goes.
+
+## Experiments
+
+Each experiment is run with three benchmark runs before and three after on the same machine,
+and the change is kept only if the whole range of the new runs lies outside the range of the old
+ones. This section records the ones that were tried, including those that were rejected, so that
+nobody repeats them without a new reason.
+
+### 1. Neighbour test by flat index: rejected
+
+Replaced the per-face `LocalPos::offset` (three `checked_add_signed` calls and a bounds check) by
+index arithmetic on the flat block array: the neighbour is `index +- 1`, `+- 32` or `+- 1024`,
+with a border test on the coordinate. The mesh was identical, vertex for vertex (a test compared
+it with a plain reference mesher on 11 chunks), and the code was about 30 lines longer.
+
+| Case | Before (3 runs, median) | After (3 runs, median) | Verdict |
+|---|---|---|---|
+| `mesh/terrain_seed_1` | 221.6 - 232.0 us | 194.7 - 217.1 us | faster by 2 to 12 percent, wide spread |
+| `mesh/solid` | 356.9 - 372.5 us | 360.1 - 388.5 us | no gain, probably slightly slower |
+| `mesh/checkerboard` | 1.94 - 2.09 ms | 2.02 - 2.79 ms | no gain (one noisy outlier) |
+
+The decision rule needed both the terrain and the solid case to be clearly faster. `mesh/solid`
+is almost nothing but neighbour checks, and it did not improve, so the cheap check is not where
+the time goes. Not kept: the extra code buys nothing that can be measured reliably.
+
 ## What this does and does not tell us
 
 - One machine, one CPU (a desktop Ryzen with a large cache). An old low-end device, which is
