@@ -8,7 +8,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+glam = "0.34.3"
 vox-render = { path = "../vox-render" }
+vox-world = { path = "../vox-world" }
 winit = "0.30.13"
 
 [lints]

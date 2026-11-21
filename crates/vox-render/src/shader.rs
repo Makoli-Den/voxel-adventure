@@ -42,11 +42,19 @@ fn compile_glsl(source: &str, stage: ShaderStage, name: &str) -> Result<Vec<u32>
         .map_err(|errors| shader_error(name, &errors.emit_to_string(source)))?;
     // Validation catches mistakes the parser lets through, so a broken shader pack
     // fails here with a readable message instead of crashing the driver.
-    let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
+    let info = Validator::new(ValidationFlags::all(), allowed_capabilities())
         .validate(&module)
         .map_err(|error| shader_error(name, &error.emit_to_string_with_path(source, name)))?;
     spv::write_vec(&module, &info, &spirv_options(), None)
         .map_err(|error| shader_error(name, &error.to_string()))
+}
+
+/// The optional features a shader may use: only those core Vulkan 1.0 always has.
+///
+/// Push constants (naga calls them "immediates") are core Vulkan 1.0 and need no
+/// device feature. Anything added here must be enabled on the device first.
+fn allowed_capabilities() -> Capabilities {
+    Capabilities::IMMEDIATES
 }
 
 /// SPIR-V writer settings for Vulkan 1.0.
@@ -93,13 +101,13 @@ mod tests {
 
     #[test]
     fn real_vertex_shader_compiles() {
-        let words = load_spirv(&shader_dir().join("triangle.vert"), ShaderStage::Vertex).unwrap();
+        let words = load_spirv(&shader_dir().join("chunk.vert"), ShaderStage::Vertex).unwrap();
         assert_is_spirv(&words);
     }
 
     #[test]
     fn real_fragment_shader_compiles() {
-        let words = load_spirv(&shader_dir().join("triangle.frag"), ShaderStage::Fragment).unwrap();
+        let words = load_spirv(&shader_dir().join("chunk.frag"), ShaderStage::Fragment).unwrap();
         assert_is_spirv(&words);
     }
 

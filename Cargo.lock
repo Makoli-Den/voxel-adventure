@@ -472,6 +472,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.34.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "627003914c6057c9c8f0832ee4f870b5a4f599d0cfa83f4072675114860cd0ff"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1519,7 +1525,9 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vox-game"
 version = "0.1.0"
 dependencies = [
+ "glam",
  "vox-render",
+ "vox-world",
  "winit",
 ]
 
@@ -1531,6 +1539,7 @@ dependencies = [
  "ash-window",
  "naga",
  "raw-window-handle",
+ "vox-world",
 ]
 
 [[package]]

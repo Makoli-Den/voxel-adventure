@@ -3,6 +3,8 @@
 //! This is where the layers are wired together: it opens the window, creates the
 //! renderer and runs the event loop. World, mods and networking will join later.
 
+mod demo;
+
 use std::error::Error;
 use std::fmt::Display;
 use std::path::Path;
@@ -10,6 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use vox_render::{Renderer, create_renderer};
+use vox_world::build_mesh;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -35,8 +38,12 @@ impl App {
         // Temporary: shaders are read straight from the source tree until the resource
         // virtual file system exists and resolves them through the active packs.
         let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shaders");
-        let renderer = create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
+        let mut renderer =
+            create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
         println!("Rendering on: {}", renderer.device_name());
+        // Temporary: a fixed demo scene until world generation and a player camera exist.
+        renderer.set_mesh(&build_mesh(&demo::chunk()))?;
+        renderer.set_camera(demo::camera(size.width, size.height));
 
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -65,6 +72,8 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
+                    // Temporary: keeps the demo camera's aspect ratio in step with the window.
+                    renderer.set_camera(demo::camera(size.width, size.height));
                 }
                 // Draw continuously, but sleep until the next event while minimized.
                 self.minimized = size.width == 0 || size.height == 0;

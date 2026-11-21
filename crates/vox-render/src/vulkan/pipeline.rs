@@ -1,9 +1,10 @@
-//! The graphics pipeline that draws the demo triangle, and the shader modules it is built from.
+//! The graphics pipeline that draws chunk meshes, and the shader modules it is built from.
 
 use std::path::Path;
 
 use ash::vk;
 
+use super::mesh;
 use super::render_pass::RenderPass;
 use crate::RenderError;
 use crate::shader::{self, ShaderStage};
@@ -11,7 +12,11 @@ use crate::shader::{self, ShaderStage};
 /// Entry point name of every shader stage; GLSL always calls it `main`.
 const ENTRY_POINT: &std::ffi::CStr = c"main";
 
-/// The triangle pipeline and its (empty) layout.
+/// Size of the push constants: one column-major `mat4`, the camera's view-projection.
+/// Vulkan 1.0 guarantees at least 128 bytes.
+pub const CAMERA_PUSH_SIZE: u32 = 64;
+
+/// The chunk pipeline and its layout (no descriptor sets, one push-constant range).
 ///
 /// Viewport and scissor are dynamic, so a window resize never rebuilds the pipeline.
 pub struct Pipeline {
@@ -21,7 +26,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Compiles `triangle.vert` and `triangle.frag` from `shader_dir` and builds the
+    /// Compiles `chunk.vert` and `chunk.frag` from `shader_dir` and builds the
     /// pipeline for `render_pass`.
     pub fn new(
         device: &ash::Device,
@@ -29,10 +34,9 @@ impl Pipeline {
         shader_dir: &Path,
     ) -> Result<Self, RenderError> {
         // Compile first: a broken shader fails before any Vulkan object exists.
-        let vertex_code =
-            shader::load_spirv(&shader_dir.join("triangle.vert"), ShaderStage::Vertex)?;
+        let vertex_code = shader::load_spirv(&shader_dir.join("chunk.vert"), ShaderStage::Vertex)?;
         let fragment_code =
-            shader::load_spirv(&shader_dir.join("triangle.frag"), ShaderStage::Fragment)?;
+            shader::load_spirv(&shader_dir.join("chunk.frag"), ShaderStage::Fragment)?;
         let vertex = ShaderModule::new(device, &vertex_code)?;
         let fragment = ShaderModule::new(device, &fragment_code)?;
 
@@ -43,8 +47,14 @@ impl Pipeline {
             layout: vk::PipelineLayout::null(),
             handle: vk::Pipeline::null(),
         };
-        let layout_info = vk::PipelineLayoutCreateInfo::default();
-        // SAFETY: the device is alive and the empty create info outlives the call.
+        let push_ranges = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::VERTEX,
+            offset: 0,
+            size: CAMERA_PUSH_SIZE,
+        }];
+        let layout_info =
+            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges);
+        // SAFETY: the device is alive and the create info with its array outlives the call.
         pipeline.layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
         pipeline.handle = pipeline.create_graphics(render_pass, &vertex, &fragment)?;
         // The shader modules are dropped here; a built pipeline no longer needs them.
@@ -54,6 +64,11 @@ impl Pipeline {
     /// The raw pipeline handle.
     pub fn handle(&self) -> vk::Pipeline {
         self.handle
+    }
+
+    /// The pipeline layout, needed to push constants.
+    pub fn layout(&self) -> vk::PipelineLayout {
+        self.layout
     }
 
     /// Builds the pipeline object from the two shader stages.
@@ -67,8 +82,11 @@ impl Pipeline {
             stage_info(vk::ShaderStageFlags::VERTEX, vertex),
             stage_info(vk::ShaderStageFlags::FRAGMENT, fragment),
         ];
-        // No vertex buffers: the vertex shader picks positions by gl_VertexIndex.
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let bindings = mesh::vertex_bindings();
+        let attributes = mesh::vertex_attributes();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         // Only the counts are fixed; the rectangles are set per frame (dynamic state).
@@ -78,6 +96,7 @@ impl Pipeline {
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let rasterization = rasterization_state();
+        let depth = depth_state();
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
@@ -92,6 +111,7 @@ impl Pipeline {
             .viewport_state(&viewport)
             .rasterization_state(&rasterization)
             .multisample_state(&multisample)
+            .depth_stencil_state(&depth)
             .color_blend_state(&blend)
             .dynamic_state(&dynamic)
             .layout(self.layout)
@@ -124,13 +144,27 @@ impl Drop for Pipeline {
     }
 }
 
-/// Filled triangles, no culling yet (the winding order is not settled), no depth bias.
+/// Filled triangles with back faces culled, no depth bias.
 fn rasterization_state() -> vk::PipelineRasterizationStateCreateInfo<'static> {
     vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
-        .front_face(vk::FrontFace::CLOCKWISE)
+        .cull_mode(vk::CullModeFlags::BACK)
+        // The mesher winds faces counter-clockwise seen from outside (right-handed,
+        // Y up). The camera matrix flips Y for Vulkan clip space, so the image is
+        // upright, and the winding a viewer sees on screen stays counter-clockwise.
+        // Vulkan defines the facing with framebuffer Y pointing down (the minus sign in
+        // the spec's area formula), so on-screen counter-clockwise is COUNTER_CLOCKWISE.
+        // Checked visually: with CLOCKWISE the far inside faces of the chunk show.
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0)
+}
+
+/// Nearer fragments win: test with LESS against a buffer cleared to 1.0, and write.
+fn depth_state() -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+    vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_write_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS)
 }
 
 fn stage_info(
@@ -155,9 +189,9 @@ impl ShaderModule {
         let create_info = vk::ShaderModuleCreateInfo::default().code(code);
         // SAFETY: the device is alive, and `code` is SPIR-V produced and validated by naga.
         // Vulkan also requires that the module uses only capabilities the device has
-        // enabled. That holds because the validator in `shader.rs` runs with no optional
-        // capabilities, so only core SPIR-V features can appear. Do not widen that set
-        // without enabling the matching device features.
+        // enabled. That holds because the validator in `shader.rs` allows only push
+        // constants, which are core Vulkan 1.0, so only core SPIR-V features can appear.
+        // Do not widen that set without enabling the matching device features.
         let handle = unsafe { device.create_shader_module(&create_info, None)? };
         Ok(Self {
             device: device.clone(),

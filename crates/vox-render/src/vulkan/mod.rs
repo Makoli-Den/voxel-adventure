@@ -6,9 +6,13 @@
 //! The target is plain Vulkan 1.0 so that old GPUs keep working.
 #![allow(unsafe_code)]
 
+mod buffer;
 mod context;
+mod depth;
 mod frames;
 mod gpu;
+mod memory;
+mod mesh;
 mod pipeline;
 mod render_pass;
 mod renderer;

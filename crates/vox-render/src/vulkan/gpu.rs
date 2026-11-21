@@ -14,6 +14,8 @@ pub struct Gpu {
     queue: vk::Queue,
     queue_family: u32,
     name: String,
+    /// Memory types and heaps of the GPU, read once because they never change.
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
 }
 
 impl Gpu {
@@ -55,6 +57,8 @@ impl Gpu {
         // SAFETY: the queue family and index 0 were requested in `device_info`.
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
+        // SAFETY: `physical` came from this live instance.
+        let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
         let name = properties.device_name_as_c_str().map_or_else(
             |_| String::from("unknown GPU"),
             |n| n.to_string_lossy().into_owned(),
@@ -66,6 +70,7 @@ impl Gpu {
             queue,
             queue_family,
             name,
+            memory_properties,
         })
     }
 
@@ -92,6 +97,11 @@ impl Gpu {
     /// Human-readable GPU name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The GPU's memory types and heaps.
+    pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+        &self.memory_properties
     }
 }
 
