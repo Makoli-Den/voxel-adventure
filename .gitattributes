@@ -1,0 +1,21 @@
+# Normalize text, leave binaries alone
+* text=auto
+
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+
+# Shaders
+*.glsl text eol=lf
+*.vert text eol=lf
+*.frag text eol=lf
+*.comp text eol=lf
+*.wgsl text eol=lf
+
+# Binary assets
+*.png  binary
+*.jpg  binary
+*.ogg  binary
+*.wav  binary
+*.spv  binary
+*.wasm binary

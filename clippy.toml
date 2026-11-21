@@ -1,0 +1,3 @@
+# unwrap and expect are fine in tests: a panic there is exactly the failure signal.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -1,0 +1,11 @@
+[package]
+name = "vox-world"
+version = "0.1.0"
+description = "World data: blocks and chunks. Knows nothing about rendering, mods or networking."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

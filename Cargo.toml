@@ -1,0 +1,25 @@
+# Root workspace manifest. Crates live in crates/ and are picked up automatically.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Shared code quality rules for every crate (see CLAUDE.md).
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid" # Allow locally and deliberately, only in isolated modules.
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Release build: maximum speed at the cost of longer build times.
+[profile.release]
+lto = "thin"
+codegen-units = 1
