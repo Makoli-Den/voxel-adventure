@@ -16,6 +16,7 @@ mod mesh;
 mod pipeline;
 mod render_pass;
 mod renderer;
+mod retired;
 mod swapchain;
 
 use ash::vk;

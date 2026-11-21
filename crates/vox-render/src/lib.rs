@@ -34,16 +34,25 @@ pub trait Renderer {
     /// Human-readable name of the GPU in use.
     fn device_name(&self) -> &str;
 
-    /// Replaces the mesh that is drawn every frame. The previous mesh's GPU buffers are freed.
+    /// Adds or replaces the mesh of the chunk at `pos`. An empty mesh (no indices) removes the entry.
     ///
-    /// Coordinates are chunk-local block units; the chunk sits at the origin. An empty
-    /// mesh draws nothing, and so does a renderer that has never been given a mesh.
+    /// Every chunk that has a mesh is drawn each frame. Mesh coordinates are chunk-local
+    /// block units; the renderer places the chunk at `pos.origin()`. A replaced mesh's GPU
+    /// memory is freed a few frames later, once no frame in flight can use it, so this
+    /// never waits for the GPU.
     ///
     /// # Errors
     /// Returns [`RenderError::InvalidMesh`] if the data is malformed (an index points
     /// past the last vertex), or another error if the GPU cannot allocate or fill the
-    /// buffers. The previous mesh is then kept.
-    fn set_mesh(&mut self, mesh: &vox_world::ChunkMesh) -> Result<(), RenderError>;
+    /// buffer. The chunk's previous mesh is then kept.
+    fn set_chunk_mesh(
+        &mut self,
+        pos: vox_world::ChunkPos,
+        mesh: &vox_world::ChunkMesh,
+    ) -> Result<(), RenderError>;
+
+    /// Removes the mesh of the chunk at `pos`, if there is one. Does nothing otherwise.
+    fn remove_chunk_mesh(&mut self, pos: vox_world::ChunkPos);
 
     /// Sets the combined view-projection matrix, column-major, exactly `glam::Mat4::to_cols_array_2d()`.
     ///

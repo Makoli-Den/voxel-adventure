@@ -16,13 +16,34 @@
 //! Location 0 reads four bytes at once because a three-byte vertex format is not
 //! guaranteed in Vulkan 1.0, while a four-byte one is. The fourth byte happens to be
 //! the face index, so nothing is wasted.
+//!
+//! # Push constants
+//! One range for the vertex stage only, 80 bytes at offset 0, pushed once per chunk
+//! drawn. Floats are little-endian `f32`:
+//!
+//! | byte   | content                                             | GLSL   |
+//! |--------|-----------------------------------------------------|--------|
+//! | 0..64  | the camera's view-projection, column-major          | `mat4` |
+//! | 64..80 | the chunk's origin in blocks in `xyz`, `w` is 0     | `vec4` |
+//!
+//! A `mat4` followed by a `vec4` has these offsets under the std430 rules push
+//! constants use, so a shader can declare the block as written in the table.
 
 /// Bytes from one vertex to the next.
 pub(crate) const VERTEX_STRIDE: u32 = 6;
 
-/// Size of the push constants, visible to the vertex stage only: one column-major
-/// `mat4`, the camera's view-projection. Vulkan 1.0 guarantees at least 128 bytes.
-pub(crate) const PUSH_CONSTANT_SIZE: u32 = 64;
+/// Size of the push constants, see the table in the module docs. Vulkan 1.0
+/// guarantees at least 128 bytes.
+pub(crate) const PUSH_CONSTANT_SIZE: u32 = 80;
+
+/// Byte offset of the chunk origin inside the push constants, right after the matrix.
+pub(crate) const CHUNK_ORIGIN_OFFSET: u32 = 64;
+
+// `maxPushConstantsSize` is at least 128 on every Vulkan 1.0 device; staying within
+// it means no capability check is needed.
+const _: () = assert!(PUSH_CONSTANT_SIZE <= 128);
+// The origin `vec4` fills the rest of the block after the matrix.
+const _: () = assert!(CHUNK_ORIGIN_OFFSET + 16 == PUSH_CONSTANT_SIZE);
 
 /// How an attribute is stored in the vertex buffer. Every format is an unsigned
 /// integer format, so the shader always sees 32-bit unsigned components.
@@ -109,6 +130,12 @@ mod tests {
     fn attributes_do_not_overlap() {
         let [first, second] = VERTEX_ATTRIBUTES;
         assert!(first.offset + size(first.format) <= second.offset);
+    }
+
+    #[test]
+    fn push_constants_are_a_matrix_then_a_vec4() {
+        assert_eq!(CHUNK_ORIGIN_OFFSET, 16 * 4);
+        assert_eq!(PUSH_CONSTANT_SIZE, CHUNK_ORIGIN_OFFSET + 4 * 4);
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub struct Frames {
     slots: Vec<FrameSlot>,
     render_finished: Vec<vk::Semaphore>,
     current: usize,
+    /// How many frames have been submitted; the number of the next frame.
+    submitted: u64,
 }
 
 impl Frames {
@@ -43,6 +45,7 @@ impl Frames {
             slots: Vec::with_capacity(FRAMES_IN_FLIGHT),
             render_finished: Vec::new(),
             current: 0,
+            submitted: 0,
         };
 
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -72,9 +75,17 @@ impl Frames {
         self.slots[self.current]
     }
 
-    /// Moves on to the next frame in flight.
+    /// Moves on to the next frame in flight. Call once per submitted frame, right after
+    /// the submit.
     pub fn advance(&mut self) {
         self.current = (self.current + 1) % FRAMES_IN_FLIGHT;
+        self.submitted += 1;
+    }
+
+    /// How many frames have been submitted so far, which is also the number of the
+    /// frame being prepared now (frames are numbered from 0).
+    pub fn submitted(&self) -> u64 {
+        self.submitted
     }
 
     /// The semaphore signaled when rendering to the swapchain image `image_index` is done.

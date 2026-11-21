@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use glam::Vec3;
 use vox_render::{Renderer, create_renderer};
-use vox_world::{build_mesh, generate_terrain};
+use vox_world::{ChunkPos, build_mesh, generate_terrain};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -60,8 +60,9 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            // Above and in front of the chunk, looking at it from a distance and slightly down.
-            camera: Camera::new(Vec3::new(16.0, 34.0, 58.0), 0.0, -0.45),
+            // Above and in front of the 3 by 3 demo grid (x and z from -32 to 64),
+            // looking at it from a distance and down.
+            camera: Camera::new(Vec3::new(16.0, 70.0, 120.0), 0.0, -0.5),
             controls: Controls::default(),
             last_frame: Instant::now(),
             frame_interval: pacing::frame_interval(None),
@@ -82,7 +83,14 @@ impl App {
         let mut renderer =
             create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
         println!("Rendering on: {}", renderer.device_name());
-        renderer.set_mesh(&build_mesh(&generate_terrain(WORLD_SEED)))?;
+        // Temporary until the chunk loader exists: the same demo chunk in a 3 by 3 grid,
+        // so the terrain does not join up at the chunk borders.
+        let mesh = build_mesh(&generate_terrain(WORLD_SEED));
+        for x in -1..=1 {
+            for z in -1..=1 {
+                renderer.set_chunk_mesh(ChunkPos::new(x, 0, z), &mesh)?;
+            }
+        }
         renderer.set_camera(self.camera.view_projection(size.width, size.height));
 
         self.window = Some(window);

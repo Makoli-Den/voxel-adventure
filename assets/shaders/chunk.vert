@@ -1,11 +1,15 @@
 #version 450
 
-// Chunk vertices: places each corner with the camera matrix and colors it by
-// block and face. Vulkan clip space: x right, y down, depth 0..1.
+// Chunk vertices: moves each corner from chunk-local to world blocks, places it with
+// the camera matrix and colors it by block and face. Vulkan clip space: x right,
+// y down, depth 0..1.
 
-layout(push_constant) uniform Camera {
+// Pushed once per chunk; the layout is fixed by the renderer (vox-render's interface.rs).
+layout(push_constant) uniform Draw {
     mat4 view_projection;
-} camera;
+    // xyz: world position of the chunk's corner (0, 0, 0) in blocks; w is 0.
+    vec4 chunk_origin;
+} draw;
 
 // xyz: corner position in blocks (0..32), w: face index (order of vox_world::Face::ALL).
 layout(location = 0) in uvec4 in_pos_face;
@@ -33,7 +37,7 @@ const vec3 PALETTE[4] = vec3[4](
 const vec3 UNKNOWN = vec3(1.00, 0.00, 1.00);
 
 void main() {
-    gl_Position = camera.view_projection * vec4(vec3(in_pos_face.xyz), 1.0);
+    gl_Position = draw.view_projection * vec4(vec3(in_pos_face.xyz) + draw.chunk_origin.xyz, 1.0);
     vec3 base = (in_block >= 1u && in_block <= 3u) ? PALETTE[in_block] : UNKNOWN;
     v_color = base * FACE_SHADE[in_pos_face.w];
 }

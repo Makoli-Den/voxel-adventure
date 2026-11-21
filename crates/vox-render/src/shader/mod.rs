@@ -215,6 +215,28 @@ mod tests {
     }
 
     #[test]
+    fn push_constants_of_exactly_the_range_are_accepted() {
+        // 80 bytes: the matrix and the chunk origin, like the built-in shader.
+        let source = "#version 450
+            layout(push_constant) uniform Draw { mat4 m; vec4 origin; } draw;
+            void main() { gl_Position = draw.m * draw.origin; }";
+        assert!(compile_glsl(source, ShaderStage::Vertex, "pack.glsl").is_ok());
+    }
+
+    #[test]
+    fn push_constants_one_vec4_past_the_range_are_rejected() {
+        // 96 bytes: one `vec4` more than the pipeline provides.
+        let source = "#version 450
+            layout(push_constant) uniform Draw { mat4 m; vec4 origin; vec4 extra; } draw;
+            void main() { gl_Position = draw.m * draw.origin + draw.extra; }";
+        let text = compile_error(source, ShaderStage::Vertex);
+        assert!(
+            text.contains("96 bytes") && text.contains("80 bytes"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn push_constants_in_the_fragment_stage_are_rejected() {
         let source = "#version 450
             layout(push_constant) uniform Tint { vec4 color; } tint;
