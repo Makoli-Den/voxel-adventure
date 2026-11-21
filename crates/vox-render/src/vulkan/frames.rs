@@ -102,7 +102,8 @@ impl Frames {
     ///
     /// Call right after waiting on the current slot's fence: that proves the frame
     /// finished, so its results are available and reading them never waits. Called
-    /// earlier, the results may not be ready and the measurement is dropped.
+    /// earlier, the results may not be ready and the measurement is dropped. After a
+    /// completed fence wait that cannot happen: the `NOT_READY` arm below is only defensive.
     pub fn take_gpu_time(&mut self) -> Result<Option<Duration>, RenderError> {
         let index = slot_index(self.submitted);
         let (Some(clock), Some(pool)) = (self.clock, self.slots[index].timestamps) else {

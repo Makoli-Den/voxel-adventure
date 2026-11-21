@@ -3,7 +3,7 @@
 Status: accepted.
 
 ## Context
-Optimizing by measurement needs numbers from the running game: how much the renderer draws, and how long the GPU needs for it. The frame rate alone says little, because the game caps it (decision 0005): at the cap a frame that costs the GPU 0.5 ms and one that costs 4 ms look the same. The GPU time per frame is the number that says how close the GPU is to its limit, independent of the frame limiter.
+Optimizing by measurement needs numbers from the running game: how much the renderer draws, and how long the GPU needs for it. The frame rate alone says little, because the game caps it (decision 0005): at the cap a frame that costs the GPU 0.5 ms and one that costs 4 ms look the same. The GPU time per frame is the number that says how close the GPU is to its limit. It does not depend on the frame limiter as long as the GPU has idle time between frames, which is the case with the limiter; when the GPU is the bottleneck the number drifts upwards (see the risks).
 
 ## Decision
 - **Interface:** `Renderer::stats()` returns a `RenderStats` copy: `chunks_drawn`, `draw_calls` and `triangles` of the most recently recorded frame, and `gpu_time: Option<Duration>` of the most recent frame whose timing has been read. No backend types appear in it.
@@ -22,6 +22,8 @@ Optimizing by measurement needs numbers from the running game: how much the rend
 - **Timestamps around every draw:** two queries per chunk per frame, hundreds of pipeline-stage writes, and readback of all of them; too costly for a per-frame statistic. Can be added later as an explicit profiling mode.
 
 ## Risks
+- `gpu_time` is an **upper bound** of the work, found by the independent review. The start timestamp is at TOP_OF_PIPE, but only the COLOR_ATTACHMENT_OUTPUT stage waits for the swapchain image, so the start can be written before the image is free and the wait is inside the span. When the GPU is the bottleneck, frame N+1 can start while frame N still runs and the spans overlap, so the figure drifts towards the frame period. To measure pure work, a second timestamp at COLOR_ATTACHMENT_OUTPUT could be compared (not done; a hypothesis until measured).
+- A measurement that cannot be read keeps the previous value instead of reporting `None`, so a consumer that averages per frame counts the same value twice now and then.
 - The span covers waits inside the frame: if the GPU is idle when the frame starts, the start timestamp is written at once, but the color output still waits for the swapchain image (the submit's wait semaphore), so that wait counts as GPU time.
 - TOP_OF_PIPE to BOTTOM_OF_PIPE measures the span of the frame's commands, not presentation or compositing.
 - The precision depends on the driver's `timestampPeriod`; some drivers report a rounded period, and the counter may tick in steps coarser than a nanosecond.

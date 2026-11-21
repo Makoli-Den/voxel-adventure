@@ -12,13 +12,14 @@ mod world_loader;
 
 use std::error::Error;
 use std::fmt::Display;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use vox_render::{Renderer, create_renderer};
+use vox_render::{RenderStats, Renderer, create_renderer};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -72,6 +73,8 @@ struct App {
     run_frames: FrameHistory,
     /// When the window title was last updated with the live figures.
     last_report: Instant,
+    /// What the renderer reported after the latest frame.
+    render_stats: RenderStats,
     /// Set when the window was minimized: the first frame after it follows a pause, not a
     /// frame time, so it is not recorded.
     skip_next_sample: bool,
@@ -93,6 +96,7 @@ impl App {
             live_frames: FrameHistory::live(),
             run_frames: FrameHistory::whole_run(),
             last_report: Instant::now(),
+            render_stats: RenderStats::default(),
             skip_next_sample: false,
             error: None,
         }
@@ -156,6 +160,10 @@ impl App {
     }
 
     /// Updates the camera, draws one frame and records how long it all took.
+    ///
+    /// The recorded work time covers moving the camera and the renderer's `render_frame`
+    /// (which includes waiting for the GPU), but not updating the window title; that cost
+    /// shows up in the next frame's interval.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let started = Instant::now();
         let interval = started.duration_since(self.last_frame);
@@ -170,6 +178,9 @@ impl App {
             self.fail(event_loop, error);
             return;
         }
+        if let Some(renderer) = &self.renderer {
+            self.render_stats = renderer.stats();
+        }
         self.record_frame(interval, started.elapsed());
     }
 
@@ -179,8 +190,9 @@ impl App {
             self.skip_next_sample = false;
             return;
         }
-        self.live_frames.push(interval, work, None);
-        self.run_frames.push(interval, work, None);
+        let gpu = self.render_stats.gpu_time;
+        self.live_frames.push(interval, work, gpu);
+        self.run_frames.push(interval, work, gpu);
 
         if self.last_frame.duration_since(self.last_report) >= metrics::REFRESH_INTERVAL {
             self.last_report = self.last_frame;
@@ -191,7 +203,11 @@ impl App {
     /// Puts the live frame figures into the window title.
     fn show_live_figures(&self) {
         if let (Some(window), Some(summary)) = (&self.window, self.live_frames.summary()) {
-            window.set_title(&format!("{WINDOW_TITLE} | {summary}"));
+            let drawn = &self.render_stats;
+            window.set_title(&format!(
+                "{WINDOW_TITLE} | {summary} | {} chunks, {} triangles",
+                drawn.chunks_drawn, drawn.triangles
+            ));
         }
     }
 
@@ -199,7 +215,7 @@ impl App {
     fn run_summary(&self) -> Option<String> {
         let summary = self.run_frames.summary()?;
         Some(format!(
-            "Run: {} frames in {:.1?}: {summary}",
+            "Run summary (frames: {}, play time: {:.1?}): {summary}",
             summary.frames, summary.covered
         ))
     }
@@ -302,12 +318,15 @@ fn main() -> ExitCode {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new();
-    if let Err(error) = event_loop.run_app(&mut app) {
+    let result = event_loop.run_app(&mut app);
+    // The summary is printed however the loop ended. A closed standard output is not a
+    // reason to fail (`println!` would panic), so a write error is ignored.
+    if let Some(summary) = app.run_summary() {
+        let _ = writeln!(io::stdout(), "{summary}");
+    }
+    if let Err(error) = result {
         eprintln!("event loop failed: {error}");
         return ExitCode::FAILURE;
-    }
-    if let Some(summary) = app.run_summary() {
-        println!("{summary}");
     }
     match app.error {
         Some(error) => {

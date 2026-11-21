@@ -45,6 +45,9 @@ Fly over the generated terrain:
 | Right mouse button + mouse | look around |
 | Esc | quit |
 
+## Frame metrics
+The window title shows live figures over the last ten seconds, refreshed twice a second: average FPS, the 1% and 0.1% lows (the average FPS of the slowest 1% and 0.1% of the frames, so they show stutter), the worst frame, the time the game spent producing a frame, the GPU time (an upper bound, measured with timestamp queries) and how many chunks and triangles are drawn. A summary of the whole run is printed when the game exits. The definitions are in `crates/vox-game/src/metrics.rs` and decision 0008. The frame rate is capped at about twice the monitor's refresh rate, so FPS alone shows the cap; the work time and the GPU time show how much room is left.
+
 ## Performance principles
 See [docs/performance-notes.md](docs/performance-notes.md).
 

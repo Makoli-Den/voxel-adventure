@@ -30,9 +30,16 @@ pub struct RenderStats {
     /// if the device cannot measure it or no frame has finished yet.
     ///
     /// The span runs from the start to the end of the frame's GPU commands; presenting
-    /// the image is not included. A frame's result is read once the renderer has proven
-    /// that frame finished, which happens when a later frame reuses its resources: with
-    /// frames in flight this lags a couple of frames behind the counts above.
+    /// the image is not included. Treat it as an **upper bound** of the work: the start
+    /// timestamp is written at the top of the pipe, while the frame's color output waits
+    /// for the swapchain image, so that wait counts; and when the GPU is the bottleneck a
+    /// frame can start while the previous one still runs, so the spans overlap. When the
+    /// GPU has idle time between frames (a frame limiter) the figure is close to the work.
+    ///
+    /// A frame's result is read once the renderer has proven that frame finished, which
+    /// happens when a later frame reuses its resources: with frames in flight this lags a
+    /// couple of frames behind the counts above. A measurement that cannot be read keeps the
+    /// previous value, so the value repeats instead of vanishing.
     pub gpu_time: Option<Duration>,
 }
 
