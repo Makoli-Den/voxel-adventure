@@ -5,6 +5,7 @@
 
 use std::error::Error;
 use std::fmt::Display;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -31,7 +32,10 @@ impl App {
         let attributes = Window::default_attributes().with_title("Voxel Adventure");
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
-        let renderer = create_renderer(Arc::clone(&window), size.width, size.height)?;
+        // Temporary: shaders are read straight from the source tree until the resource
+        // virtual file system exists and resolves them through the active packs.
+        let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shaders");
+        let renderer = create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
         println!("Rendering on: {}", renderer.device_name());
 
         self.window = Some(window);

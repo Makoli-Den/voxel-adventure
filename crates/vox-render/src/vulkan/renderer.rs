@@ -1,6 +1,7 @@
 //! The Vulkan renderer: owns every Vulkan object and runs the frame loop.
 
 use std::any::Any;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,19 +11,25 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use super::context::{Context, Surface};
 use super::frames::{FrameSlot, Frames};
 use super::gpu::Gpu;
-use super::swapchain::Swapchain;
+use super::pipeline::Pipeline;
+use super::render_pass::RenderPass;
+use super::swapchain::{self, Swapchain};
 use crate::{RenderError, Renderer};
 
 /// Draws into a window with Vulkan.
 ///
-/// For now a frame is just the whole window cleared to a slowly changing color.
-/// That is enough to prove the window, device, swapchain and synchronization work.
+/// For now a frame is a colored triangle on a slowly changing background color.
+/// That is enough to prove the render pass, the pipeline and the shaders loaded
+/// from files work.
 pub struct VulkanRenderer {
     // Rust drops fields in declaration order, so each object comes before the
-    // ones it depends on. Do not reorder.
+    // ones it depends on: framebuffers (in the swapchain) and the pipeline before
+    // the render pass, everything before the device. Do not reorder.
     frames: Frames,
     /// `None` while the window has no area to draw into (minimized).
     swapchain: Option<Swapchain>,
+    pipeline: Pipeline,
+    render_pass: RenderPass,
     gpu: Gpu,
     surface: Surface,
     context: Context,
@@ -37,8 +44,18 @@ pub struct VulkanRenderer {
 }
 
 impl VulkanRenderer {
-    /// Creates the renderer for `window`, whose current size is `width` by `height` pixels.
-    pub fn new<W>(window: Arc<W>, width: u32, height: u32) -> Result<Self, RenderError>
+    /// Creates the renderer for `window`, whose current size is `width` by `height` pixels,
+    /// with the shaders from `shader_dir`.
+    ///
+    /// If a step fails, the locals created so far are dropped in reverse order of
+    /// creation, which is the same safe order as the struct fields. Nothing has been
+    /// submitted to the GPU yet, so they can be destroyed right away.
+    pub fn new<W>(
+        window: Arc<W>,
+        width: u32,
+        height: u32,
+        shader_dir: &Path,
+    ) -> Result<Self, RenderError>
     where
         W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
     {
@@ -50,7 +67,17 @@ impl VulkanRenderer {
         // (`_window`) for longer than the surface (see the field order).
         let surface = unsafe { Surface::new(&context, display, window_handle)? };
         let gpu = Gpu::new(&context, &surface)?;
-        let swapchain = Swapchain::new(&context, &surface, &gpu, (width, height), None)?;
+        let format = swapchain::surface_format(&surface, &gpu)?;
+        let render_pass = RenderPass::new(gpu.device(), format)?;
+        let pipeline = Pipeline::new(gpu.device(), &render_pass, shader_dir)?;
+        let swapchain = Swapchain::new(
+            &context,
+            &surface,
+            &gpu,
+            &render_pass,
+            (width, height),
+            None,
+        )?;
         let mut frames = Frames::new(&gpu)?;
         if let Some(swapchain) = &swapchain {
             // SAFETY: nothing has been submitted yet, so the GPU is idle.
@@ -61,6 +88,8 @@ impl VulkanRenderer {
             frames,
             needs_recreate: swapchain.is_none(),
             swapchain,
+            pipeline,
+            render_pass,
             gpu,
             surface,
             context,
@@ -79,6 +108,7 @@ impl VulkanRenderer {
             &self.context,
             &self.surface,
             &self.gpu,
+            &self.render_pass,
             self.size,
             self.swapchain.as_ref(),
         )?
@@ -88,7 +118,7 @@ impl VulkanRenderer {
         let image_count = new.image_count();
 
         // SAFETY: the device is alive. Waiting for idle makes it safe to destroy the old
-        // swapchain and the per-image semaphores below.
+        // swapchain with its framebuffers and views, and the per-image semaphores below.
         unsafe { self.gpu.device().device_wait_idle()? };
         self.swapchain = Some(new); // the old swapchain is destroyed here
         // SAFETY: the GPU is idle, see above.
@@ -96,74 +126,53 @@ impl VulkanRenderer {
         Ok(true)
     }
 
-    /// Records the commands that clear `image` and prepare it for presentation.
-    fn record_clear(
+    /// Records one frame into `command_buffer`: the render pass clears the swapchain
+    /// image `image_index` to the background color and the pipeline draws the triangle.
+    /// The render pass also moves the image to the present layout, so no barriers are needed.
+    // HOT PATH: runs every frame. Everything lives on the stack, nothing is allocated.
+    fn record_frame(
         &self,
         command_buffer: vk::CommandBuffer,
-        image: vk::Image,
+        swapchain: &Swapchain,
+        image_index: u32,
     ) -> Result<(), RenderError> {
         let device = self.gpu.device();
-        let range = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: 1,
+        let extent = swapchain.extent();
+        let area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
         };
-        let to_clear = image_barrier(
-            image,
-            range,
-            (vk::ImageLayout::UNDEFINED, vk::AccessFlags::empty()),
-            (
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
-            ),
-        );
-        let to_present = image_barrier(
-            image,
-            range,
-            (
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::TRANSFER_WRITE,
-            ),
-            (vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::empty()),
-        );
-        let clear = vk::ClearColorValue {
-            float32: color_at(self.started.elapsed().as_secs_f32()),
-        };
+        let clear_values = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: color_at(self.started.elapsed().as_secs_f32()),
+            },
+        }];
+        let pass_info = vk::RenderPassBeginInfo::default()
+            .render_pass(self.render_pass.handle())
+            .framebuffer(swapchain.framebuffer(image_index))
+            .render_area(area)
+            .clear_values(&clear_values);
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         // SAFETY: the command buffer belongs to this device and is not in use (the frame's
-        // fence was waited on; beginning implicitly resets it because the pool allows resets),
-        // and `image` was acquired from the swapchain.
+        // fence was waited on; beginning implicitly resets it because the pool allows resets).
+        // The framebuffer belongs to the acquired image and was built for this render pass,
+        // which the pipeline was built for too. The pipeline's viewport and scissor are
+        // dynamic and both are set before the draw.
         unsafe {
             device.begin_command_buffer(command_buffer, &begin_info)?;
-            device.cmd_pipeline_barrier(
+            device.cmd_begin_render_pass(command_buffer, &pass_info, vk::SubpassContents::INLINE);
+            device.cmd_bind_pipeline(
                 command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_clear],
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline.handle(),
             );
-            device.cmd_clear_color_image(
-                command_buffer,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear,
-                &[range],
-            );
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_present],
-            );
+            device.cmd_set_viewport(command_buffer, 0, &[full_viewport(extent)]);
+            device.cmd_set_scissor(command_buffer, 0, &[area]);
+            // Three vertices, one instance: the triangle from the vertex shader.
+            device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            device.cmd_end_render_pass(command_buffer);
             device.end_command_buffer(command_buffer)?;
         }
         Ok(())
@@ -173,7 +182,9 @@ impl VulkanRenderer {
     fn submit(&self, slot: FrameSlot, render_finished: vk::Semaphore) -> Result<(), RenderError> {
         let device = self.gpu.device();
         let wait_semaphores = [slot.image_available];
-        let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+        // Only the color output must wait for the image; the vertex work can start earlier.
+        // The render pass's external dependency orders its layout change after this wait.
+        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let command_buffers = [slot.command_buffer];
         let signal_semaphores = [render_finished];
         let submit_info = vk::SubmitInfo::default()
@@ -253,7 +264,7 @@ impl Renderer for VulkanRenderer {
             Err(error) => return Err(error.into()),
         };
 
-        self.record_clear(slot.command_buffer, swapchain.image(image_index))?;
+        self.record_frame(slot.command_buffer, swapchain, image_index)?;
         let render_finished = self.frames.render_finished(image_index);
         self.submit(slot, render_finished)?;
         if self.present(swapchain, render_finished, image_index)? {
@@ -288,23 +299,17 @@ fn color_at(seconds: f32) -> [f32; 4] {
     [wave(0.0), wave(2.1), wave(4.2), 1.0]
 }
 
-/// A barrier that moves a whole color image between layouts.
-/// Each side is given as `(layout, access mask)`.
-fn image_barrier(
-    image: vk::Image,
-    range: vk::ImageSubresourceRange,
-    from: (vk::ImageLayout, vk::AccessFlags),
-    to: (vk::ImageLayout, vk::AccessFlags),
-) -> vk::ImageMemoryBarrier<'static> {
-    vk::ImageMemoryBarrier::default()
-        .old_layout(from.0)
-        .src_access_mask(from.1)
-        .new_layout(to.0)
-        .dst_access_mask(to.1)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(range)
+/// A viewport covering the whole image, with the standard `0..1` depth range.
+fn full_viewport(extent: vk::Extent2D) -> vk::Viewport {
+    vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        // Exact: image sides are far below 2^24, where f32 starts to round integers.
+        width: extent.width as f32,
+        height: extent.height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }
 }
 
 #[cfg(test)]
@@ -323,5 +328,16 @@ mod tests {
     #[test]
     fn color_changes_over_time() {
         assert_ne!(color_at(0.0), color_at(1.0));
+    }
+
+    #[test]
+    fn viewport_covers_the_whole_image() {
+        let viewport = full_viewport(vk::Extent2D {
+            width: 1280,
+            height: 720,
+        });
+        assert_eq!((viewport.x, viewport.y), (0.0, 0.0));
+        assert_eq!((viewport.width, viewport.height), (1280.0, 720.0));
+        assert_eq!((viewport.min_depth, viewport.max_depth), (0.0, 1.0));
     }
 }

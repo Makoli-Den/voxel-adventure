@@ -13,7 +13,7 @@ The first vertical slice must open a window and draw with Vulkan, while keeping 
 - **Presentation:** FIFO present mode only (vsync). It is the only mode every driver must support.
 - **Queues:** one queue family that supports both graphics and presentation, which all desktop GPUs offer.
 - **Frames in flight:** two, with one "rendering finished" semaphore per swapchain image.
-- **First frame:** the swapchain image is cleared with transfer commands, which needs no render pass or pipeline. Real rendering replaces this in the next slice.
+- **First frame:** the swapchain image is cleared with transfer commands, which needs no render pass or pipeline. Superseded: the next slice replaced this with a render pass and a triangle, see decision 0003.
 - **Validation:** the Khronos validation layer is enabled automatically in debug builds when it is installed.
 
 ## Rejected

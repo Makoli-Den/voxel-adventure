@@ -5,8 +5,10 @@
 //! replaced (for example by a fallback for old devices) without touching other layers.
 
 mod error;
+mod shader;
 mod vulkan;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -37,16 +39,21 @@ pub trait Renderer {
 /// The renderer keeps the `Arc` alive for as long as it exists, which guarantees
 /// the native window outlives the surface created from it.
 ///
+/// `shader_dir` is the folder with the GLSL shader files (`triangle.vert`,
+/// `triangle.frag`). They are read and compiled once, here.
+///
 /// # Errors
-/// Returns an error if Vulkan is unavailable or no GPU can present to the window.
+/// Returns an error if Vulkan is unavailable, no GPU can present to the window,
+/// or a shader file is missing or does not compile ([`RenderError::Shader`]).
 pub fn create_renderer<W>(
     window: Arc<W>,
     width: u32,
     height: u32,
+    shader_dir: &Path,
 ) -> Result<Box<dyn Renderer>, RenderError>
 where
     W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
 {
-    let renderer = vulkan::VulkanRenderer::new(window, width, height)?;
+    let renderer = vulkan::VulkanRenderer::new(window, width, height, shader_dir)?;
     Ok(Box::new(renderer))
 }
