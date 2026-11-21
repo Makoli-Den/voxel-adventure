@@ -6,7 +6,9 @@
 mod block;
 mod chunk;
 mod mesh;
+mod terrain;
 
 pub use block::BlockId;
 pub use chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, LocalPos};
 pub use mesh::{ChunkMesh, ChunkVertex, Face, build_mesh};
+pub use terrain::{DIRT, GRASS, MAX_SURFACE, MIN_SURFACE, STONE, generate_terrain};
