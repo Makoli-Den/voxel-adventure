@@ -7,6 +7,7 @@
 mod error;
 mod interface;
 mod shader;
+mod stats;
 mod vulkan;
 
 use std::path::Path;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 pub use error::RenderError;
+pub use stats::RenderStats;
 
 /// What the game needs from a renderer.
 pub trait Renderer {
@@ -62,6 +64,20 @@ pub trait Renderer {
     /// The matrix must already produce Vulkan clip space (Y down, depth 0..1); the
     /// renderer applies it unchanged.
     fn set_camera(&mut self, view_projection: [[f32; 4]; 4]);
+
+    /// What the renderer drew and how long the GPU took. Cheap: returns a copy.
+    ///
+    /// The draw counts describe the most recently recorded frame: the last call to
+    /// [`Self::render_frame`] that built GPU commands, whether or not presenting it
+    /// succeeded. Calls that draw nothing because the window is minimized or its
+    /// swapchain is being rebuilt do not change them.
+    ///
+    /// The GPU time belongs to the most recent finished frame: the newest frame that the
+    /// renderer has proven finished (by waiting for it before reusing its per-frame
+    /// resources) and whose timing it has read. That is usually a frame or two older than
+    /// the one the counts describe. It is `None` until the first such frame, and forever
+    /// on a device whose queue cannot write timestamps.
+    fn stats(&self) -> RenderStats;
 }
 
 /// Creates the default renderer (Vulkan) that draws into `window`.

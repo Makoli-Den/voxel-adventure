@@ -4,6 +4,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -18,8 +19,9 @@ use super::pipeline::Pipeline;
 use super::render_pass::RenderPass;
 use super::retired::{self, Retired};
 use super::swapchain::{self, Swapchain};
+use super::timestamps;
 use crate::interface::{CHUNK_ORIGIN_OFFSET, PUSH_CONSTANT_SIZE};
-use crate::{RenderError, Renderer};
+use crate::{RenderError, RenderStats, Renderer};
 
 /// The sky: everything the meshes do not cover is cleared to this color.
 const SKY_COLOR: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
@@ -51,6 +53,10 @@ pub struct VulkanRenderer {
     needs_recreate: bool,
     /// The view-projection matrix, column-major, as given to [`Renderer::set_camera`].
     camera: [[f32; 4]; 4],
+    /// Draw counts of the most recently recorded frame; its `gpu_time` stays `None`.
+    drawn: RenderStats,
+    /// GPU time of the most recent frame whose timestamps were read.
+    last_gpu_time: Option<Duration>,
 }
 
 impl VulkanRenderer {
@@ -109,6 +115,8 @@ impl VulkanRenderer {
             _window: window,
             size: (width, height),
             camera: IDENTITY,
+            drawn: RenderStats::default(),
+            last_gpu_time: None,
         })
     }
 
@@ -141,18 +149,23 @@ impl VulkanRenderer {
         Ok(true)
     }
 
-    /// Records one frame into `command_buffer`: the render pass clears the swapchain
-    /// image `image_index` to the sky color and the depth buffer to the far plane, then
-    /// the chunk meshes are drawn. The render pass also moves the image to the present
-    /// layout, so no barriers are needed.
+    /// Records one frame into the command buffer of `slot`: the render pass clears the
+    /// swapchain image `image_index` to the sky color and the depth buffer to the far
+    /// plane, then the chunk meshes are drawn. The render pass also moves the image to the
+    /// present layout, so no barriers are needed. If the slot has a query pool, a
+    /// timestamp is written before the first and after the last command.
+    ///
+    /// Returns the draw counts of the recorded frame.
     // HOT PATH: runs every frame. Everything lives on the stack, nothing is allocated.
     fn record_frame(
         &self,
-        command_buffer: vk::CommandBuffer,
+        slot: FrameSlot,
         swapchain: &Swapchain,
         image_index: u32,
-    ) -> Result<(), RenderError> {
+    ) -> Result<RenderStats, RenderError> {
         let device = self.gpu.device();
+        let command_buffer = slot.command_buffer;
+        let mut drawn = RenderStats::default();
         let extent = swapchain.extent();
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
@@ -184,9 +197,15 @@ impl VulkanRenderer {
         // draws. The matrix push (bytes 0..64, vertex stage) lies inside the layout's only
         // range, and it stays valid for every draw below because they all use this
         // pipeline's layout. The meshes live in `self`; a replaced mesh moves to `retired`
-        // and is freed only after the frames that may use it have finished.
+        // and is freed only after the frames that may use it have finished. The query pool
+        // is a timestamp pool with the frame's queries; it exists only if the queue writes
+        // timestamps, and the fence wait proved the previous frame in this slot, its last
+        // user, finished. Its reset and both writes lie outside the render pass.
         unsafe {
             device.begin_command_buffer(command_buffer, &begin_info)?;
+            if let Some(pool) = slot.timestamps {
+                timestamps::record_frame_start(device, command_buffer, pool);
+            }
             device.cmd_begin_render_pass(command_buffer, &pass_info, vk::SubpassContents::INLINE);
             device.cmd_set_viewport(command_buffer, 0, &[full_viewport(extent)]);
             device.cmd_set_scissor(command_buffer, 0, &[area]);
@@ -205,12 +224,16 @@ impl VulkanRenderer {
                 );
                 for (&pos, mesh) in &self.meshes {
                     self.record_mesh(command_buffer, pos, mesh);
+                    drawn.count_chunk_draw(mesh.index_count());
                 }
             }
             device.cmd_end_render_pass(command_buffer);
+            if let Some(pool) = slot.timestamps {
+                timestamps::record_frame_end(device, command_buffer, pool);
+            }
             device.end_command_buffer(command_buffer)?;
         }
-        Ok(())
+        Ok(drawn)
     }
 
     /// Records the draw of the chunk at `pos`.
@@ -344,6 +367,10 @@ impl Renderer for VulkanRenderer {
                 .device()
                 .wait_for_fences(&[slot.in_flight], true, u64::MAX)?;
         }
+        // The wait proved the slot's previous frame finished, so its timing can be read.
+        if let Some(gpu_time) = self.frames.take_gpu_time()? {
+            self.last_gpu_time = Some(gpu_time);
+        }
         // The wait proved which frames are finished; meshes only they used can go now.
         self.retired.release(retired::completed_after_wait(
             self.frames.submitted(),
@@ -362,10 +389,11 @@ impl Renderer for VulkanRenderer {
             Err(error) => return Err(error.into()),
         };
 
-        self.record_frame(slot.command_buffer, swapchain, image_index)?;
+        self.drawn = self.record_frame(slot, swapchain, image_index)?;
         let render_finished = self.frames.render_finished(image_index);
         self.submit(slot, render_finished)?;
-        // Counted right after the submit: from here on this frame may read the meshes.
+        // Counted right after the submit: from here on this frame may read the meshes, and
+        // its timestamps (written whenever the slot has a pool) wait to be read.
         self.frames.advance();
         if self.present(swapchain, render_finished, image_index)? {
             self.needs_recreate = true;
@@ -397,6 +425,13 @@ impl Renderer for VulkanRenderer {
 
     fn set_camera(&mut self, view_projection: [[f32; 4]; 4]) {
         self.camera = view_projection;
+    }
+
+    fn stats(&self) -> RenderStats {
+        RenderStats {
+            gpu_time: self.last_gpu_time,
+            ..self.drawn
+        }
     }
 }
 
