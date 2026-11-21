@@ -138,9 +138,17 @@ than at the baseline, which is why `mesh/*` here is higher than in the baseline 
 | solid | 383.6 / 394.7 / 385.8 us (383.6 - 394.7) | 360.4 / 359.6 / 359.0 us (359.0 - 360.4) | -7 percent, ranges do not overlap |
 | checkerboard | 2.74 / 2.56 / 2.47 ms (2.47 - 2.74) | 0.92 / 0.93 / 0.98 ms (0.92 - 0.98) | -63 percent, ranges do not overlap |
 
+The conductor repeated the measurement independently in three more runs of the same session,
+with the same direction: terrain 234 / 252 / 235 us fresh against 212 / 210 / 211 us reused (10 to
+16 percent faster, ranges apart), solid 397 / 399 / 394 against 366 / 360 / 354 us (8 to 10 percent),
+checkerboard 2.04 / 2.86 / 2.02 ms against 0.98 / 1.01 / 0.92 ms (52 to 65 percent).
+
 The terrain case passes the rule (more than 10 percent and outside the noise), though only just:
-11 percent at the median, and the fresh case had a wide spread (225 to 249 us). The reused runs
-were very stable (within 1 percent). The big winner is the checkerboard: with 4.7 MB of output,
+11 percent at the median, and the fresh case had a wide spread (225 to 252 us across the two
+measurements). The fresh figure also differs between sessions: the baseline table has 209 to 232 us
+for the same case, so against the earlier fresh figures the reused terrain case (about 211 us) would
+look like no gain at all. Read the terrain gain as modest and the comparison as valid only within
+one session. The reused runs were very stable (within 1 percent). The big winner is the checkerboard: with 4.7 MB of output,
 allocating, growing and page-faulting fresh vectors was most of its time. The gain is the cost
 of growing and touching new memory, so it only exists for a caller that keeps its buffers; a
 caller that needs a fresh mesh each time gets nothing. Next steps that follow from this: reserve
