@@ -11,7 +11,7 @@ use std::mem::size_of;
 
 use criterion::{Criterion, Throughput};
 use vox_world::{BlockId, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkVertex, LocalPos};
-use vox_world::{build_mesh, generate_terrain};
+use vox_world::{build_mesh, build_mesh_into, generate_terrain};
 
 const STONE: BlockId = BlockId(1);
 /// The seed of the realistic case. `terrain_mesh_has_the_pinned_number_of_quads` uses it too.
@@ -102,6 +102,30 @@ fn bench_mesh(c: &mut Criterion) {
     group.finish();
 }
 
+/// Times `build_mesh_into` on one mesh that is reused, as a worker thread would. The
+/// mesh is warmed up first, so its capacity already has the final size and the timed
+/// closure does no allocation. Compare each case with the same name in `mesh`.
+fn bench_mesh_reused(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mesh_reused");
+    group.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
+    let cases = [
+        ("terrain_seed_1", generate_terrain(SEED)),
+        ("solid", solid_chunk()),
+        ("checkerboard", checkerboard_chunk()),
+    ];
+    for (name, chunk) in cases {
+        let mut mesh = ChunkMesh::default();
+        build_mesh_into(&chunk, &mut mesh);
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                build_mesh_into(black_box(&chunk), &mut mesh);
+                black_box(&mesh);
+            })
+        });
+    }
+    group.finish();
+}
+
 /// Times `generate_terrain` alone (noise, column fill and the allocation of the chunk).
 fn bench_terrain(c: &mut Criterion) {
     let mut group = c.benchmark_group("terrain");
@@ -115,9 +139,9 @@ fn bench_terrain(c: &mut Criterion) {
 // `criterion_group!` generates a public function without a doc comment.
 #[allow(missing_docs)]
 mod groups {
-    use super::{bench_mesh, bench_terrain};
+    use super::{bench_mesh, bench_mesh_reused, bench_terrain};
     use criterion::criterion_group;
-    criterion_group!(benches, bench_mesh, bench_terrain);
+    criterion_group!(benches, bench_mesh, bench_mesh_reused, bench_terrain);
 }
 
 /// A custom `main` instead of `criterion_main!`, only to print the mesh sizes first.
