@@ -35,6 +35,7 @@ closure; inputs and outputs go through `std::hint::black_box`. Source:
 | `mesh/solid` | every block solid | Maximum number of neighbour checks with almost no output (only the outer shell). |
 | `mesh/checkerboard` | blocks where `x + y + z` is even | Worst case: no two solid blocks touch, almost every face is emitted. |
 | `terrain/generate_seed_1` | seed 1 | Cost of generating the chunk (noise, column fill, allocating the chunk). |
+| `mesh_reused/terrain_seed_1`, `solid`, `checkerboard` | same chunks | `build_mesh_into` on one warmed-up mesh: the steady state of a worker, without allocation. |
 
 Throughput is set to the number of blocks in the chunk, so "blocks per second" counts air
 blocks too; it is a way to compare cases, not a count of solid blocks processed.
@@ -121,6 +122,30 @@ it with a plain reference mesher on 11 chunks), and the code was about 30 lines 
 The decision rule needed both the terrain and the solid case to be clearly faster. `mesh/solid`
 is almost nothing but neighbour checks, and it did not improve, so the cheap check is not where
 the time goes. Not kept: the extra code buys nothing that can be measured reliably.
+
+### 2. Reusing the output buffers: kept
+
+`build_mesh_into(chunk, &mut mesh)` clears the mesh (`Vec::clear` keeps the capacity) and fills
+it; `build_mesh` is a wrapper around it with a fresh `ChunkMesh`. The new cases `mesh_reused/*`
+call it on one mesh created and warmed up outside the timed closure, which is what a worker
+thread that meshes chunks all day does. Compared inside the same three runs (medians of each run,
+range lowest - highest, runs on 2026-11-21; this session the machine ran 5 to 10 percent slower
+than at the baseline, which is why `mesh/*` here is higher than in the baseline table):
+
+| Case | Fresh `mesh/X` (3 runs) | Reused `mesh_reused/X` (3 runs) | Change at the median |
+|---|---|---|---|
+| terrain_seed_1 | 249.1 / 238.1 / 224.9 us (224.9 - 249.1) | 212.1 / 210.1 / 212.4 us (210.1 - 212.4) | -11 percent, ranges do not overlap |
+| solid | 383.6 / 394.7 / 385.8 us (383.6 - 394.7) | 360.4 / 359.6 / 359.0 us (359.0 - 360.4) | -7 percent, ranges do not overlap |
+| checkerboard | 2.74 / 2.56 / 2.47 ms (2.47 - 2.74) | 0.92 / 0.93 / 0.98 ms (0.92 - 0.98) | -63 percent, ranges do not overlap |
+
+The terrain case passes the rule (more than 10 percent and outside the noise), though only just:
+11 percent at the median, and the fresh case had a wide spread (225 to 249 us). The reused runs
+were very stable (within 1 percent). The big winner is the checkerboard: with 4.7 MB of output,
+allocating, growing and page-faulting fresh vectors was most of its time. The gain is the cost
+of growing and touching new memory, so it only exists for a caller that keeps its buffers; a
+caller that needs a fresh mesh each time gets nothing. Next steps that follow from this: reserve
+a capacity estimate for the first call, and note that reused meshes of different sizes keep
+the largest capacity they ever reached.
 
 ## What this does and does not tell us
 

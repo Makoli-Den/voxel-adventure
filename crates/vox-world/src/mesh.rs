@@ -111,12 +111,39 @@ pub struct ChunkMesh {
 /// assert_eq!(build_mesh(&chunk).indices.len(), 36);
 /// ```
 pub fn build_mesh(chunk: &Chunk) -> ChunkMesh {
+    let mut mesh = ChunkMesh::default();
+    build_mesh_into(chunk, &mut mesh);
+    mesh
+}
+
+/// Builds the mesh of a chunk into an existing mesh, replacing its contents.
+///
+/// The result equals [`build_mesh`]. The vectors are cleared, not dropped, so their
+/// capacity is kept between calls: a worker that meshes many chunks stops
+/// allocating once the buffers have grown to the size of a typical mesh.
+///
+/// # Example
+///
+/// ```
+/// use vox_world::{BlockId, Chunk, ChunkMesh, LocalPos, build_mesh_into};
+///
+/// let mut chunk = Chunk::new();
+/// if let Some(pos) = LocalPos::new(1, 1, 1) {
+///     chunk.set(pos, BlockId(1));
+/// }
+/// let mut mesh = ChunkMesh::default();
+/// build_mesh_into(&chunk, &mut mesh);
+/// build_mesh_into(&chunk, &mut mesh);
+/// assert_eq!(mesh.indices.len(), 36);
+/// ```
+pub fn build_mesh_into(chunk: &Chunk, mesh: &mut ChunkMesh) {
     // HOT PATH: runs for every chunk that is generated or edited. It walks the flat
     // block array once in storage order, so memory is read sequentially, and writes
-    // 6-byte vertices, so little data has to travel to the GPU. The only allocation
-    // cost is the growth of the output vectors, which is known and not measured yet;
-    // a capacity estimate waits for a benchmark.
-    let mut mesh = ChunkMesh::default();
+    // 6-byte vertices, so little data has to travel to the GPU. The output vectors
+    // keep their capacity between calls; a capacity estimate for a first call waits
+    // for a benchmark.
+    mesh.vertices.clear();
+    mesh.indices.clear();
     for pos in LocalPos::all() {
         let block = chunk.get(pos);
         if block.is_air() {
@@ -124,11 +151,10 @@ pub fn build_mesh(chunk: &Chunk) -> ChunkMesh {
         }
         for face in Face::ALL {
             if is_face_visible(chunk, pos, face) {
-                push_quad(&mut mesh, pos, face, block);
+                push_quad(mesh, pos, face, block);
             }
         }
     }
-    mesh
 }
 
 /// A face is visible when the neighbour it looks at is air or outside the chunk.
@@ -255,6 +281,43 @@ mod tests {
             // out of the block. A face wound the wrong way would give the opposite vector.
             assert_eq!(normal, face.offset().map(f32::from));
         }
+    }
+
+    #[test]
+    fn build_into_reused_mesh_equals_fresh_mesh() {
+        let mut solid = Chunk::new();
+        let mut checkerboard = Chunk::new();
+        for p in LocalPos::all() {
+            solid.set(p, STONE);
+            if (p.x() + p.y() + p.z()) % 2 == 0 {
+                checkerboard.set(p, STONE);
+            }
+        }
+        let chunks = [
+            Chunk::new(),
+            single_block_chunk(10, 10, 10),
+            solid,
+            checkerboard,
+            crate::generate_terrain(1),
+            crate::generate_terrain(2),
+        ];
+        // Start from a mesh far bigger than any result but the checkerboard, so stale
+        // contents would show if they leaked through.
+        let mut mesh = build_mesh(&chunks[3]);
+        for chunk in &chunks {
+            build_mesh_into(chunk, &mut mesh);
+            assert_eq!(mesh, build_mesh(chunk));
+        }
+    }
+
+    #[test]
+    fn build_into_keeps_capacity() {
+        let chunk = single_block_chunk(10, 10, 10);
+        let mut mesh = build_mesh(&crate::generate_terrain(1));
+        let capacity = mesh.vertices.capacity();
+        build_mesh_into(&chunk, &mut mesh);
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(mesh.vertices.capacity(), capacity);
     }
 
     #[test]
