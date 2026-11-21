@@ -68,19 +68,19 @@ impl World {
 /// knowing about [`World`]. It can also be built by hand for chunks that live elsewhere.
 #[derive(Clone, Copy, Debug)]
 pub struct Neighbours<'a> {
-    chunks: [Option<&'a Chunk>; 6],
+    chunks: [Option<&'a Chunk>; Face::COUNT],
 }
 
 impl<'a> Neighbours<'a> {
     /// Builds the view from six chunks ordered by [`Face::index`]: element 0 is the
     /// chunk on the +X side, element 1 the one on the -X side, and so on.
-    pub const fn new(chunks: [Option<&'a Chunk>; 6]) -> Self {
+    pub const fn new(chunks: [Option<&'a Chunk>; Face::COUNT]) -> Self {
         Self { chunks }
     }
 
     /// No neighbour at all: everything outside the chunk counts as air.
     pub const fn none() -> Self {
-        Self::new([None; 6])
+        Self::new([None; Face::COUNT])
     }
 
     /// The chunk on the side `face` looks at, or `None` if it is missing.

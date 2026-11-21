@@ -179,25 +179,42 @@ slower than at the baseline above, and drifted during the last run, see below):
 | `terrain/generate_seed_1` | 38.7 / 39.1 / 40.3 us | 46.3 / 48.2 / 49.2 us |
 | `terrain/generate_chunk_far` | new case | 46.1 / 49.8 / 51.9 us |
 
-- **The existing mesher cases did not get slower.** The `mesh_reused/*` ranges overlap or lie
-  lower. `mesh/solid` is the only one that looks higher after (407 - 442 against 399 - 413 us), but
-  `mesh/empty`, which runs none of the changed code, rose by the same 5 to 15 percent in the same
-  runs (13.7 us in the last run), so this is machine drift; the interleaved `mesh_reused/solid`,
-  the same work without allocation, was lower. The common path (a neighbour inside the chunk)
-  is the same code as before.
+- **The existing mesher cases are not distinguishable from noise.** The `mesh_reused/*` ranges
+  overlap or lie lower. `mesh/single_block` and `mesh/solid` look a little higher after (13.1 - 14.2
+  against 11.6 - 12.1 us, and 407 - 442 against 399 - 413 us), but `mesh/empty`, which runs none of
+  the changed code, also moved up in the same runs (13.7 us in the last run), and the interleaved
+  `mesh_reused/solid`, the same work without allocation, was lower. With three runs and 5 to 15 percent
+  of drift this cannot be settled either way. The common path (a neighbour inside the chunk) is the
+  same code as before.
 - **Neighbour-aware meshing costs nothing that can be measured here.** `mesh_neighbours/terrain_seed_1`
   (198 - 248 us) lies inside the range of `mesh_reused/terrain_seed_1` (207 - 234 us). The runs of
   the neighbour case are wide (the ranges are 25 percent apart), so a difference of a few percent
   would not show. Note that the two cases do not produce the same output: with its neighbours the
   chunk has 1,642 quads instead of 4,848 (its sides are mostly hidden by the stone next to it), so
   there is less to write while more border faces take the slower path. The two effects may cancel.
-- **Terrain generation got about 20 percent slower** (38.7 - 40.3 to 46.3 - 49.2 us, ranges do not
-  overlap), and this is not noise. The cause is the support of negative coordinates and of chunks
-  that do not start at height 0 (a shift and a mask per octave and column, checked saturating
-  arithmetic). A first version with `div_euclid` and `rem_euclid` took 61 - 74 us (about 60 percent
-  slower), so the shift and mask (valid because every cell size is a power of two, a const
-  assertion guards this) won back most of it. A chunk at (3, 0, -2) costs the same as the origin
-  chunk. The generator has not been optimized; it runs once per chunk.
+- **Terrain generation was about 20 percent slower right after this change** (38.7 - 40.3 to
+  46.3 - 49.2 us, ranges do not overlap). The cause was a hypothesis until experiment 4 below
+  measured it: the per-block work in `fill_column`, not the noise. A first version of the noise with
+  `div_euclid` and `rem_euclid` took 61 - 74 us, so the shift and mask (valid because every cell
+  size is a power of two, a const assertion guards this) were kept. The numbers in the table above
+  are from before experiment 4; see there for the final ones.
+
+### 4. Filling a column by layers: kept
+
+`fill_column` first decided the block of every height with a four-way `block_for`, a saturating add
+and a `LocalPos::new`. It now works out the layer boundaries once per column (stone below
+`stone_end`, dirt up to `dirt_end`, one grass block), clamped to the chunk, and fills each layer with
+a plain loop. Output is identical (all terrain tests and pinned numbers pass unchanged). Three runs
+before and after in the same session (medians of each run, range lowest - highest):
+
+| Case | Before (3 runs) | After (3 runs) | Verdict |
+|---|---|---|---|
+| `terrain/generate_seed_1` | 45.3 / 44.2 / 44.9 us (44.2 - 45.3) | 29.3 / 29.4 / 26.8 us (26.8 - 29.4) | 35 to 40 percent faster, ranges apart |
+| `terrain/generate_chunk_far` | 44.8 / 45.8 / 47.8 us (44.8 - 47.8) | 29.2 / 30.1 / 27.8 us (27.8 - 30.1) | 33 to 42 percent faster, ranges apart |
+
+Both cases pass the keep rule. The new figures are also lower than the 38.7 - 40.3 us of before the
+multi-chunk change (measured an hour earlier, so only roughly comparable): the old code branched
+per block as well.
 
 ## What this does and does not tell us
 

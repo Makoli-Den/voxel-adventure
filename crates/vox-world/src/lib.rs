@@ -14,7 +14,8 @@ pub use block::BlockId;
 pub use chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, LocalPos};
 pub use chunk_pos::ChunkPos;
 pub use mesh::{
-    ChunkMesh, ChunkVertex, Face, build_mesh, build_mesh_into, build_mesh_with_neighbours_into,
+    ChunkMesh, ChunkVertex, Face, INDICES_PER_QUAD, VERTICES_PER_QUAD, build_mesh, build_mesh_into,
+    build_mesh_with_neighbours_into,
 };
 pub use terrain::{DIRT, GRASS, MAX_SURFACE, MIN_SURFACE, STONE, generate_chunk, generate_terrain};
 pub use world::{Neighbours, World};

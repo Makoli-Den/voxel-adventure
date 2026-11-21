@@ -10,11 +10,16 @@ use std::hint::black_box;
 use std::mem::size_of;
 
 use criterion::{Criterion, Throughput};
-use vox_world::{BlockId, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, LocalPos};
+use vox_world::{
+    BlockId, CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, LocalPos,
+};
 use vox_world::{Neighbours, build_mesh, build_mesh_into, build_mesh_with_neighbours_into};
 use vox_world::{generate_chunk, generate_terrain};
 
 const STONE: BlockId = BlockId(1);
+/// Coordinate of the middle of the chunk along an axis: far from every border, so the
+/// single block of `single_block_chunk` has all six neighbours inside the chunk.
+const MIDDLE: usize = CHUNK_SIZE / 2;
 /// The seed of the realistic case. `terrain_mesh_has_the_pinned_number_of_quads` uses it too.
 const SEED: u32 = 1;
 
@@ -26,7 +31,7 @@ fn empty_chunk() -> Chunk {
 /// One block in the middle: the fixed cost of a mesh with almost no output.
 fn single_block_chunk() -> Chunk {
     let mut chunk = Chunk::new();
-    if let Some(pos) = LocalPos::new(16, 16, 16) {
+    if let Some(pos) = LocalPos::new(MIDDLE, MIDDLE, MIDDLE) {
         chunk.set(pos, STONE);
     }
     chunk
@@ -53,8 +58,8 @@ fn chunk_where(solid: impl Fn(LocalPos) -> bool) -> Chunk {
 }
 
 /// The mesher cases in the order they appear in the report.
-fn mesh_cases() -> [(&'static str, Chunk); 5] {
-    [
+fn mesh_cases() -> Vec<(&'static str, Chunk)> {
+    vec![
         ("empty", empty_chunk()),
         ("single_block", single_block_chunk()),
         ("terrain_seed_1", generate_terrain(SEED)),
@@ -75,7 +80,7 @@ fn print_mesh_stats() {
         println!(
             "{:<16} {:>8} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
             name,
-            mesh.indices.len() / 6,
+            mesh.quad_count(),
             mesh.vertices.len(),
             mesh_bytes(&mesh),
             mesh.vertices.capacity(),
@@ -140,7 +145,7 @@ fn bench_mesh_neighbours(c: &mut Criterion) {
     build_mesh_with_neighbours_into(&chunk, &neighbours, &mut mesh);
     println!(
         "terrain_seed_1 with neighbours: {} quads",
-        mesh.indices.len() / 6
+        mesh.quad_count()
     );
     group.bench_function("terrain_seed_1", |b| {
         b.iter(|| {

@@ -29,9 +29,7 @@ pub const MAX_SURFACE: usize = 24;
 const _: () = assert!(MAX_SURFACE < CHUNK_SIZE);
 
 // `smooth_noise` splits coordinates with a shift and a mask, which needs power-of-two cells.
-const _: () = assert!(OCTAVES[0].0.count_ones() == 1);
-const _: () = assert!(OCTAVES[1].0.count_ones() == 1);
-const _: () = assert!(OCTAVES[2].0.count_ones() == 1);
+const _: () = assert!(cells_are_powers_of_two());
 
 /// Number of dirt blocks between the grass and the stone.
 const DIRT_DEPTH: usize = 3;
@@ -43,6 +41,17 @@ const OCTAVES: [(i32, f32); 3] = [(16, 4.0), (8, 2.0), (4, 1.0)];
 /// Sum of the octave weights, the divisor that normalizes the noise to `0.0..=1.0`.
 /// Computed from [`OCTAVES`], so the two cannot drift apart.
 const WEIGHT_SUM: f32 = weight_sum();
+
+const fn cells_are_powers_of_two() -> bool {
+    let mut index = 0;
+    while index < OCTAVES.len() {
+        if OCTAVES[index].0.count_ones() != 1 {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
 
 const fn weight_sum() -> f32 {
     let mut sum = 0.0;
@@ -125,30 +134,41 @@ fn surface_height(seed: u32, x: i32, z: i32) -> i32 {
     (MIN_SURFACE as i32 + offset).min(MAX_SURFACE as i32)
 }
 
-/// The block at world height `y` in a column whose grass is at `height`.
-fn block_for(y: i32, height: i32) -> BlockId {
-    if y > height {
-        BlockId::AIR
-    } else if y == height {
-        GRASS
-    } else if y.saturating_add(DIRT_DEPTH_I32) >= height {
-        DIRT
-    } else {
-        STONE
+/// Writes one column of a chunk whose lowest block is at world height `base_y`.
+///
+/// The layer boundaries are worked out once, as heights inside the chunk, and each layer
+/// is then filled by a plain loop: stone below `stone_end`, dirt up to `dirt_end`, one grass
+/// block, and air above, which is left as it is. The boundaries are clamped to the chunk,
+/// so a chunk that holds only part of the column (or none of it) gets an empty range.
+fn fill_column(chunk: &mut Chunk, x: usize, z: usize, base_y: i32, height: i32) {
+    let grass = height.saturating_sub(base_y);
+    let stone_end = clamp_to_chunk(grass.saturating_sub(DIRT_DEPTH_I32));
+    let dirt_end = clamp_to_chunk(grass);
+    fill_range(chunk, x, z, 0..stone_end, STONE);
+    fill_range(chunk, x, z, stone_end..dirt_end, DIRT);
+    if (0..CHUNK_SIZE_I32).contains(&grass) {
+        fill_range(chunk, x, z, dirt_end..dirt_end + 1, GRASS);
     }
 }
 
-/// Writes one column of a chunk whose lowest block is at world height `base_y`.
-/// Everything above the surface stays air, so only the part up to it is written.
-fn fill_column(chunk: &mut Chunk, x: usize, z: usize, base_y: i32, height: i32) {
-    let top = height.saturating_sub(base_y).min(CHUNK_SIZE_I32 - 1);
-    // An empty range when the whole column of this chunk lies above the surface.
-    for y in 0..=top {
-        let block = block_for(base_y.saturating_add(y), height);
-        // `LocalPos::new` cannot fail here: `x` and `z` come from the chunk loops and
-        // `y` is in `0..CHUNK_SIZE`. The library never panics, so the impossible case is
-        // skipped instead of unwrapped.
-        if let Some(pos) = LocalPos::new(x, y as usize, z) {
+/// Limits a height inside a chunk to `0..=CHUNK_SIZE`, the valid range of a layer boundary.
+fn clamp_to_chunk(y: i32) -> usize {
+    y.clamp(0, CHUNK_SIZE_I32) as usize
+}
+
+/// Sets the blocks of the column `(x, z)` at the heights in `layer` to `block`.
+fn fill_range(
+    chunk: &mut Chunk,
+    x: usize,
+    z: usize,
+    layer: std::ops::Range<usize>,
+    block: BlockId,
+) {
+    for y in layer {
+        // `LocalPos::new` cannot fail here: `x` and `z` come from the chunk loops and the
+        // layers are clamped to the chunk. The library never panics, so the impossible
+        // case is skipped instead of unwrapped.
+        if let Some(pos) = LocalPos::new(x, y, z) {
             chunk.set(pos, block);
         }
     }
@@ -195,20 +215,40 @@ fn smooth_noise(seed: u32, x: i32, z: i32, cell: i32) -> f32 {
     lerp(near, far, tz)
 }
 
+/// Number of hash bits that become the noise value. 24 is the width of the `f32`
+/// mantissa, so every such integer converts to `f32` exactly.
+const LATTICE_BITS: u32 = 24;
+
+/// `2^LATTICE_BITS` as `f32`: dividing a [`LATTICE_BITS`]-bit integer by it gives
+/// `0.0..1.0`. A power of two, so the division is exact too.
+const LATTICE_SCALE: f32 = (1_u32 << LATTICE_BITS) as f32;
+
+/// The 32-bit golden-ratio multiplier (`2^32 / phi`, Knuth's multiplicative hashing). It
+/// spreads the x coordinate over all bits before it is combined with z and the seed.
+const GOLDEN_RATIO_32: u32 = 0x9E37_79B1;
+
 /// Pseudo-random value in `0.0..1.0` for a lattice point.
 fn lattice_value(seed: u32, x: u32, z: u32) -> f32 {
-    let hash = mix(x.wrapping_mul(0x9E37_79B1) ^ mix(z ^ mix(seed)));
-    // The top 24 bits fit the f32 mantissa exactly, and 2^24 is a power of two.
-    (hash >> 8) as f32 / 16_777_216.0
+    let hash = mix(x.wrapping_mul(GOLDEN_RATIO_32) ^ mix(z ^ mix(seed)));
+    // Keep the top bits: they are the best mixed ones.
+    (hash >> (u32::BITS - LATTICE_BITS)) as f32 / LATTICE_SCALE
 }
+
+/// Shifts and multipliers of the `lowbias32` mix, in the order of [`mix`]. They are the
+/// constants found by Chris Wellons' search for a 32-bit hash with good avalanche
+/// (<https://nullprogram.com/blog/2018/07/31/>); other values would hash worse.
+/// The three right shifts of the mix.
+const MIX_SHIFTS: [u32; 3] = [16, 15, 16];
+/// The two multipliers of the mix.
+const MIX_MULTIPLIERS: [u32; 2] = [0x7FEB_352D, 0x846C_A68B];
 
 /// The `lowbias32` integer mix by Chris Wellons: a cheap 32-bit hash with good avalanche.
 fn mix(mut value: u32) -> u32 {
-    value ^= value >> 16;
-    value = value.wrapping_mul(0x7FEB_352D);
-    value ^= value >> 15;
-    value = value.wrapping_mul(0x846C_A68B);
-    value ^ (value >> 16)
+    value ^= value >> MIX_SHIFTS[0];
+    value = value.wrapping_mul(MIX_MULTIPLIERS[0]);
+    value ^= value >> MIX_SHIFTS[1];
+    value = value.wrapping_mul(MIX_MULTIPLIERS[1]);
+    value ^ (value >> MIX_SHIFTS[2])
 }
 
 /// Smooth ease curve for `t` in `0.0..=1.0`: zero slope at both ends.
@@ -347,7 +387,7 @@ mod tests {
         // The exact count for seed 1, so a change in the terrain or the mesher shows up.
         // Recompute it when either changes on purpose.
         let mesh = build_mesh(&generate_terrain(1));
-        assert_eq!(mesh.indices.len() / 6, 4848);
+        assert_eq!(mesh.quad_count(), 4848);
     }
 
     /// The most the surface height can change between two adjacent columns. The noise has
@@ -414,27 +454,51 @@ mod tests {
         }
     }
 
+    /// Surface height the generator must use for the column `(x, z)` of the chunk at
+    /// `pos`. The world column is computed here by hand (32 blocks per chunk), not with
+    /// `ChunkPos::origin`, so the test does not share the code it checks.
+    fn expected_height(seed: u32, pos: ChunkPos, x: usize, z: usize) -> i32 {
+        surface_height(seed, pos.x * 32 + x as i32, pos.z * 32 + z as i32)
+    }
+
     #[test]
-    fn two_chunks_match_one_height_function_over_the_whole_area() {
+    fn every_column_matches_the_height_of_its_world_column() {
         for seed in [1, 2, 3, 99] {
-            for pos in [
-                ChunkPos::new(0, 0, 0),
-                ChunkPos::new(1, 0, 0),
-                ChunkPos::new(-1, 0, 0),
-            ] {
+            for (px, pz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (3, -2), (-4, -4)] {
+                let pos = ChunkPos::new(px, 0, pz);
                 let chunk = generate_chunk(seed, pos);
-                let [origin_x, _, origin_z] = pos.origin();
                 for z in 0..CHUNK_SIZE {
                     for x in 0..CHUNK_SIZE {
-                        let expected =
-                            surface_height(seed, origin_x + x as i32, origin_z + z as i32);
                         assert_eq!(
                             world_grass(&chunk, pos, x, z),
-                            expected,
+                            expected_height(seed, pos, x, z),
                             "seed {seed}, chunk {pos:?}, column ({x}, {z})"
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn border_columns_use_the_world_columns_on_both_sides_of_a_border() {
+        // Literal world columns: chunk (1, 0, 0) starts at world x = 32, chunk (0, 0, 0)
+        // ends at 31 and chunk (-1, 0, 0) ends at -1. A chunk origin that is off by one
+        // column would put a different column in each of these places.
+        for seed in [1, 2, 3, 99] {
+            for i in 0..CHUNK_SIZE {
+                let along = i as i32;
+                let at = |x: i32, y: i32, z: i32, cx: usize, cz: usize| {
+                    let pos = ChunkPos::new(x, y, z);
+                    world_grass(&generate_chunk(seed, pos), pos, cx, cz)
+                };
+                let last = CHUNK_SIZE - 1;
+                assert_eq!(at(0, 0, 0, last, i), surface_height(seed, 31, along));
+                assert_eq!(at(1, 0, 0, 0, i), surface_height(seed, 32, along));
+                assert_eq!(at(-1, 0, 0, last, i), surface_height(seed, -1, along));
+                assert_eq!(at(0, 0, 0, i, last), surface_height(seed, along, 31));
+                assert_eq!(at(0, 0, 1, i, 0), surface_height(seed, along, 32));
+                assert_eq!(at(0, 0, -1, i, last), surface_height(seed, along, -1));
             }
         }
     }
