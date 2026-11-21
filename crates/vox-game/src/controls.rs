@@ -15,7 +15,10 @@ pub struct Controls {
     left: bool,
     right: bool,
     up: bool,
-    down: bool,
+    /// Each Shift key is tracked on its own, so releasing one while the other is still
+    /// held does not stop the descent.
+    shift_left: bool,
+    shift_right: bool,
     looking: bool,
 }
 
@@ -28,7 +31,8 @@ impl Controls {
             KeyCode::KeyA => self.left = pressed,
             KeyCode::KeyD => self.right = pressed,
             KeyCode::Space => self.up = pressed,
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.down = pressed,
+            KeyCode::ShiftLeft => self.shift_left = pressed,
+            KeyCode::ShiftRight => self.shift_right = pressed,
             _ => {}
         }
     }
@@ -54,7 +58,7 @@ impl Controls {
         Movement {
             forward: axis(self.forward, self.backward),
             right: axis(self.right, self.left),
-            up: axis(self.up, self.down),
+            up: axis(self.up, self.shift_left || self.shift_right),
         }
     }
 }
@@ -105,6 +109,17 @@ mod tests {
         controls.set_key(KeyCode::KeyW, true);
         controls.set_key(KeyCode::KeyW, false);
         assert_eq!(controls.movement(), Movement::default());
+    }
+
+    #[test]
+    fn releasing_one_shift_key_keeps_descending_while_the_other_is_held() {
+        let mut controls = Controls::default();
+        controls.set_key(KeyCode::ShiftLeft, true);
+        controls.set_key(KeyCode::ShiftRight, true);
+        controls.set_key(KeyCode::ShiftLeft, false);
+        assert_eq!(controls.movement().up, -1.0);
+        controls.set_key(KeyCode::ShiftRight, false);
+        assert_eq!(controls.movement().up, 0.0);
     }
 
     #[test]

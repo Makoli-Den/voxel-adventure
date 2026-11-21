@@ -329,13 +329,13 @@ fn choose_extent(capabilities: &vk::SurfaceCapabilitiesKHR, size: (u32, u32)) ->
 
 /// Prefers MAILBOX, and falls back to FIFO, the one mode every driver must support.
 ///
-/// With FIFO, the present call can block while Windows resizes the window: the compositor
-/// stops taking frames and waits for the window thread, the window thread waits in the
-/// present call, and the game hangs for good. Measured on this project's test machine,
-/// 10 to 30 percent of runs with rapid window resizing hung with FIFO, and none of 14 did
-/// with MAILBOX (see decision 0005). MAILBOX never blocks in present and still avoids
-/// tearing: the newest finished frame is shown at every refresh. Because it does not
-/// wait for the refresh, the game has to cap its own frame rate.
+/// Why not FIFO: on one Windows test machine the game hung for good inside the present
+/// call during rapid window resizing, in 6 of 42 runs with FIFO and in none of 46 runs
+/// with MAILBOX. The mechanism is a hypothesis, not confirmed: the compositor and the
+/// window thread may be waiting for each other. Decision 0005 has the numbers and the
+/// caveats. MAILBOX also avoids tearing, because the newest finished frame is shown at
+/// every refresh. It does not wait for the refresh, so the game has to cap its own
+/// frame rate.
 fn choose_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     if modes.contains(&vk::PresentModeKHR::MAILBOX) {
         vk::PresentModeKHR::MAILBOX

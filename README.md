@@ -2,7 +2,7 @@
 
 A voxel game: the open world, freedom of action and world generation of Minecraft, combined with the adventure, difficulty and boss fights of Terraria. The top priority is speed: the game must be extremely fast and run on old devices. Mods, texture packs and shader packs are part of the core.
 
-> Status: very early. The game opens a window, picks a GPU through Vulkan and draws one demo chunk in 3D (depth buffer, per-face shading, a fixed camera) with shaders that are loaded from files and compiled at startup. World generation, a movable camera, textures and mods are still to come.
+> Status: very early. The game opens a window, picks a GPU through Vulkan, generates one chunk of hilly terrain and lets you fly over it (depth buffer, per-face shading), with shaders that are loaded from files and compiled at startup. Many chunks, textures, collision and mods are still to come.
 
 ## Stack
 - A custom engine in **Rust**, graphics on **Vulkan** (`ash`). The decision and its reasons: [docs/decisions/0001-rust-vulkan-own-engine.md](docs/decisions/0001-rust-vulkan-own-engine.md)
@@ -33,6 +33,16 @@ cargo fmt --all --check     # formatting check
 cargo clippy --workspace --all-targets -- -D warnings   # linter with zero warnings
 ```
 Formatting, the linter and the tests must pass before every commit.
+
+## Controls
+Fly over the generated terrain:
+
+| Input | Action |
+|---|---|
+| W, A, S, D | move forward, left, back, right |
+| Space / Shift | go up / go down |
+| Right mouse button + mouse | look around |
+| Esc | quit |
 
 ## Performance principles
 See [docs/performance-notes.md](docs/performance-notes.md).

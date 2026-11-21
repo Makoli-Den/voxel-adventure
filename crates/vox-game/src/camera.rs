@@ -32,19 +32,21 @@ pub struct Movement {
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
     position: Vec3,
-    /// Rotation around the Y axis in radians, kept within `0..TAU`.
+    /// Rotation around the Y axis in radians, kept within `0..=TAU` (a tiny negative angle
+    /// can round up to exactly `TAU`, which points the same way as 0).
     yaw: f32,
     /// Look up (positive) or down (negative) in radians, within `-MAX_PITCH..=MAX_PITCH`.
     pitch: f32,
 }
 
 impl Camera {
-    /// Creates a camera. The pitch is limited to [`MAX_PITCH`].
+    /// Creates a camera. The pitch is limited to [`MAX_PITCH`]; a angle that is not a
+    /// finite number counts as 0.
     pub fn new(position: Vec3, yaw: f32, pitch: f32) -> Self {
         Self {
             position,
-            yaw: yaw.rem_euclid(TAU),
-            pitch: pitch.clamp(-MAX_PITCH, MAX_PITCH),
+            yaw: finite_or_zero(yaw).rem_euclid(TAU),
+            pitch: finite_or_zero(pitch).clamp(-MAX_PITCH, MAX_PITCH),
         }
     }
 
@@ -65,7 +67,13 @@ impl Camera {
     ///
     /// `yaw_delta` turns right when positive; `pitch_delta` looks down when positive,
     /// the way a mouse moved towards you does.
+    ///
+    /// A delta that is not a finite number is ignored: it would turn the camera into NaN
+    /// for good, and nothing would bring it back.
     pub fn look(&mut self, yaw_delta: f32, pitch_delta: f32) {
+        if !(yaw_delta.is_finite() && pitch_delta.is_finite()) {
+            return;
+        }
         self.yaw = (self.yaw + yaw_delta).rem_euclid(TAU);
         self.pitch = (self.pitch - pitch_delta).clamp(-MAX_PITCH, MAX_PITCH);
     }
@@ -73,7 +81,11 @@ impl Camera {
     /// Moves the eye by `distance` blocks in the direction the player asked for.
     ///
     /// Diagonal movement is normalized, so it is not faster than a straight line.
+    /// A distance that is not a finite number is ignored, for the reason given at [`Self::look`].
     pub fn translate(&mut self, movement: Movement, distance: f32) {
+        if !distance.is_finite() {
+            return;
+        }
         let direction = self.forward() * movement.forward
             + self.right() * movement.right
             + Vec3::Y * movement.up;
@@ -91,6 +103,11 @@ impl Camera {
         let view = view::look_at_mat4(self.position, self.position + self.forward(), Vec3::Y);
         (projection * view).to_cols_array_2d()
     }
+}
+
+/// The value itself, or 0 if it is NaN or infinite.
+fn finite_or_zero(value: f32) -> f32 {
+    if value.is_finite() { value } else { 0.0 }
 }
 
 #[cfg(test)]
@@ -146,9 +163,46 @@ mod tests {
     fn yaw_stays_within_one_turn() {
         let mut camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
         camera.look(-0.1, 0.0);
-        assert!((0.0..TAU).contains(&camera.yaw));
+        assert!((0.0..=TAU).contains(&camera.yaw));
         camera.look(100.0, 0.0);
-        assert!((0.0..TAU).contains(&camera.yaw));
+        assert!((0.0..=TAU).contains(&camera.yaw));
+    }
+
+    #[test]
+    fn values_that_are_not_finite_never_corrupt_the_camera() {
+        let mut camera = Camera::new(Vec3::new(1.0, 2.0, 3.0), 0.5, 0.25);
+        camera.look(f32::NAN, 0.1);
+        camera.look(0.1, f32::INFINITY);
+        camera.translate(
+            Movement {
+                forward: 1.0,
+                ..Movement::default()
+            },
+            f32::NAN,
+        );
+        camera.translate(
+            Movement {
+                forward: f32::NAN,
+                ..Movement::default()
+            },
+            1.0,
+        );
+        assert_eq!(camera.yaw, 0.5);
+        assert_eq!(camera.pitch, 0.25);
+        assert!(close(camera.position, Vec3::new(1.0, 2.0, 3.0)));
+        assert!(
+            camera
+                .view_projection(800, 600)
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn a_new_camera_with_non_finite_angles_looks_straight_ahead() {
+        let camera = Camera::new(Vec3::ZERO, f32::NAN, f32::INFINITY);
+        assert!(close(camera.forward(), Vec3::NEG_Z));
     }
 
     #[test]

@@ -85,15 +85,24 @@ impl App {
         renderer.set_mesh(&build_mesh(&generate_terrain(WORLD_SEED)))?;
         renderer.set_camera(self.camera.view_projection(size.width, size.height));
 
+        self.window = Some(window);
+        self.renderer = Some(renderer);
+        self.update_frame_interval();
+        self.last_frame = Instant::now();
+        self.next_frame = self.last_frame;
+        Ok(())
+    }
+
+    /// Reads the refresh rate of the monitor the window is on and sets the frame interval
+    /// from it. Called again when the window moves, since the other monitor may differ.
+    fn update_frame_interval(&mut self) {
+        let Some(window) = &self.window else {
+            return;
+        };
         let refresh = window
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz());
         self.frame_interval = pacing::frame_interval(refresh);
-        self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.last_frame = Instant::now();
-        self.next_frame = self.last_frame;
-        Ok(())
     }
 
     /// Moves the camera for the time since the last frame and hands it to the renderer.
@@ -106,6 +115,8 @@ impl App {
         self.camera.translate(self.controls.movement(), distance);
 
         if let (Some(window), Some(renderer)) = (&self.window, self.renderer.as_mut()) {
+            // The aspect ratio comes from the window. For a frame or so after a resize the
+            // swapchain may still have the old size, which only stretches that one frame.
             let size = window.inner_size();
             renderer.set_camera(self.camera.view_projection(size.width, size.height));
         }
@@ -152,6 +163,7 @@ impl ApplicationHandler for App {
             } => self.controls.set_looking(state == ElementState::Pressed),
             // Held keys would stay "held" forever, because their release goes to another window.
             WindowEvent::Focused(false) => self.controls.release_all(),
+            WindowEvent::Moved(_) => self.update_frame_interval(),
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
