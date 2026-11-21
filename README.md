@@ -31,6 +31,7 @@ cargo run -p vox-game       # run the game
 cargo test --workspace      # tests
 cargo fmt --all --check     # formatting check
 cargo clippy --workspace --all-targets -- -D warnings   # linter with zero warnings
+cargo bench -p vox-world    # benchmarks, see docs/benchmarks.md (not run in CI)
 ```
 Formatting, the linter and the tests must pass before every commit.
 
