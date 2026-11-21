@@ -217,7 +217,7 @@ pub struct Summary {
 }
 
 /// A duration in milliseconds, with the fraction.
-fn millis(duration: Duration) -> f64 {
+pub(crate) fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * MILLIS_PER_SECOND
 }
 
