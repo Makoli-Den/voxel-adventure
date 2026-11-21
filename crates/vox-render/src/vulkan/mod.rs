@@ -9,6 +9,8 @@
 mod context;
 mod frames;
 mod gpu;
+mod pipeline;
+mod render_pass;
 mod renderer;
 mod swapchain;
 

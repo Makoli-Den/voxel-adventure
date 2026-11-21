@@ -1,25 +1,49 @@
-//! Swapchain: the queue of images that are presented to the window.
+//! Swapchain: the queue of images that are presented to the window,
+//! with the image views and framebuffers that draw into them.
 
 use ash::{khr, vk};
 
 use super::context::{Context, Surface};
 use super::gpu::Gpu;
+use super::render_pass::RenderPass;
 use crate::RenderError;
 
-/// Usage we need from swapchain images: drawing, and clearing through transfer commands.
+/// Usage we need from swapchain images: drawing into them as color attachments.
 fn image_usage() -> vk::ImageUsageFlags {
-    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST
+    vk::ImageUsageFlags::COLOR_ATTACHMENT
 }
 
-/// A swapchain together with its images.
+/// Chooses the format for swapchain images on this surface.
+///
+/// Called once at startup: the render pass and pipeline are built for this format,
+/// and the format list of a surface does not change when the window is resized.
+pub fn surface_format(surface: &Surface, gpu: &Gpu) -> Result<vk::SurfaceFormatKHR, RenderError> {
+    // SAFETY: the physical device and the surface are alive and belong to the same instance.
+    let formats = unsafe {
+        surface
+            .loader()
+            .get_physical_device_surface_formats(gpu.physical(), surface.handle())?
+    };
+    choose_format(&formats)
+}
+
+/// A swapchain together with its images and one image view and framebuffer per image.
+///
+/// The views and framebuffers depend on the image size, so they are rebuilt with the
+/// swapchain on every resize.
 pub struct Swapchain {
+    device: ash::Device,
     loader: khr::swapchain::Device,
     handle: vk::SwapchainKHR,
+    extent: vk::Extent2D,
     images: Vec<vk::Image>,
+    views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
 }
 
 impl Swapchain {
-    /// Creates a swapchain for a window of `size` pixels.
+    /// Creates a swapchain for a window of `size` pixels, with images in the format
+    /// of `render_pass` and a framebuffer for that pass on each image.
     ///
     /// Returns `None` when the surface currently has no area (for example a minimized
     /// window on Windows), because Vulkan forbids zero-sized swapchains. The caller
@@ -31,40 +55,23 @@ impl Swapchain {
         context: &Context,
         surface: &Surface,
         gpu: &Gpu,
+        render_pass: &RenderPass,
         size: (u32, u32),
         old: Option<&Self>,
     ) -> Result<Option<Self>, RenderError> {
-        let physical = gpu.physical();
-        // SAFETY: `physical` and the surface are alive and belong to the same instance.
+        // SAFETY: the physical device and the surface are alive and belong to the same instance.
         let capabilities = unsafe {
             surface
                 .loader()
-                .get_physical_device_surface_capabilities(physical, surface.handle())?
+                .get_physical_device_surface_capabilities(gpu.physical(), surface.handle())?
         };
-        // SAFETY: as above.
-        let formats = unsafe {
-            surface
-                .loader()
-                .get_physical_device_surface_formats(physical, surface.handle())?
-        };
-
         let extent = choose_extent(&capabilities, size);
         if extent.width == 0 || extent.height == 0 {
             return Ok(None);
         }
-        if !capabilities.supported_usage_flags.contains(image_usage()) {
-            return Err(RenderError::Unsupported(
-                "swapchain images cannot be cleared",
-            ));
-        }
-        if !capabilities
-            .supported_composite_alpha
-            .contains(vk::CompositeAlphaFlagsKHR::OPAQUE)
-        {
-            return Err(RenderError::Unsupported("opaque window composition"));
-        }
+        check_capabilities(&capabilities)?;
 
-        let format = choose_format(&formats)?;
+        let format = render_pass.format();
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface.handle())
             .min_image_count(choose_image_count(&capabilities))
@@ -87,12 +94,18 @@ impl Swapchain {
 
         // Build `Self` before the next fallible call so `Drop` cleans up on failure.
         let mut swapchain = Self {
+            device: gpu.device().clone(),
             loader,
             handle,
+            extent,
             images: Vec::new(),
+            views: Vec::new(),
+            framebuffers: Vec::new(),
         };
         // SAFETY: `handle` was just created by this loader.
         swapchain.images = unsafe { swapchain.loader.get_swapchain_images(swapchain.handle)? };
+        swapchain.create_views(format.format)?;
+        swapchain.create_framebuffers(render_pass)?;
         Ok(Some(swapchain))
     }
 
@@ -101,10 +114,17 @@ impl Swapchain {
         self.images.len()
     }
 
-    /// The image with the given index, as returned by [`Self::acquire_next_image`].
-    pub fn image(&self, index: u32) -> vk::Image {
-        // Indexing is safe: the driver only returns indices below the image count.
-        self.images[index as usize]
+    /// Size of the swapchain images in pixels.
+    pub fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+
+    /// The framebuffer of the image with the given index, as returned by
+    /// [`Self::acquire_next_image`].
+    pub fn framebuffer(&self, index: u32) -> vk::Framebuffer {
+        // Indexing is safe: there is one framebuffer per image, and the driver only
+        // returns indices below the image count.
+        self.framebuffers[index as usize]
     }
 
     /// Acquires the next image to draw into. Returns its index and whether the
@@ -144,13 +164,84 @@ impl Swapchain {
         // rendering will signal `wait`.
         unsafe { self.loader.queue_present(queue, &info) }
     }
+
+    /// Creates one color view per swapchain image. Views are pushed one by one,
+    /// so `Drop` destroys those already made if a later one fails.
+    fn create_views(&mut self, format: vk::Format) -> Result<(), RenderError> {
+        for &image in &self.images {
+            let create_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(color_range());
+            // SAFETY: `image` belongs to this live swapchain, which was created with `format`.
+            let view = unsafe { self.device.create_image_view(&create_info, None)? };
+            self.views.push(view);
+        }
+        Ok(())
+    }
+
+    /// Creates one framebuffer per image view. Pushed one by one, like the views.
+    fn create_framebuffers(&mut self, render_pass: &RenderPass) -> Result<(), RenderError> {
+        for &view in &self.views {
+            let attachments = [view];
+            let create_info = vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass.handle())
+                .attachments(&attachments)
+                .width(self.extent.width)
+                .height(self.extent.height)
+                .layers(1);
+            // SAFETY: the render pass and the view are alive, and the view's format matches
+            // the pass attachment (both come from `render_pass.format()`).
+            let framebuffer = unsafe { self.device.create_framebuffer(&create_info, None)? };
+            self.framebuffers.push(framebuffer);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
         // SAFETY: the renderer waits for the device to go idle before dropping or replacing
-        // a swapchain, so no GPU work still uses it.
-        unsafe { self.loader.destroy_swapchain(self.handle, None) };
+        // a swapchain, so no GPU work still uses it, its views or its framebuffers.
+        // Framebuffers go first, then the views they point to, then the swapchain that
+        // owns the images.
+        unsafe {
+            for framebuffer in self.framebuffers.drain(..) {
+                self.device.destroy_framebuffer(framebuffer, None);
+            }
+            for view in self.views.drain(..) {
+                self.device.destroy_image_view(view, None);
+            }
+            self.loader.destroy_swapchain(self.handle, None);
+        }
+    }
+}
+
+/// Fails if the surface cannot be used the way this renderer needs.
+fn check_capabilities(capabilities: &vk::SurfaceCapabilitiesKHR) -> Result<(), RenderError> {
+    if !capabilities.supported_usage_flags.contains(image_usage()) {
+        return Err(RenderError::Unsupported(
+            "swapchain images cannot be rendered to",
+        ));
+    }
+    if !capabilities
+        .supported_composite_alpha
+        .contains(vk::CompositeAlphaFlagsKHR::OPAQUE)
+    {
+        return Err(RenderError::Unsupported("opaque window composition"));
+    }
+    Ok(())
+}
+
+/// The single mip level and array layer of a color image.
+fn color_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
     }
 }
 
@@ -306,5 +397,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(choose_image_count(&capabilities), 2);
+    }
+
+    #[test]
+    fn surface_without_color_attachment_usage_is_rejected() {
+        let capabilities = vk::SurfaceCapabilitiesKHR {
+            supported_usage_flags: vk::ImageUsageFlags::TRANSFER_DST,
+            supported_composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+            ..Default::default()
+        };
+        assert!(check_capabilities(&capabilities).is_err());
+    }
+
+    #[test]
+    fn usable_surface_passes_the_check() {
+        let capabilities = vk::SurfaceCapabilitiesKHR {
+            supported_usage_flags: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            supported_composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+            ..Default::default()
+        };
+        assert!(check_capabilities(&capabilities).is_ok());
     }
 }
