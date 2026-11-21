@@ -6,6 +6,7 @@
 
 mod camera;
 mod controls;
+mod metrics;
 mod pacing;
 mod world_loader;
 
@@ -26,7 +27,10 @@ use winit::window::{Window, WindowId};
 
 use camera::Camera;
 use controls::Controls;
+use metrics::FrameHistory;
 
+/// The name of the game, at the start of the window title.
+const WINDOW_TITLE: &str = "Voxel Adventure";
 /// Seed of the terrain that is generated at startup.
 const WORLD_SEED: u32 = 1;
 /// How far the loaded area reaches from the origin chunk along X and Z, in chunks. The
@@ -62,6 +66,15 @@ struct App {
     next_frame: Instant,
     /// True while the window has zero size. The loop sleeps instead of spinning.
     minimized: bool,
+    /// The last ten seconds of frames, for the live figures in the window title.
+    live_frames: FrameHistory,
+    /// Every frame of the run (up to a limit), for the summary printed at exit.
+    run_frames: FrameHistory,
+    /// When the window title was last updated with the live figures.
+    last_report: Instant,
+    /// Set when the window was minimized: the first frame after it follows a pause, not a
+    /// frame time, so it is not recorded.
+    skip_next_sample: bool,
     /// The error that stopped the game, reported after the event loop ends.
     error: Option<String>,
 }
@@ -77,13 +90,17 @@ impl App {
             frame_interval: pacing::frame_interval(None),
             next_frame: Instant::now(),
             minimized: false,
+            live_frames: FrameHistory::live(),
+            run_frames: FrameHistory::whole_run(),
+            last_report: Instant::now(),
+            skip_next_sample: false,
             error: None,
         }
     }
 
     /// Opens the window, creates the renderer and uploads the terrain.
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
-        let attributes = Window::default_attributes().with_title("Voxel Adventure");
+        let attributes = Window::default_attributes().with_title(WINDOW_TITLE);
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         // Temporary: shaders are read straight from the source tree until the resource
@@ -109,6 +126,7 @@ impl App {
         self.update_frame_interval();
         self.last_frame = Instant::now();
         self.next_frame = self.last_frame;
+        self.last_report = self.last_frame;
         Ok(())
     }
 
@@ -125,12 +143,8 @@ impl App {
     }
 
     /// Moves the camera for the time since the last frame and hands it to the renderer.
-    fn update_camera(&mut self) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_frame).as_secs_f32();
-        self.last_frame = now;
-
-        let distance = MOVE_SPEED * elapsed.min(MAX_FRAME_TIME);
+    fn update_camera(&mut self, since_last_frame: Duration) {
+        let distance = MOVE_SPEED * since_last_frame.as_secs_f32().min(MAX_FRAME_TIME);
         self.camera.translate(self.controls.movement(), distance);
 
         if let (Some(window), Some(renderer)) = (&self.window, self.renderer.as_mut()) {
@@ -139,6 +153,55 @@ impl App {
             let size = window.inner_size();
             renderer.set_camera(self.camera.view_projection(size.width, size.height));
         }
+    }
+
+    /// Updates the camera, draws one frame and records how long it all took.
+    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let started = Instant::now();
+        let interval = started.duration_since(self.last_frame);
+        self.last_frame = started;
+
+        self.update_camera(interval);
+        let result = self
+            .renderer
+            .as_mut()
+            .map(|renderer| renderer.render_frame());
+        if let Some(Err(error)) = result {
+            self.fail(event_loop, error);
+            return;
+        }
+        self.record_frame(interval, started.elapsed());
+    }
+
+    /// Adds a finished frame to the metrics and refreshes the window title now and then.
+    fn record_frame(&mut self, interval: Duration, work: Duration) {
+        if self.skip_next_sample {
+            self.skip_next_sample = false;
+            return;
+        }
+        self.live_frames.push(interval, work, None);
+        self.run_frames.push(interval, work, None);
+
+        if self.last_frame.duration_since(self.last_report) >= metrics::REFRESH_INTERVAL {
+            self.last_report = self.last_frame;
+            self.show_live_figures();
+        }
+    }
+
+    /// Puts the live frame figures into the window title.
+    fn show_live_figures(&self) {
+        if let (Some(window), Some(summary)) = (&self.window, self.live_frames.summary()) {
+            window.set_title(&format!("{WINDOW_TITLE} | {summary}"));
+        }
+    }
+
+    /// The figures of the whole run, for the line printed when the game ends.
+    fn run_summary(&self) -> Option<String> {
+        let summary = self.run_frames.summary()?;
+        Some(format!(
+            "Run: {} frames in {:.1?}: {summary}",
+            summary.frames, summary.covered
+        ))
     }
 
     /// Handles a keyboard event; Escape quits.
@@ -192,15 +255,10 @@ impl ApplicationHandler for App {
                 self.minimized = size.width == 0 || size.height == 0;
                 if self.minimized {
                     event_loop.set_control_flow(ControlFlow::Wait);
+                    self.skip_next_sample = true;
                 }
             }
-            WindowEvent::RedrawRequested => {
-                self.update_camera();
-                let result = self.renderer.as_mut().map(|r| r.render_frame());
-                if let Some(Err(error)) = result {
-                    self.fail(event_loop, error);
-                }
-            }
+            WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
         }
     }
@@ -247,6 +305,9 @@ fn main() -> ExitCode {
     if let Err(error) = event_loop.run_app(&mut app) {
         eprintln!("event loop failed: {error}");
         return ExitCode::FAILURE;
+    }
+    if let Some(summary) = app.run_summary() {
+        println!("{summary}");
     }
     match app.error {
         Some(error) => {
