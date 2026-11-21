@@ -10,6 +10,7 @@ use std::path::Path;
 
 use naga::back::spv;
 use naga::front::glsl;
+use naga::proc::{BoundsCheckPolicies, BoundsCheckPolicy};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
 pub(crate) use naga::ShaderStage;
@@ -56,6 +57,15 @@ fn spirv_options() -> spv::Options<'static> {
     options
         .flags
         .remove(spv::WriterFlags::ADJUST_COORDINATE_SPACE);
+    // The default does no bounds checking, and the device has no `robustBufferAccess`.
+    // A shader from a pack that indexes past the end of an array would then read or
+    // write outside its data on the GPU. `Restrict` clamps every index into range.
+    options.bounds_check_policies = BoundsCheckPolicies {
+        index: BoundsCheckPolicy::Restrict,
+        buffer: BoundsCheckPolicy::Restrict,
+        image_load: BoundsCheckPolicy::Restrict,
+        binding_array: BoundsCheckPolicy::Restrict,
+    };
     options
 }
 
@@ -91,6 +101,13 @@ mod tests {
     fn real_fragment_shader_compiles() {
         let words = load_spirv(&shader_dir().join("triangle.frag"), ShaderStage::Fragment).unwrap();
         assert_is_spirv(&words);
+    }
+
+    #[test]
+    fn array_indices_and_buffers_are_bounds_checked() {
+        let policies = spirv_options().bounds_check_policies;
+        assert_eq!(policies.index, BoundsCheckPolicy::Restrict);
+        assert_eq!(policies.buffer, BoundsCheckPolicy::Restrict);
     }
 
     #[test]

@@ -154,6 +154,10 @@ impl ShaderModule {
     fn new(device: &ash::Device, code: &[u32]) -> Result<Self, RenderError> {
         let create_info = vk::ShaderModuleCreateInfo::default().code(code);
         // SAFETY: the device is alive, and `code` is SPIR-V produced and validated by naga.
+        // Vulkan also requires that the module uses only capabilities the device has
+        // enabled. That holds because the validator in `shader.rs` runs with no optional
+        // capabilities, so only core SPIR-V features can appear. Do not widen that set
+        // without enabling the matching device features.
         let handle = unsafe { device.create_shader_module(&create_info, None)? };
         Ok(Self {
             device: device.clone(),

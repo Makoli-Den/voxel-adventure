@@ -15,16 +15,22 @@ fn image_usage() -> vk::ImageUsageFlags {
 
 /// Chooses the format for swapchain images on this surface.
 ///
-/// Called once at startup: the render pass and pipeline are built for this format,
-/// and the format list of a surface does not change when the window is resized.
+/// Called once at startup: the render pass and pipeline are built for this format.
+/// The list of formats a surface offers may change later (for example when the window
+/// moves to another monitor), so [`Swapchain::new`] checks it again. Rebuilding the
+/// render pass and pipeline for a new format is not implemented until it is seen in practice.
 pub fn surface_format(surface: &Surface, gpu: &Gpu) -> Result<vk::SurfaceFormatKHR, RenderError> {
+    choose_format(&query_formats(surface, gpu)?)
+}
+
+/// Asks the driver which image formats the surface offers right now.
+fn query_formats(surface: &Surface, gpu: &Gpu) -> Result<Vec<vk::SurfaceFormatKHR>, RenderError> {
     // SAFETY: the physical device and the surface are alive and belong to the same instance.
-    let formats = unsafe {
+    Ok(unsafe {
         surface
             .loader()
             .get_physical_device_surface_formats(gpu.physical(), surface.handle())?
-    };
-    choose_format(&formats)
+    })
 }
 
 /// A swapchain together with its images and one image view and framebuffer per image.
@@ -72,6 +78,11 @@ impl Swapchain {
         check_capabilities(&capabilities)?;
 
         let format = render_pass.format();
+        if !is_listed(&query_formats(surface, gpu)?, format) {
+            return Err(RenderError::Unsupported(
+                "the surface no longer offers the swapchain image format",
+            ));
+        }
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface.handle())
             .min_image_count(choose_image_count(&capabilities))
@@ -264,6 +275,19 @@ fn choose_format(formats: &[vk::SurfaceFormatKHR]) -> Result<vk::SurfaceFormatKH
         .ok_or(RenderError::Unsupported("surface lists no image formats"))
 }
 
+/// Whether a swapchain may use `wanted` according to the formats the surface offers.
+fn is_listed(formats: &[vk::SurfaceFormatKHR], wanted: vk::SurfaceFormatKHR) -> bool {
+    // A single UNDEFINED entry means "any format works", see `choose_format`.
+    if let [only] = formats {
+        if only.format == vk::Format::UNDEFINED {
+            return true;
+        }
+    }
+    formats
+        .iter()
+        .any(|f| f.format == wanted.format && f.color_space == wanted.color_space)
+}
+
 /// Uses the size the surface dictates, or the window size clamped to the allowed range.
 fn choose_extent(capabilities: &vk::SurfaceCapabilitiesKHR, size: (u32, u32)) -> vk::Extent2D {
     if capabilities.current_extent.width != u32::MAX {
@@ -330,6 +354,37 @@ mod tests {
     #[test]
     fn empty_format_list_is_an_error() {
         assert!(choose_format(&[]).is_err());
+    }
+
+    #[test]
+    fn listed_format_is_accepted() {
+        let formats = [
+            format(vk::Format::R8G8B8A8_UNORM),
+            format(vk::Format::B8G8R8A8_UNORM),
+        ];
+        assert!(is_listed(&formats, format(vk::Format::B8G8R8A8_UNORM)));
+    }
+
+    #[test]
+    fn missing_format_is_rejected() {
+        let formats = [format(vk::Format::R8G8B8A8_UNORM)];
+        assert!(!is_listed(&formats, format(vk::Format::B8G8R8A8_UNORM)));
+    }
+
+    #[test]
+    fn same_format_in_another_color_space_is_rejected() {
+        let formats = [format(vk::Format::B8G8R8A8_UNORM)];
+        let hdr = vk::SurfaceFormatKHR {
+            format: vk::Format::B8G8R8A8_UNORM,
+            color_space: vk::ColorSpaceKHR::HDR10_ST2084_EXT,
+        };
+        assert!(!is_listed(&formats, hdr));
+    }
+
+    #[test]
+    fn single_undefined_entry_accepts_any_format() {
+        let formats = [format(vk::Format::UNDEFINED)];
+        assert!(is_listed(&formats, format(vk::Format::B8G8R8A8_UNORM)));
     }
 
     #[test]

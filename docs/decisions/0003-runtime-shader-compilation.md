@@ -10,6 +10,8 @@ Shader packs are part of the core (decision 0001): a pack is a folder of shader 
 - The built-in shaders live in `assets/shaders/`. The renderer receives the folder as a path (`create_renderer(..., shader_dir)`) and reads the files from there at startup.
 - They are compiled to **SPIR-V 1.0** (the version Vulkan 1.0 accepts) with the pure-Rust **`naga`** crate: the GLSL front end, the validator and the SPIR-V back end. naga is used only inside `vox-render`; no naga type appears in the public API.
 - A missing or broken shader is a `RenderError::Shader` carrying the file name and the compiler message, never a panic.
+- The SPIR-V writer is told to bounds-check array indices and buffer accesses (`Restrict`, which clamps indices into range), because the device is created without `robustBufferAccess` and a pack shader must not be able to read or write outside its data.
+- The validator runs with no optional SPIR-V capabilities, so a module can only use core features the device always has. Widening this set requires enabling the matching device features.
 - Until the resource virtual file system exists, the game passes the folder from the source tree (`CARGO_MANIFEST_DIR/../../assets/shaders`). Later the file system resolves shaders through the active packs.
 
 ## Reasons
