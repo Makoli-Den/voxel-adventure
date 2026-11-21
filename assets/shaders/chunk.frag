@@ -1,6 +1,7 @@
 #version 450
 
-// Writes the color interpolated across the triangle from its corners.
+// Writes the face color computed in the vertex shader. It is the same on all
+// corners of a face, so the interpolation leaves it unchanged.
 
 layout(location = 0) in vec3 v_color;
 

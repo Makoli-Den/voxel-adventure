@@ -5,6 +5,7 @@
 //! replaced (for example by a fallback for old devices) without touching other layers.
 
 mod error;
+mod interface;
 mod shader;
 mod vulkan;
 
@@ -32,6 +33,23 @@ pub trait Renderer {
 
     /// Human-readable name of the GPU in use.
     fn device_name(&self) -> &str;
+
+    /// Replaces the mesh that is drawn every frame. The previous mesh's GPU buffers are freed.
+    ///
+    /// Coordinates are chunk-local block units; the chunk sits at the origin. An empty
+    /// mesh draws nothing, and so does a renderer that has never been given a mesh.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::InvalidMesh`] if the data is malformed (an index points
+    /// past the last vertex), or another error if the GPU cannot allocate or fill the
+    /// buffers. The previous mesh is then kept.
+    fn set_mesh(&mut self, mesh: &vox_world::ChunkMesh) -> Result<(), RenderError>;
+
+    /// Sets the combined view-projection matrix, column-major, exactly `glam::Mat4::to_cols_array_2d()`.
+    ///
+    /// The matrix must already produce Vulkan clip space (Y down, depth 0..1); the
+    /// renderer applies it unchanged.
+    fn set_camera(&mut self, view_projection: [[f32; 4]; 4]);
 }
 
 /// Creates the default renderer (Vulkan) that draws into `window`.
@@ -39,8 +57,8 @@ pub trait Renderer {
 /// The renderer keeps the `Arc` alive for as long as it exists, which guarantees
 /// the native window outlives the surface created from it.
 ///
-/// `shader_dir` is the folder with the GLSL shader files (`triangle.vert`,
-/// `triangle.frag`). They are read and compiled once, here.
+/// `shader_dir` is the folder with the GLSL shader files (`chunk.vert`,
+/// `chunk.frag`). They are read and compiled once, here.
 ///
 /// # Errors
 /// Returns an error if Vulkan is unavailable, no GPU can present to the window,

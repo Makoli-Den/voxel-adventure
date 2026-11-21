@@ -3,29 +3,36 @@
 use std::any::Any;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use vox_world::ChunkMesh;
 
 use super::context::{Context, Surface};
+use super::depth;
 use super::frames::{FrameSlot, Frames};
 use super::gpu::Gpu;
+use super::mesh::GpuMesh;
 use super::pipeline::Pipeline;
 use super::render_pass::RenderPass;
 use super::swapchain::{self, Swapchain};
+use crate::interface::PUSH_CONSTANT_SIZE;
 use crate::{RenderError, Renderer};
+
+/// The sky: everything the mesh does not cover is cleared to this color.
+const SKY_COLOR: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
 
 /// Draws into a window with Vulkan.
 ///
-/// For now a frame is a colored triangle on a slowly changing background color.
-/// That is enough to prove the render pass, the pipeline and the shaders loaded
-/// from files work.
+/// For now a frame is one chunk mesh in front of a plain sky color.
 pub struct VulkanRenderer {
     // Rust drops fields in declaration order, so each object comes before the
-    // ones it depends on: framebuffers (in the swapchain) and the pipeline before
-    // the render pass, everything before the device. Do not reorder.
+    // ones it depends on: buffers, framebuffers (in the swapchain) and the pipeline
+    // before the render pass, everything before the device. Do not reorder.
     frames: Frames,
+    /// The mesh drawn every frame; `None` while there is nothing to draw (no mesh yet,
+    /// or an empty one).
+    mesh: Option<GpuMesh>,
     /// `None` while the window has no area to draw into (minimized).
     swapchain: Option<Swapchain>,
     pipeline: Pipeline,
@@ -39,8 +46,8 @@ pub struct VulkanRenderer {
     size: (u32, u32),
     /// Set when the swapchain no longer matches the window and must be rebuilt.
     needs_recreate: bool,
-    /// Start of the demo animation: the clear color is a function of the time since then.
-    started: Instant,
+    /// The view-projection matrix as push-constant bytes, see [`camera_bytes`].
+    camera: [u8; PUSH_CONSTANT_SIZE as usize],
 }
 
 impl VulkanRenderer {
@@ -68,7 +75,8 @@ impl VulkanRenderer {
         let surface = unsafe { Surface::new(&context, display, window_handle)? };
         let gpu = Gpu::new(&context, &surface)?;
         let format = swapchain::surface_format(&surface, &gpu)?;
-        let render_pass = RenderPass::new(gpu.device(), format)?;
+        let depth_format = depth::depth_format(&context, &gpu)?;
+        let render_pass = RenderPass::new(gpu.device(), format, depth_format)?;
         let pipeline = Pipeline::new(gpu.device(), &render_pass, shader_dir)?;
         let swapchain = Swapchain::new(
             &context,
@@ -86,6 +94,7 @@ impl VulkanRenderer {
 
         Ok(Self {
             frames,
+            mesh: None,
             needs_recreate: swapchain.is_none(),
             swapchain,
             pipeline,
@@ -95,7 +104,7 @@ impl VulkanRenderer {
             context,
             _window: window,
             size: (width, height),
-            started: Instant::now(),
+            camera: camera_bytes(&IDENTITY),
         })
     }
 
@@ -127,8 +136,9 @@ impl VulkanRenderer {
     }
 
     /// Records one frame into `command_buffer`: the render pass clears the swapchain
-    /// image `image_index` to the background color and the pipeline draws the triangle.
-    /// The render pass also moves the image to the present layout, so no barriers are needed.
+    /// image `image_index` to the sky color and the depth buffer to the far plane, then
+    /// the mesh is drawn. The render pass also moves the image to the present layout,
+    /// so no barriers are needed.
     // HOT PATH: runs every frame. Everything lives on the stack, nothing is allocated.
     fn record_frame(
         &self,
@@ -142,11 +152,17 @@ impl VulkanRenderer {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
         };
-        let clear_values = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: color_at(self.started.elapsed().as_secs_f32()),
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue { float32: SKY_COLOR },
             },
-        }];
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        ];
         let pass_info = vk::RenderPassBeginInfo::default()
             .render_pass(self.render_pass.handle())
             .framebuffer(swapchain.framebuffer(image_index))
@@ -158,24 +174,56 @@ impl VulkanRenderer {
         // SAFETY: the command buffer belongs to this device and is not in use (the frame's
         // fence was waited on; beginning implicitly resets it because the pool allows resets).
         // The framebuffer belongs to the acquired image and was built for this render pass,
-        // which the pipeline was built for too. The pipeline's viewport and scissor are
-        // dynamic and both are set before the draw.
+        // which the pipeline was built for too. Viewport and scissor are set before the
+        // draw. The mesh lives in `self` and is only replaced after `device_wait_idle`.
         unsafe {
             device.begin_command_buffer(command_buffer, &begin_info)?;
             device.cmd_begin_render_pass(command_buffer, &pass_info, vk::SubpassContents::INLINE);
+            device.cmd_set_viewport(command_buffer, 0, &[full_viewport(extent)]);
+            device.cmd_set_scissor(command_buffer, 0, &[area]);
+            if let Some(mesh) = &self.mesh {
+                self.record_mesh(command_buffer, mesh);
+            }
+            device.cmd_end_render_pass(command_buffer);
+            device.end_command_buffer(command_buffer)?;
+        }
+        Ok(())
+    }
+
+    /// Records the draw of `mesh` with the current camera.
+    ///
+    /// # Safety
+    /// `command_buffer` must be recording inside the render pass the pipeline was built
+    /// for, with viewport and scissor set. `mesh` must stay alive until the GPU has
+    /// finished the command buffer.
+    // HOT PATH: runs every frame; only binds, one push and one indexed draw.
+    unsafe fn record_mesh(&self, command_buffer: vk::CommandBuffer, mesh: &GpuMesh) {
+        let device = self.gpu.device();
+        // SAFETY: the caller guarantees the recording state and the mesh lifetime. The
+        // pipeline, its layout and the buffers belong to this device, and the pushed
+        // range (64 bytes at offset 0, vertex stage) matches the layout's range.
+        unsafe {
             device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline.handle(),
             );
-            device.cmd_set_viewport(command_buffer, 0, &[full_viewport(extent)]);
-            device.cmd_set_scissor(command_buffer, 0, &[area]);
-            // Three vertices, one instance: the triangle from the vertex shader.
-            device.cmd_draw(command_buffer, 3, 1, 0, 0);
-            device.cmd_end_render_pass(command_buffer);
-            device.end_command_buffer(command_buffer)?;
+            device.cmd_push_constants(
+                command_buffer,
+                self.pipeline.layout(),
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &self.camera,
+            );
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer()], &[0]);
+            device.cmd_bind_index_buffer(
+                command_buffer,
+                mesh.index_buffer(),
+                0,
+                vk::IndexType::UINT32,
+            );
+            device.cmd_draw_indexed(command_buffer, mesh.index_count(), 1, 0, 0, 0);
         }
-        Ok(())
     }
 
     /// Submits the frame's recorded commands to the GPU.
@@ -278,6 +326,20 @@ impl Renderer for VulkanRenderer {
     fn device_name(&self) -> &str {
         self.gpu.name()
     }
+
+    fn set_mesh(&mut self, mesh: &ChunkMesh) -> Result<(), RenderError> {
+        // Upload first: if it fails, the old mesh stays and keeps being drawn.
+        let new = GpuMesh::new(&self.gpu, mesh)?;
+        // SAFETY: the device is alive. Waiting for idle means no frame in flight still
+        // reads the old buffers, which are freed by the assignment below.
+        unsafe { self.gpu.device().device_wait_idle()? };
+        self.mesh = new;
+        Ok(())
+    }
+
+    fn set_camera(&mut self, view_projection: [[f32; 4]; 4]) {
+        self.camera = camera_bytes(&view_projection);
+    }
 }
 
 impl Drop for VulkanRenderer {
@@ -291,12 +353,23 @@ impl Drop for VulkanRenderer {
     }
 }
 
-/// A color that drifts smoothly with time, so it is obvious the frames are live.
-/// Every component stays within `0.0..=1.0`; alpha is always opaque.
-fn color_at(seconds: f32) -> [f32; 4] {
-    let t = seconds * 0.8;
-    let wave = |phase: f32| 0.5 + 0.5 * (t + phase).sin();
-    [wave(0.0), wave(2.1), wave(4.2), 1.0]
+/// The camera before [`Renderer::set_camera`] is called.
+const IDENTITY: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Packs a column-major matrix into the bytes of a GLSL `mat4` push constant:
+/// columns one after another, each float little-endian like the GPU reads it.
+fn camera_bytes(matrix: &[[f32; 4]; 4]) -> [u8; PUSH_CONSTANT_SIZE as usize] {
+    let mut bytes = [0; PUSH_CONSTANT_SIZE as usize];
+    let floats = matrix.iter().flatten();
+    for (chunk, value) in bytes.chunks_exact_mut(4).zip(floats) {
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
 }
 
 /// A viewport covering the whole image, with the standard `0..1` depth range.
@@ -317,17 +390,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn color_stays_in_range_and_opaque() {
-        for step in 0..1000_u16 {
-            let color = color_at(f32::from(step) * 0.1);
-            assert!(color[..3].iter().all(|c| (0.0..=1.0).contains(c)));
-            assert_eq!(color[3], 1.0);
-        }
-    }
-
-    #[test]
-    fn color_changes_over_time() {
-        assert_ne!(color_at(0.0), color_at(1.0));
+    fn camera_bytes_are_columns_in_order() {
+        let mut matrix = IDENTITY;
+        matrix[3][0] = 2.0; // translation x, first value of the last column
+        let bytes = camera_bytes(&matrix);
+        assert_eq!(bytes[..4], 1.0_f32.to_le_bytes());
+        assert_eq!(bytes[48..52], 2.0_f32.to_le_bytes());
+        assert_eq!(bytes[60..], 1.0_f32.to_le_bytes());
     }
 
     #[test]

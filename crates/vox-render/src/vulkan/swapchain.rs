@@ -1,9 +1,10 @@
 //! Swapchain: the queue of images that are presented to the window,
-//! with the image views and framebuffers that draw into them.
+//! with the image views, depth image and framebuffers that draw into them.
 
 use ash::{khr, vk};
 
 use super::context::{Context, Surface};
+use super::depth::DepthImage;
 use super::gpu::Gpu;
 use super::render_pass::RenderPass;
 use crate::RenderError;
@@ -23,6 +24,19 @@ pub fn surface_format(surface: &Surface, gpu: &Gpu) -> Result<vk::SurfaceFormatK
     choose_format(&query_formats(surface, gpu)?)
 }
 
+/// Asks the driver which present modes the surface offers right now.
+fn query_present_modes(
+    surface: &Surface,
+    gpu: &Gpu,
+) -> Result<Vec<vk::PresentModeKHR>, RenderError> {
+    // SAFETY: the physical device and the surface are alive and belong to the same instance.
+    Ok(unsafe {
+        surface
+            .loader()
+            .get_physical_device_surface_present_modes(gpu.physical(), surface.handle())?
+    })
+}
+
 /// Asks the driver which image formats the surface offers right now.
 fn query_formats(surface: &Surface, gpu: &Gpu) -> Result<Vec<vk::SurfaceFormatKHR>, RenderError> {
     // SAFETY: the physical device and the surface are alive and belong to the same instance.
@@ -33,10 +47,11 @@ fn query_formats(surface: &Surface, gpu: &Gpu) -> Result<Vec<vk::SurfaceFormatKH
     })
 }
 
-/// A swapchain together with its images and one image view and framebuffer per image.
+/// A swapchain together with its images, one image view and framebuffer per image,
+/// and the depth image all framebuffers share.
 ///
-/// The views and framebuffers depend on the image size, so they are rebuilt with the
-/// swapchain on every resize.
+/// The views, the depth image and the framebuffers depend on the image size, so they
+/// are rebuilt with the swapchain on every resize.
 pub struct Swapchain {
     device: ash::Device,
     loader: khr::swapchain::Device,
@@ -45,11 +60,14 @@ pub struct Swapchain {
     images: Vec<vk::Image>,
     views: Vec<vk::ImageView>,
     framebuffers: Vec<vk::Framebuffer>,
+    /// Dropped after `Drop::drop` has destroyed the framebuffers that point at it.
+    depth: DepthImage,
 }
 
 impl Swapchain {
     /// Creates a swapchain for a window of `size` pixels, with images in the format
-    /// of `render_pass` and a framebuffer for that pass on each image.
+    /// of `render_pass`, a depth image of the same size, and a framebuffer for that
+    /// pass on each image.
     ///
     /// Returns `None` when the surface currently has no area (for example a minimized
     /// window on Windows), because Vulkan forbids zero-sized swapchains. The caller
@@ -77,12 +95,15 @@ impl Swapchain {
         }
         check_capabilities(&capabilities)?;
 
+        // Created before the swapchain, so a failure below simply drops it unused.
+        let depth = DepthImage::new(gpu, render_pass.depth_format(), extent)?;
         let format = render_pass.format();
         if !is_listed(&query_formats(surface, gpu)?, format) {
             return Err(RenderError::Unsupported(
                 "the surface no longer offers the swapchain image format",
             ));
         }
+        let present_mode = choose_present_mode(&query_present_modes(surface, gpu)?);
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface.handle())
             .min_image_count(choose_image_count(&capabilities))
@@ -94,8 +115,7 @@ impl Swapchain {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            // FIFO is the only present mode every driver must support (vsync).
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(old.map_or(vk::SwapchainKHR::null(), |s| s.handle));
 
@@ -112,6 +132,7 @@ impl Swapchain {
             images: Vec::new(),
             views: Vec::new(),
             framebuffers: Vec::new(),
+            depth,
         };
         // SAFETY: `handle` was just created by this loader.
         swapchain.images = unsafe { swapchain.loader.get_swapchain_images(swapchain.handle)? };
@@ -195,15 +216,16 @@ impl Swapchain {
     /// Creates one framebuffer per image view. Pushed one by one, like the views.
     fn create_framebuffers(&mut self, render_pass: &RenderPass) -> Result<(), RenderError> {
         for &view in &self.views {
-            let attachments = [view];
+            let attachments = [view, self.depth.view()];
             let create_info = vk::FramebufferCreateInfo::default()
                 .render_pass(render_pass.handle())
                 .attachments(&attachments)
                 .width(self.extent.width)
                 .height(self.extent.height)
                 .layers(1);
-            // SAFETY: the render pass and the view are alive, and the view's format matches
-            // the pass attachment (both come from `render_pass.format()`).
+            // SAFETY: the render pass and the views are alive, and their formats match the
+            // pass attachments (`render_pass.format()` and `render_pass.depth_format()`).
+            // Both images have this swapchain's extent.
             let framebuffer = unsafe { self.device.create_framebuffer(&create_info, None)? };
             self.framebuffers.push(framebuffer);
         }
@@ -216,7 +238,7 @@ impl Drop for Swapchain {
         // SAFETY: the renderer waits for the device to go idle before dropping or replacing
         // a swapchain, so no GPU work still uses it, its views or its framebuffers.
         // Framebuffers go first, then the views they point to, then the swapchain that
-        // owns the images.
+        // owns the images. The depth image is a field and is dropped after this body.
         unsafe {
             for framebuffer in self.framebuffers.drain(..) {
                 self.device.destroy_framebuffer(framebuffer, None);
@@ -305,6 +327,23 @@ fn choose_extent(capabilities: &vk::SurfaceCapabilitiesKHR, size: (u32, u32)) ->
     }
 }
 
+/// Prefers MAILBOX, and falls back to FIFO, the one mode every driver must support.
+///
+/// Why not FIFO: on one Windows test machine the game hung for good inside the present
+/// call during rapid window resizing, in 6 of 42 runs with FIFO and in none of 46 runs
+/// with MAILBOX. The mechanism is a hypothesis, not confirmed: the compositor and the
+/// window thread may be waiting for each other. Decision 0005 has the numbers and the
+/// caveats. MAILBOX also avoids tearing, because the newest finished frame is shown at
+/// every refresh. It does not wait for the refresh, so the game has to cap its own
+/// frame rate.
+fn choose_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+        vk::PresentModeKHR::MAILBOX
+    } else {
+        vk::PresentModeKHR::FIFO
+    }
+}
+
 /// One image more than the minimum, so we never wait on the driver; capped at the maximum.
 fn choose_image_count(capabilities: &vk::SurfaceCapabilitiesKHR) -> u32 {
     let wanted = capabilities.min_image_count + 1;
@@ -323,6 +362,19 @@ mod tests {
             format,
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
         }
+    }
+
+    #[test]
+    fn present_mode_prefers_mailbox() {
+        let modes = [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX];
+        assert_eq!(choose_present_mode(&modes), vk::PresentModeKHR::MAILBOX);
+    }
+
+    #[test]
+    fn present_mode_falls_back_to_fifo() {
+        let modes = [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::IMMEDIATE];
+        assert_eq!(choose_present_mode(&modes), vk::PresentModeKHR::FIFO);
+        assert_eq!(choose_present_mode(&[]), vk::PresentModeKHR::FIFO);
     }
 
     #[test]
