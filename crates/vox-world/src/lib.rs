@@ -5,6 +5,8 @@
 
 mod block;
 mod chunk;
+mod mesh;
 
 pub use block::BlockId;
 pub use chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, LocalPos};
+pub use mesh::{ChunkMesh, ChunkVertex, Face, build_mesh};

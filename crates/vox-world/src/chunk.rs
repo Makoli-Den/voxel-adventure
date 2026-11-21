@@ -37,6 +37,46 @@ impl LocalPos {
         }
     }
 
+    /// X coordinate, always below [`CHUNK_SIZE`].
+    pub const fn x(self) -> u8 {
+        self.x
+    }
+
+    /// Y coordinate, always below [`CHUNK_SIZE`].
+    pub const fn y(self) -> u8 {
+        self.y
+    }
+
+    /// Z coordinate, always below [`CHUNK_SIZE`].
+    pub const fn z(self) -> u8 {
+        self.z
+    }
+
+    /// Returns the position shifted by `offset`, or `None` if it leaves the chunk.
+    ///
+    /// Checked arithmetic on `u8` makes underflow below zero and overflow past the
+    /// far edge both come back as `None`, with no signed tricks at the call site.
+    pub fn offset(self, offset: [i8; 3]) -> Option<Self> {
+        let x = self.x.checked_add_signed(offset[0])?;
+        let y = self.y.checked_add_signed(offset[1])?;
+        let z = self.z.checked_add_signed(offset[2])?;
+        Self::new(x as usize, y as usize, z as usize)
+    }
+
+    /// Iterates over every position of the chunk in storage order.
+    pub fn all() -> impl Iterator<Item = Self> {
+        (0..CHUNK_VOLUME).map(Self::from_index)
+    }
+
+    /// Inverse of [`LocalPos::index`]. The masks keep every coordinate below 32.
+    const fn from_index(index: usize) -> Self {
+        Self {
+            x: (index & (CHUNK_SIZE - 1)) as u8,
+            z: ((index / CHUNK_SIZE) & (CHUNK_SIZE - 1)) as u8,
+            y: ((index / (CHUNK_SIZE * CHUNK_SIZE)) & (CHUNK_SIZE - 1)) as u8,
+        }
+    }
+
     /// Index of the block in the chunk's flat array. Layers go along `y`, then `z` within a layer, then `x`.
     const fn index(self) -> usize {
         (self.y as usize * CHUNK_SIZE + self.z as usize) * CHUNK_SIZE + self.x as usize
@@ -120,6 +160,24 @@ mod tests {
             }
         }
         assert!(seen.iter().all(|&s| s));
+    }
+
+    #[test]
+    fn all_visits_every_position_in_storage_order() {
+        let mut count = 0;
+        for (i, p) in LocalPos::all().enumerate() {
+            assert_eq!(p.index(), i);
+            count += 1;
+        }
+        assert_eq!(count, CHUNK_VOLUME);
+    }
+
+    #[test]
+    fn offset_moves_inside_and_rejects_outside() {
+        let p = pos(0, 31, 5);
+        assert_eq!(p.offset([1, 0, -1]), Some(pos(1, 31, 4)));
+        assert_eq!(p.offset([-1, 0, 0]), None);
+        assert_eq!(p.offset([0, 1, 0]), None);
     }
 
     #[test]
