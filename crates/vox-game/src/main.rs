@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use glam::Vec3;
 use vox_render::{RenderError, RenderStats, Renderer, ShaderSources, create_renderer};
+use vox_resources::PackStack;
 use vox_world::{BlockId, ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -598,13 +599,13 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Stacks the built-in pack and the `--pack` directories, warns about any `--pack` that is not
-/// a directory, and reads the shaders through the stack.
+/// Stacks the built-in pack and the `--pack` directories and warns about any `--pack` that is
+/// not a directory.
 ///
 /// # Errors
 /// A message naming the built-in pack's path if it is missing (the game cannot run without
-/// it), or the shader that cannot be read.
-fn load_shaders(options: &Options) -> Result<ShaderSources, String> {
+/// it).
+fn build_pack_stack(options: &Options) -> Result<PackStack, String> {
     let built_in = packs::built_in_pack();
     if !built_in.exists() {
         return Err(format!(
@@ -619,7 +620,7 @@ fn load_shaders(options: &Options) -> Result<ShaderSources, String> {
             packs::describe_root(&root)
         );
     }
-    packs::load_shaders(&stack).map_err(|error| format!("cannot load the shaders: {error}"))
+    Ok(stack)
 }
 
 fn main() -> ExitCode {
@@ -634,18 +635,26 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    // Read before the window opens, so a missing shader is reported without flashing one.
-    let shaders = match load_shaders(&options) {
-        Ok(shaders) => shaders,
+    // Everything is read before the window opens, so a missing shader or a broken blocks file
+    // is reported without flashing one.
+    let stack = match build_pack_stack(&options) {
+        Ok(stack) => stack,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
     };
-    let content = match Content::new() {
+    let shaders = match packs::load_shaders(&stack) {
+        Ok(shaders) => shaders,
+        Err(error) => {
+            eprintln!("error: cannot load the shaders: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let content = match Content::new(&stack) {
         Ok(content) => content,
         Err(error) => {
-            eprintln!("error: cannot set up the blocks: {error}");
+            eprintln!("error: cannot load the blocks: {error}");
             return ExitCode::FAILURE;
         }
     };
