@@ -3,6 +3,7 @@
 use ash::{khr, vk};
 
 use super::context::{Context, Surface};
+use super::timestamps::TimestampClock;
 use crate::RenderError;
 
 /// A chosen GPU, its logical device and the single queue we use.
@@ -16,6 +17,8 @@ pub struct Gpu {
     name: String,
     /// Memory types and heaps of the GPU, read once because they never change.
     memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// How to read the queue's timestamps; `None` if the queue cannot write them.
+    timestamp_clock: Option<TimestampClock>,
 }
 
 impl Gpu {
@@ -59,6 +62,10 @@ impl Gpu {
 
         // SAFETY: `physical` came from this live instance.
         let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let timestamp_clock = TimestampClock::new(
+            timestamp_valid_bits(instance, physical, queue_family),
+            properties.limits.timestamp_period,
+        );
         let name = properties.device_name_as_c_str().map_or_else(
             |_| String::from("unknown GPU"),
             |n| n.to_string_lossy().into_owned(),
@@ -71,6 +78,7 @@ impl Gpu {
             queue_family,
             name,
             memory_properties,
+            timestamp_clock,
         })
     }
 
@@ -103,6 +111,11 @@ impl Gpu {
     pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
         &self.memory_properties
     }
+
+    /// How to read the queue's timestamps, or `None` if it cannot write them.
+    pub fn timestamp_clock(&self) -> Option<TimestampClock> {
+        self.timestamp_clock
+    }
 }
 
 impl Drop for Gpu {
@@ -133,6 +146,20 @@ fn supports_swapchain(
         e.extension_name_as_c_str()
             .is_ok_and(|name| name == khr::swapchain::NAME)
     }))
+}
+
+/// How many bits of a timestamp the queue family `family` writes; 0 if it writes none.
+fn timestamp_valid_bits(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    family: u32,
+) -> u32 {
+    // SAFETY: `physical` was returned by `enumerate_physical_devices` on this live instance.
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+    // Lossless: a family index is a small `u32`.
+    families
+        .get(family as usize)
+        .map_or(0, |properties| properties.timestamp_valid_bits)
 }
 
 /// Finds a queue family that supports both graphics and presenting to `surface`.

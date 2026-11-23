@@ -18,6 +18,7 @@ mod render_pass;
 mod renderer;
 mod retired;
 mod swapchain;
+mod timestamps;
 
 use ash::vk;
 use raw_window_handle::HandleError;
