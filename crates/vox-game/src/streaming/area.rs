@@ -45,6 +45,8 @@ pub fn wanted(centre: ChunkPos, radius: i32) -> Vec<ChunkPos> {
             }
         }
     }
+    // Near i32::MIN or i32::MAX the saturating adds below could give duplicate positions;
+    // that is about 7e10 blocks from the origin, far beyond where f32 positions mean anything.
     offsets.sort_unstable();
     offsets
         .into_iter()

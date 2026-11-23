@@ -245,6 +245,8 @@ impl App {
             renderer.remove_chunk_mesh(*pos);
         }
         let uploading = Instant::now();
+        // An upload error is fatal (the caller exits the game), so the streamer's record of
+        // what is loaded need not be corrected when one fails halfway.
         for (pos, mesh) in &changes.uploads {
             renderer.set_chunk_mesh(*pos, mesh)?;
         }

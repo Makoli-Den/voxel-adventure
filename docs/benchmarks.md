@@ -261,6 +261,8 @@ and reduce detail with distance (see docs/performance-notes.md).
 | 16 | 1089 | 163 | 448 | 6.11 ms | 2.22 ms |
 | 30 | 3721 | 52 | 168 | 19.35 ms | 5.89 ms |
 
+Note: the tables above were measured with the square area that existed before chunk streaming; `--view-radius` now means a circle (about 79 percent as many chunks), so later figures are not directly comparable.
+
 At radius 16 the start view draws 365 of 1089 chunks. The camera looks along one direction,
 so a view that sees more of the area gains less; a flight around the world is not measured yet.
 The remaining cost is still per drawn triangle (1.2 M triangles at radius 16): the next steps

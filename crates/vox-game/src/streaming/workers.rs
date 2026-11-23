@@ -257,7 +257,7 @@ mod tests {
         let started = Instant::now();
         drop(workers);
         // Waiting for every job would take JOBS * JOB_TIME (4 s); stopping takes about one job.
-        assert!(started.elapsed() < TIMEOUT / 2);
+        assert!(started.elapsed() < JOB_TIME * (JOBS as u32) / 4);
         assert!(run.load(Ordering::SeqCst) < JOBS as usize);
     }
 
