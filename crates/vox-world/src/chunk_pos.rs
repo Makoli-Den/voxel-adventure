@@ -1,6 +1,6 @@
 //! Position of a chunk in the world, counted in chunks.
 
-use crate::chunk::CHUNK_SIZE;
+use crate::chunk::{AXIS_X, AXIS_Y, AXIS_Z, CHUNK_SIZE, LocalPos};
 use crate::mesh::Face;
 
 /// `CHUNK_SIZE` as the integer type of world coordinates (the size is 32, so it always fits).
@@ -31,6 +31,20 @@ impl ChunkPos {
         Self { x, y, z }
     }
 
+    /// Splits the world position of a block into the chunk that holds it and the block's
+    /// position inside that chunk.
+    ///
+    /// Rounds towards negative infinity, so block `-1` belongs to chunk `-1` (local 31),
+    /// not to chunk 0.
+    pub const fn containing(block: [i32; 3]) -> (Self, LocalPos) {
+        let chunk = Self::new(
+            block[AXIS_X].div_euclid(CHUNK_SIZE_I32),
+            block[AXIS_Y].div_euclid(CHUNK_SIZE_I32),
+            block[AXIS_Z].div_euclid(CHUNK_SIZE_I32),
+        );
+        (chunk, LocalPos::from_block_coords(block))
+    }
+
     /// World position of the chunk's lowest corner (its block `(0, 0, 0)`), in blocks.
     ///
     /// Positions so far out that the result would not fit an `i32` (more than 67 million
@@ -59,6 +73,39 @@ impl ChunkPos {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn containing_splits_positive_positions() {
+        let (chunk, local) = ChunkPos::containing([33, 0, 95]);
+        assert_eq!(chunk, ChunkPos::new(1, 0, 2));
+        assert_eq!(local, LocalPos::new(1, 0, 31).unwrap());
+    }
+
+    #[test]
+    fn containing_floors_negative_positions() {
+        let (chunk, local) = ChunkPos::containing([-1, -32, -33]);
+        assert_eq!(chunk, ChunkPos::new(-1, -1, -2));
+        assert_eq!(local, LocalPos::new(31, 0, 31).unwrap());
+    }
+
+    #[test]
+    fn containing_agrees_with_origin_at_every_chunk_border() {
+        for edge in [-65, -64, -33, -32, -1, 0, 31, 32, 63, 64] {
+            let (chunk, local) = ChunkPos::containing([edge, edge, edge]);
+            let origin = chunk.origin();
+            assert_eq!(origin[0] + i32::from(local.x()), edge);
+            assert_eq!(origin[1] + i32::from(local.y()), edge);
+            assert_eq!(origin[2] + i32::from(local.z()), edge);
+        }
+    }
+
+    #[test]
+    fn containing_handles_the_ends_of_the_range() {
+        let (chunk, local) = ChunkPos::containing([i32::MIN, i32::MAX, 0]);
+        assert_eq!(chunk.x, i32::MIN / 32);
+        assert_eq!(chunk.y, i32::MAX / 32);
+        assert_eq!((local.x(), local.y(), local.z()), (0, 31, 0));
+    }
 
     #[test]
     fn origin_of_the_origin_chunk_is_zero() {
