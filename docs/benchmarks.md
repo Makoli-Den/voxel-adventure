@@ -232,3 +232,23 @@ per block as well.
   allocator work for the fresh vectors are included, because every iteration allocates a new mesh.
 - The terrain generator benchmark includes allocating and zeroing the chunk (64 KiB).
 - Noise between runs is around 5 to 10 percent, and up to about 45 percent for the checkerboard.
+
+## Frame time against chunk count (2026-11-24)
+
+Measured with `--view-radius N` (release build, window 1280x720 default, static camera at the start
+position, nothing culled: every chunk with a mesh is drawn each frame, frame limit off, 7 s per run,
+RTX 4070 SUPER, one run each, so treat as rough). `gpu` is the upper-bound figure of the metrics.
+
+| Radius | Chunks | Quads | FPS | 1% low | CPU work avg | GPU avg |
+|---|---|---|---|---|---|---|
+| 2 | 25 | 52 k | 3186 | 365 | 0.22 ms | 0.09 ms |
+| 4 | 81 | 151 k | 1515 | 294 | 0.56 ms | 0.49 ms |
+| 8 | 289 | 507 k | 518 | 160 | 1.68 ms | 1.86 ms |
+| 16 | 1089 | 1.84 M | 163 | 97 | 5.91 ms | 6.11 ms |
+| 30 | 3721 | 6.18 M | 52 | 31 | 18.97 ms | 19.35 ms |
+
+Findings: the frame time grows linearly with the chunk count (about 5 us per chunk, about
+3 ns per quad), so the cost is per drawn triangle, not a fixed overhead. "CPU work" tracks
+"GPU" because the game waits for the GPU; the CPU is not the bottleneck. Hence the way to
+more frames is to draw less: cull chunks outside the view, drop faces that cannot be seen,
+and reduce detail with distance (see docs/performance-notes.md).
