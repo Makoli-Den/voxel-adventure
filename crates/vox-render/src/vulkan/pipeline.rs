@@ -1,8 +1,6 @@
 //! The graphics pipelines (chunk meshes and the overlay), and the shader modules they
 //! are built from.
 
-use std::path::Path;
-
 use ash::vk;
 
 use super::context::Context;
@@ -11,7 +9,7 @@ use super::interface;
 use super::render_pass::RenderPass;
 use crate::RenderError;
 use crate::interface::{PipelineInterface, chunk, overlay};
-use crate::shader;
+use crate::shader::{self, ShaderSource, ShaderSources};
 
 /// Entry point name of every shader stage; GLSL always calls it `main`.
 const ENTRY_POINT: &std::ffi::CStr = c"main";
@@ -28,10 +26,10 @@ pub struct Pipeline {
 }
 
 /// What differs between the pipelines the renderer builds.
-struct Spec {
-    /// File names of the two shader stages inside the shader folder.
-    vertex_file: &'static str,
-    fragment_file: &'static str,
+struct Spec<'a> {
+    /// The GLSL of the two shader stages.
+    vertex: &'a ShaderSource,
+    fragment: &'a ShaderSource,
     /// What the pipeline provides to its shaders; checked against them and turned into
     /// the vertex input state and the push-constant range.
     interface: &'static PipelineInterface,
@@ -41,36 +39,36 @@ struct Spec {
 }
 
 impl Pipeline {
-    /// Compiles `chunk.vert` and `chunk.frag` from `shader_dir` and builds the opaque,
-    /// depth-tested chunk pipeline for `render_pass`.
+    /// Compiles the chunk shaders of `shaders` and builds the opaque, depth-tested chunk
+    /// pipeline for `render_pass`.
     pub fn chunk(
         device: &ash::Device,
         render_pass: &RenderPass,
-        shader_dir: &Path,
+        shaders: &ShaderSources,
     ) -> Result<Self, RenderError> {
         let spec = Spec {
-            vertex_file: "chunk.vert",
-            fragment_file: "chunk.frag",
+            vertex: &shaders.chunk_vertex,
+            fragment: &shaders.chunk_fragment,
             interface: &chunk::INTERFACE,
             cull_mode: vk::CullModeFlags::BACK,
             depth: depth_tested(),
             blend: opaque(),
         };
-        Self::new(device, render_pass, shader_dir, &spec)
+        Self::new(device, render_pass, &spec)
     }
 
-    /// Compiles `overlay.vert` and `overlay.frag` from `shader_dir` and builds the
-    /// overlay pipeline for `render_pass`: no depth test or write, no culling, and alpha
-    /// blending if `blending_supported` (see [`supports_blending`]); otherwise opaque.
+    /// Compiles the overlay shaders of `shaders` and builds the overlay pipeline for
+    /// `render_pass`: no depth test or write, no culling, and alpha blending if
+    /// `blending_supported` (see [`supports_blending`]); otherwise opaque.
     pub fn overlay(
         device: &ash::Device,
         render_pass: &RenderPass,
-        shader_dir: &Path,
+        shaders: &ShaderSources,
         blending_supported: bool,
     ) -> Result<Self, RenderError> {
         let spec = Spec {
-            vertex_file: "overlay.vert",
-            fragment_file: "overlay.frag",
+            vertex: &shaders.overlay_vertex,
+            fragment: &shaders.overlay_fragment,
             interface: &overlay::INTERFACE,
             cull_mode: vk::CullModeFlags::NONE,
             depth: depth_ignored(),
@@ -80,23 +78,18 @@ impl Pipeline {
                 opaque()
             },
         };
-        Self::new(device, render_pass, shader_dir, &spec)
+        Self::new(device, render_pass, &spec)
     }
 
     /// Compiles the shaders of `spec` and builds its pipeline.
     fn new(
         device: &ash::Device,
         render_pass: &RenderPass,
-        shader_dir: &Path,
         spec: &Spec,
     ) -> Result<Self, RenderError> {
         // Compile and check first: a broken or mismatched shader fails before any
         // Vulkan object exists.
-        let code = shader::load_pipeline_shaders(
-            &shader_dir.join(spec.vertex_file),
-            &shader_dir.join(spec.fragment_file),
-            spec.interface,
-        )?;
+        let code = shader::load_pipeline_shaders(spec.vertex, spec.fragment, spec.interface)?;
         let vertex = ShaderModule::new(device, &code.vertex)?;
         let fragment = ShaderModule::new(device, &code.fragment)?;
 

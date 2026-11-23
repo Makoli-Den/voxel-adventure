@@ -11,6 +11,7 @@ publish.workspace = true
 font8x8 = { version = "0.3.1", default-features = false }
 glam = "0.34.3"
 vox-render = { path = "../vox-render" }
+vox-resources = { path = "../vox-resources" }
 vox-world = { path = "../vox-world" }
 winit = "0.30.13"
 

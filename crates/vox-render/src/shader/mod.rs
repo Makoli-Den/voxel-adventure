@@ -1,18 +1,17 @@
-//! Loading GLSL shaders from files and compiling them to SPIR-V at runtime.
+//! Compiling GLSL shaders to SPIR-V at runtime.
 //!
-//! Shaders are read from disk instead of being embedded in the binary, because shader
-//! packs replace them with their own files. Compilation uses `naga`, which is pure Rust,
-//! so neither players nor pack authors need a C++ toolchain or the Vulkan SDK.
-//! See `docs/decisions/0003-runtime-shader-compilation.md`.
+//! The GLSL text comes from the caller ([`ShaderSources`]), which reads it from resource
+//! packs instead of the binary, because shader packs replace the built-in shaders.
+//! Compilation uses `naga`, which is pure Rust, so neither players nor pack authors need a
+//! C++ toolchain or the Vulkan SDK. See `docs/decisions/0003-runtime-shader-compilation.md`
+//! and `0013-resources-and-textures.md`.
 //!
 //! Every shader is validated by naga and then checked against what the pipeline
 //! provides (`check`), so a pack shader that asks for more fails with a readable
 //! error instead of producing an invalid pipeline.
 
 mod check;
-
-use std::fs;
-use std::path::Path;
+mod sources;
 
 use naga::back::spv;
 use naga::front::glsl;
@@ -23,6 +22,8 @@ use naga::{Module, ShaderStage};
 use crate::RenderError;
 use crate::interface::PipelineInterface;
 
+pub use sources::{ShaderSource, ShaderSources};
+
 /// SPIR-V words of the vertex and fragment stage of one pipeline.
 pub(crate) struct PipelineShaders {
     /// The vertex stage.
@@ -31,18 +32,23 @@ pub(crate) struct PipelineShaders {
     pub(crate) fragment: Vec<u32>,
 }
 
-/// Reads and compiles the vertex and fragment shader files of one pipeline.
+/// Compiles the vertex and fragment shaders of one pipeline.
 ///
 /// Both are validated, checked against `interface`, the description of what that
 /// pipeline provides (see `crate::interface`), and checked against each other: every
 /// fragment input must be a vertex output.
 pub(crate) fn load_pipeline_shaders(
-    vertex_path: &Path,
-    fragment_path: &Path,
+    vertex: &ShaderSource,
+    fragment: &ShaderSource,
     interface: &PipelineInterface,
 ) -> Result<PipelineShaders, RenderError> {
-    let vertex = load(vertex_path, ShaderStage::Vertex, interface)?;
-    let fragment = load(fragment_path, ShaderStage::Fragment, interface)?;
+    let vertex = compile_glsl(&vertex.text, ShaderStage::Vertex, interface, &vertex.name)?;
+    let fragment = compile_glsl(
+        &fragment.text,
+        ShaderStage::Fragment,
+        interface,
+        &fragment.name,
+    )?;
     link(&vertex, &fragment)?;
     Ok(PipelineShaders {
         vertex: vertex.to_spirv()?,
@@ -54,7 +60,7 @@ pub(crate) fn load_pipeline_shaders(
 struct Compiled {
     module: Module,
     info: ModuleInfo,
-    /// Labels the shader in error messages, normally its file path.
+    /// Labels the shader in error messages, normally its resource id.
     name: String,
 }
 
@@ -66,21 +72,9 @@ impl Compiled {
     }
 }
 
-/// Reads the GLSL file at `path` and compiles it for `stage` of the pipeline `interface` describes.
-fn load(
-    path: &Path,
-    stage: ShaderStage,
-    interface: &PipelineInterface,
-) -> Result<Compiled, RenderError> {
-    let name = path.display().to_string();
-    let source = fs::read_to_string(path)
-        .map_err(|error| shader_error(&name, &format!("cannot read the file: {error}")))?;
-    compile_glsl(&source, stage, interface, &name)
-}
-
 /// Parses and validates GLSL 450 (Vulkan style), then checks it against `interface`.
 ///
-/// `name` labels the shader in error messages, normally its file path.
+/// `name` labels the shader in error messages, normally its resource id.
 fn compile_glsl(
     source: &str,
     stage: ShaderStage,
@@ -146,7 +140,8 @@ fn shader_error(name: &str, message: &str) -> RenderError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::Path;
 
     use super::*;
     use crate::interface::chunk::INTERFACE as CHUNK;
@@ -155,8 +150,18 @@ mod tests {
     /// First word of every SPIR-V module.
     const SPIRV_MAGIC: u32 = 0x0723_0203;
 
-    fn shader_dir() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shaders")
+    /// Where the built-in shaders live in the source tree (the `core:shaders/` resources).
+    const BUILT_IN_SHADERS: &str = "../../assets/core/shaders";
+
+    /// The built-in shader file `file_name`, named the way the game names it.
+    fn built_in(file_name: &str) -> ShaderSource {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(BUILT_IN_SHADERS)
+            .join(file_name);
+        ShaderSource {
+            name: format!("core:shaders/{file_name}"),
+            text: fs::read_to_string(path).unwrap(),
+        }
     }
 
     fn assert_is_spirv(words: &[u32]) {
@@ -202,9 +207,8 @@ mod tests {
 
     /// Compiles and links the real shader files `name.vert` and `name.frag`.
     fn assert_real_shaders_compile(name: &str, interface: &PipelineInterface) {
-        let dir = shader_dir();
-        let vertex = dir.join(format!("{name}.vert"));
-        let fragment = dir.join(format!("{name}.frag"));
+        let vertex = built_in(&format!("{name}.vert"));
+        let fragment = built_in(&format!("{name}.frag"));
         let shaders = load_pipeline_shaders(&vertex, &fragment, interface).unwrap();
         assert_is_spirv(&shaders.vertex);
         assert_is_spirv(&shaders.fragment);
@@ -218,9 +222,8 @@ mod tests {
 
     #[test]
     fn chunk_shaders_do_not_fit_the_overlay_pipeline() {
-        let dir = shader_dir();
         let result =
-            load_pipeline_shaders(&dir.join("chunk.vert"), &dir.join("chunk.frag"), &OVERLAY);
+            load_pipeline_shaders(&built_in("chunk.vert"), &built_in("chunk.frag"), &OVERLAY);
         assert!(matches!(result, Err(RenderError::Shader(_))));
     }
 
@@ -232,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn broken_glsl_reports_the_file_name() {
+    fn broken_glsl_reports_the_shader_name() {
         let source = "#version 450\nvoid main() { this is not glsl }\n";
         let Err(error) = compile_glsl(source, ShaderStage::Fragment, &CHUNK, "broken.frag") else {
             panic!("broken GLSL was accepted");
@@ -241,16 +244,20 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_is_a_shader_error() {
-        let dir = shader_dir();
-        let missing = dir.join("does_not_exist.vert");
-        let Err(error) = load_pipeline_shaders(&missing, &dir.join("chunk.frag"), &CHUNK) else {
-            panic!("a missing file was accepted");
+    fn a_broken_pipeline_shader_is_named_by_its_source_name() {
+        let broken = ShaderSource {
+            name: "my_pack:shaders/chunk.vert".to_owned(),
+            text: "#version 450
+void main() { broken }
+"
+            .to_owned(),
+        };
+        let Err(error) = load_pipeline_shaders(&broken, &built_in("chunk.frag"), &CHUNK) else {
+            panic!("a broken shader was accepted");
         };
         let text = error.to_string();
         assert!(matches!(error, RenderError::Shader(_)));
-        assert!(text.contains("does_not_exist.vert"));
-        assert!(text.contains("cannot read"));
+        assert!(text.contains("my_pack:shaders/chunk.vert"), "{text}");
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! Command-line options of the game.
 
+use std::path::PathBuf;
+
 /// The radius of the streamed circle of chunks when `--view-radius` is not given.
 pub const DEFAULT_VIEW_RADIUS: i32 = 8;
 
@@ -13,7 +15,7 @@ pub const MAX_VIEW_RADIUS: i32 = 30;
 pub const FLY_SPEED: f32 = 160.0;
 
 /// How the game was asked to run.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     /// Open the window without taking the keyboard focus, so it does not interrupt
     /// whatever the player was doing in another window. Used by scripted checks.
@@ -23,6 +25,10 @@ pub struct Options {
     /// Fly sideways at [`FLY_SPEED`] for this many seconds and then quit, for measuring
     /// how streaming behaves while the camera moves. `None` leaves the camera to the player.
     pub fly_seconds: Option<f32>,
+    /// Resource pack directories from `--pack`, in command-line order. They are layered over
+    /// the built-in pack, each one above the previous, so a later pack overrides an earlier
+    /// one file by file (decision 0013).
+    pub packs: Vec<PathBuf>,
 }
 
 impl Default for Options {
@@ -31,12 +37,13 @@ impl Default for Options {
             background: false,
             view_radius: DEFAULT_VIEW_RADIUS,
             fly_seconds: None,
+            packs: Vec::new(),
         }
     }
 }
 
 /// What the command line asks for.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Run the game with these options.
     Run(Options),
@@ -48,12 +55,14 @@ pub enum Command {
 /// constants, so the text cannot disagree with what the parser accepts.
 pub fn usage() -> String {
     format!(
-        "Usage: vox-game [--background] [--view-radius N] [--fly SECONDS]
+        "Usage: vox-game [--background] [--view-radius N] [--fly SECONDS] [--pack DIR]...
 
 Options:
   --background     open the window without taking the keyboard focus
   --view-radius N  chunks to stream in around the camera (a circle), 0 to {MAX_VIEW_RADIUS} (default {DEFAULT_VIEW_RADIUS})
   --fly SECONDS    fly sideways automatically, then quit (for measuring)
+  --pack DIR       use the resource pack in DIR over the built-in one; repeatable, a later
+                   pack overrides an earlier one
   -h, --help       print this text"
     )
 }
@@ -76,6 +85,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
                 let value = args.next().ok_or("--view-radius needs a number")?;
                 options.view_radius = parse_view_radius(&value)?;
             }
+            "--pack" => {
+                let dir = args.next().ok_or("--pack needs a directory")?;
+                options.packs.push(parse_pack(&dir)?);
+            }
             "-h" | "--help" => return Ok(Command::Help),
             _ => return Err(format!("unknown option: {arg}")),
         }
@@ -90,6 +103,15 @@ fn parse_fly_seconds(value: &str) -> Result<f32, String> {
             "--fly must be a positive number of seconds, got: {value}"
         )),
     }
+}
+
+/// Rejects an empty directory and one that looks like an option: `--pack --background` is
+/// almost surely a forgotten directory, not a folder named `--background`.
+fn parse_pack(value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() || value.starts_with("--") {
+        return Err(format!("--pack needs a directory, got: {value:?}"));
+    }
+    Ok(PathBuf::from(value))
 }
 
 fn parse_view_radius(value: &str) -> Result<i32, String> {
@@ -179,6 +201,38 @@ mod tests {
         let text = usage();
         assert!(text.contains("--background"));
         assert!(text.contains("--view-radius"));
+        assert!(text.contains("--pack"));
         assert!(text.contains("--help"));
+    }
+
+    #[test]
+    fn packs_are_kept_in_command_line_order() {
+        let packs = |args: &[&str]| match parse_all(args) {
+            Ok(Command::Run(options)) => Ok(options.packs),
+            other => Err(format!("{other:?}")),
+        };
+        assert_eq!(packs(&[]), Ok(Vec::new()));
+        assert_eq!(
+            packs(&["--pack", "first", "--background", "--pack", "second"]),
+            Ok(vec![PathBuf::from("first"), PathBuf::from("second")])
+        );
+        assert_eq!(
+            packs(&["--pack", "same", "--pack", "same"]),
+            Ok(vec![PathBuf::from("same"), PathBuf::from("same")])
+        );
+    }
+
+    #[test]
+    fn pack_needs_a_directory() {
+        let error = parse_all(&["--pack"]).unwrap_err();
+        assert!(error.contains("--pack"), "{error}");
+    }
+
+    #[test]
+    fn pack_rejects_an_empty_value_and_an_option() {
+        let error = parse_all(&["--pack", ""]).unwrap_err();
+        assert!(error.contains("--pack needs a directory"), "{error}");
+        let error = parse_all(&["--pack", "--background"]).unwrap_err();
+        assert!(error.contains("--background"), "{error}");
     }
 }
