@@ -1,0 +1,131 @@
+# 0013. Resources, block definitions and textured blocks
+
+Status: accepted.
+
+## Context
+Blocks are three hard-coded ids (`GRASS`, `DIRT`, `STONE` in `vox-world/src/terrain.rs`) coloured by a palette inside `chunk.vert`. Shaders are read from a fixed folder (decision 0003, which promised a resource file system later). The next milestone is textured blocks whose definitions and pictures come from files, so that architecture rules 3 (content is data), 4 (`mod:path` resources in layered packs) and 5 (numeric ids through a registry) start to hold, and a texture pack can replace any texture.
+
+What the code gives us: the greedy mesher emits quads with integer corners in chunk-local blocks (0..=32) and a 6-byte vertex `[x, y, z, face, block_lo, block_hi]` (decision 0004); the renderer has no descriptor sets, and the shader check rejects every descriptor resource (decision 0003); the swapchain is `B8G8R8A8_UNORM` with sRGB colour space, so shader output is written as gamma-encoded values; `serde`, `serde_derive` and `serde_json` are already in `Cargo.lock` (through `criterion`).
+
+## Decision
+
+### Crates and layering
+| crate | new? | knows | contains |
+|---|---|---|---|
+| `vox-resources` | new, no dependencies | nothing | `ResourceId`, `DirPack`, `PackStack`, `ResourceError` |
+| `vox-world` | changed, still no dependencies | nothing | `BlockRegistry`, `TextureLayer`, `FaceTextures`, `TerrainBlocks`; the mesher writes texture layers |
+| `vox-content` | new | `vox-resources`, `vox-world`, `serde`, `serde_json`, `png` | blocks file loader, block texture array builder |
+| `vox-render` | changed | `vox-world` (as today) | `TextureLayers`, `Renderer::set_block_textures`, descriptor set, sampler, image upload, mipmaps |
+| `vox-game` | changed | all of the above | `--pack`, wiring |
+
+None of the new code knows Vulkan. `vox-render` does not depend on `vox-resources` or `vox-content`: it takes shader text and pixels as plain data, like it takes `ChunkMesh` and `OverlayRect` today. A future server can use `vox-content` for blocks without the renderer.
+
+### (a) `vox-resources`: the virtual file system
+- **`ResourceId`** is `namespace:path`, parsed and validated once: namespace `[a-z0-9_]+`, path segments `[a-z0-9_.-]+` separated by `/`, no empty, `.` or `..` segment, no leading `/`, no `\`. Lowercase only, so a pack behaves the same on case-insensitive (Windows) and case-sensitive file systems. The file extension is part of the path (`base:textures/block/stone.png`); nothing is appended implicitly.
+- **Namespaces:** `core` for what the engine itself loads (shaders), `base` for the base game's content (blocks, textures). Mods later get their own namespace.
+- **`DirPack`** is a directory; `ns:a/b.png` is the file `<root>/ns/a/b.png`. A missing file is `Ok(None)`, any other I/O failure is an error.
+- **`PackStack`** is an ordered list of `DirPack`, lowest priority first. `read(&id)` asks the packs from the top down and returns the first hit; `read_to_string` does the same for UTF-8 text; `source_of(&id)` names the pack that served it, for messages. No hit is `ResourceError::NotFound`.
+- **Override semantics: whole file, per resource.** The highest pack that has the file wins; files are never merged. Every resource is resolved on its own, so a pack can replace one texture and leave the rest to lower packs.
+- **Order at startup:** the built-in pack `assets/` (from the source tree, as decision 0003 does for shaders) at the bottom, then every `--pack DIR` in command-line order; a later `--pack` overrides an earlier one.
+- **No `Pack` trait and no zip yet.** One kind of pack exists; the trait is extracted when the zip pack (second implementation) arrives. No directory listing either: everything is reached by a known id.
+
+### (b) Blocks as data
+- **Format: JSON via `serde_json`.** It adds no crate to `Cargo.lock` (serde, serde_derive and serde_json are already there), every modding tool and language can write it, and Minecraft modders know it. The missing comments are the price.
+- **File:** `base:blocks.json`, a list in id order:
+  ```json
+  { "format": 1,
+    "blocks": [
+      { "name": "grass", "textures": { "top": "base:textures/block/grass_top.png",
+                                       "bottom": "base:textures/block/dirt.png",
+                                       "side": "base:textures/block/grass_side.png" } },
+      { "name": "dirt",  "textures": { "all": "base:textures/block/dirt.png" } },
+      { "name": "stone", "textures": { "all": "base:textures/block/stone.png" } } ] }
+  ```
+  `name` is local; the registry name is `<namespace of the file>:<name>` (`base:grass`). Texture keys are `all`, `side`, `top`, `bottom`; `side`, `top` and `bottom` override `all`; every face must end up with a texture. Unknown keys, an unknown `format`, a duplicate name or an invalid id are a `ContentError` naming the file and the block (serde gives line and column). A broken blocks file stops the game at startup with that message.
+- **Registry in `vox-world`, plain types, no serde.** `BlockRegistry::new()` holds only `core:air` at `BlockId::AIR`; `register(name, [TextureLayer; Face::COUNT]) -> Result<BlockId, RegistryError>` hands out the next id (duplicate name and `u16` overflow are errors); `id(name)`, `name(id)`, `face_textures()`. Ids follow load order, so with the file above grass, dirt and stone keep ids 1, 2 and 3 and the pinned terrain fingerprints do not change. Rule 5's "a world survives a changed mod set" needs a saved name-to-id table, which comes with world saves; nothing is saved yet.
+- **`FaceTextures`** is a flat `Vec<[TextureLayer; Face::COUNT]>` indexed by block id; `get(block, face)` returns `TextureLayer::MISSING` (layer 0) for an id it does not know. It is all the mesher sees of the registry.
+- **Terrain consts are migrated, not kept.** `generate_chunk(seed, pos, &TerrainBlocks)` with `TerrainBlocks { grass, dirt, stone }` (ids, `Copy`). The game resolves `base:grass`, `base:dirt`, `base:stone` by name once at startup (a missing name is a startup error), and so does `PLACE_BLOCK` (`base:stone`). The public `GRASS`/`DIRT`/`STONE` consts go away; tests use a local `TerrainBlocks` with ids 1, 2, 3. The core generator thus names no content; it becomes data with biomes in a later milestone.
+
+### (c) Textures: a 2D array texture, UVs from positions
+- **A `sampler2DArray`, one layer per texture, `REPEAT` addressing, chosen over an atlas with `fract()`.** A greedy quad spanning `w x h` blocks needs the tile repeated `w x h` times. With an atlas the shader must wrap by hand with `fract()`; the jump in UV at every block edge breaks the derivatives the GPU uses to pick a mip level, which shows as a line of wrong (smallest) mip along every block edge unless the shader uses `textureGrad`, and mips bleed neighbouring tiles unless every tile is padded. An array texture repeats in the sampler for free, mips never bleed, and the shader is one `texture()` call. 2D array images are core Vulkan 1.0 with at least 256 layers (`maxImageArrayLayers`) and `REPEAT` is always supported; OpenGL ES 3.0, the likely fallback backend, has them too. 256 layers is far more than the base game needs.
+- **Layer 0 is the missing texture** (magenta and black checker, generated in code). Layers 1.. are the textures in order of first use in the blocks file. A texture that is missing or fails to decode gets layer 0 and a warning; the game still starts. Warnings are returned as data from `vox-content` and printed by the game.
+- **PNG decoding: the `png` crate** (pure Rust, the decoder `image` itself uses, a handful of small dependencies), normalized to 8-bit RGBA whatever the colour type. Not `image`: it pulls every format and far more code for one.
+- **Tile size:** square and a power of two, at most `MAX_TILE_SIZE` (256). The array's tile size is the largest one among the loaded textures; a smaller power-of-two texture is scaled up by nearest neighbour (an integer factor), so a 32x pack that misses some textures still shows the 16x base ones. Anything else (not square, not a power of two, too large) is a warning and layer 0.
+- **`vox-content` output:** `BlockTextures { size, layer_count, pixels: Vec<u8> }`, RGBA8, layer after layer, base level only. `load_content(&PackStack) -> Result<(BlockRegistry, BlockTextures, Vec<Warning>), ContentError>`.
+- **Vertex format: unchanged in size.** The 2-byte field that held the block id now holds the `TextureLayer` of that quad's face, looked up once per quad by the mesher in `FaceTextures` (`ChunkVertex::block` becomes `ChunkVertex::texture`). The greedy merge still compares block ids. No UV is stored: corners are integers, so the vertex shader derives the UV by projecting the chunk-local position on the face's two tangent axes, and `REPEAT` turns a `w`-block extent into `w` repeats. Per face the tangent signs are chosen so a side texture stands upright (v grows downwards with `-y`) and nothing is mirrored seen from outside; the table lives next to `FACE_SHADE` in `chunk.vert`. Since 32 is a whole number of blocks, the pattern lines up across chunks.
+- **Format and filtering:** `R8G8B8A8_UNORM` (mandatory for sampling with linear filtering in Vulkan 1.0). Texels are used as stored, the same gamma-space convention as today's palette and the `UNORM` swapchain; a linear-light pipeline (sRGB image and swapchain) is a separate decision. Magnification `NEAREST` (pixel art), minification `NEAREST` with `LINEAR` between mip levels once mipmaps exist. No anisotropy (an optional feature).
+- **Mipmaps** are built on the CPU in `vox-render` (2x2 box filter, pure, unit-tested) and uploaded with the base level. Not `vkCmdBlitImage`: it needs format-feature checks and barriers per level, and the data is a few hundred kilobytes once at startup.
+
+### (d) Renderer interface and shaders
+- **Shader sources come from the caller.** `create_renderer(window, width, height, &ShaderSources)` replaces the `shader_dir` path; `ShaderSources` holds the four GLSL texts, each with a name for error messages (the resource id). The game reads them from `core:shaders/<name>`; the files move to `assets/core/shaders/`. A shader pack is now just a `--pack` with `core/shaders/...` in it.
+- **`Renderer::set_block_textures(&TextureLayers<'_>) -> Result<(), RenderError>`**, with `TextureLayers { size, layer_count, pixels: &[u8] }` defined in `vox-render` (a borrowed view; the game passes `BlockTextures` through). It validates (`size` a power of two, `pixels.len()` exact, `layer_count` within `maxImageArrayLayers`, `size` within `maxImageDimension2D`) and returns `RenderError::InvalidTextures` otherwise; the previous textures are kept on any error. It builds the mips, uploads through a host-visible staging buffer into a device-local `OPTIMAL` image with one-time command buffer, layout transitions and a fence, then waits for the device to go idle and swaps image and descriptor. Waiting idle is acceptable because this runs at startup and, later, on a pack reload, never per frame. Until it is called, a 1x1 single-layer missing texture is bound, so the pipeline is always valid.
+- **Descriptors:** one set layout for the chunk pipeline, set 0: binding 0 a `SAMPLED_IMAGE` (2D array), binding 1 a `SAMPLER`, both fragment stage; one pool, one set, written again on replacement. Separate image and sampler, because naga's SPIR-V back end emits them separately; the shader declares `uniform texture2DArray block_textures` and `uniform sampler block_sampler` and samples `sampler2DArray(block_textures, block_sampler)`. Two more device memory allocations in total (image, plus the staging buffer that is freed after upload), negligible against the 4096 limit.
+- **Shader check:** `PipelineInterface` gains `resources: &'static [ResourceBinding]` (set, binding, kind, stage). A shader may use a subset of them and nothing else; the overlay's list is empty, so its check is unchanged. The validator capabilities stay core-only.
+- **Shaders:** `chunk.vert` outputs `uv` (`vec2`), `layer` (`flat uint`) and `shade` (`float`, from `FACE_SHADE`); the palette goes away. `chunk.frag` outputs `texture(...).rgb * shade`, alpha 1 (no transparency or alpha test in this milestone). The interface docs in `interface/chunk.rs` are updated: attribute 1 is the texture layer.
+
+### (e) Texture packs
+A texture pack is a `--pack` directory laid out like `assets/`: `mypack/base/textures/block/stone.png` replaces the base stone texture and nothing else. Packs never change which blocks exist; that is the blocks file, which a pack can replace as a whole, but texture packs should not ship it. Packs are read at startup; reloading at runtime later means rebuilding `BlockTextures` and calling `set_block_textures` again, which the interface already supports. Different resolutions mix as described under "Tile size".
+
+## Answers to the open questions
+- Namespaces: `core` holds engine resources (shaders), `base` holds the base game's content.
+- Art: the first four 16x16 textures are generated placeholders written by us (no third-party art, no licence questions); real art arrives as a texture pack later.
+- A broken blocks file stops the game at startup with a clear error; a missing or broken texture only shows the magenta checker and logs a warning.
+- Linear-light shading is deferred; it is decided when lighting is added.
+- Packs may replace any file, including `base:blocks.json` (data is data); the highest pack wins as a whole file.
+
+## Steps
+Each step is one PR, leaves the game running as before or better, and passes `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test`. Arrows give the order; steps on separate lines with no arrow between them can run in parallel (they touch different files).
+
+```
+S1 ---------> S2 ------------------.
+S3 -> S4 (needs S1) -> S5 ---------+-> S7 -> S8
+S3 -> S6a -------------------------+
+S2 -> S6 --------------------------'
+```
+S1 and S3 can start together. S4 needs S1 and S3. S6 (render only) runs alongside S4, S5 and S6a. S7 needs S2, S5, S6 and S6a. The steps that edit `vox-game` (S2, S3, S4, S6a, S7) all touch `main.rs` or the streaming jobs, so they are merged one after another, never written in parallel; real parallelism is S1 with S3, and S6 and S5 with the `vox-game` chain.
+
+**S1. `vox-resources` crate** (world-dev). New `crates/vox-resources/`: `ResourceId` (parse, validate, `Display`), `DirPack`, `PackStack`, `ResourceError`; test fixtures checked in under `crates/vox-resources/tests/fixtures/` (two packs overriding one file). Done: tests for id validation (valid, uppercase, `..`, empty segment, `\`, missing colon), lookup, override order, `NotFound`, `source_of`; no dependencies; not yet used by the game.
+
+**S2. Shaders through the resource stack** (render-dev; the `vox-game` part is small and stays with the same author). Move `assets/shaders/*` to `assets/core/shaders/`; `ShaderSources` and the new `create_renderer` signature in `vox-render` (`lib.rs`, `shader/mod.rs`, `vulkan/renderer.rs`); `--pack DIR` (repeatable) in `vox-game/src/cli.rs` (`Options` stops being `Copy`); `main.rs` builds the `PackStack` and reads the four shaders. Done: CLI tests for `--pack`; the game looks exactly as before; one window check with a `--pack` that overrides `chunk.frag` (for example inverted colours) shows the override; a missing shader names its resource id.
+
+**S3. Block registry and terrain migration** (world-dev). `vox-world`: new `registry.rs` (`BlockRegistry`, `TextureLayer`, `FaceTextures`, `RegistryError`), `TerrainBlocks` in `terrain.rs`, `generate_chunk`/`generate_terrain` take it, `GRASS`/`DIRT`/`STONE` removed from the public API. `vox-game`: a temporary `content.rs` that registers `base:grass`, `base:dirt`, `base:stone` in code, resolves `TerrainBlocks` and `PLACE_BLOCK` by name, and passes `TerrainBlocks` into streaming jobs and `remesh`. Done: registry tests (air at 0, sequential ids, duplicate, overflow, lookups both ways, `FaceTextures::get` falls back to `MISSING`); pinned terrain fingerprints and the pinned quad count unchanged; the game looks the same.
+
+**S4. Blocks file** (world-dev). New `crates/vox-content/` with `blocks.rs` (serde types, `load_blocks(&PackStack) -> Result<(BlockRegistry, Vec<ResourceId>), ContentError>`, the second value being the texture id of each layer); `assets/base/blocks.json`; the temporary registration in `vox-game/src/content.rs` is replaced by `load_blocks`. Done: tests for `all`/`side`/`top`/`bottom` resolution, missing face, unknown key, unknown `format`, duplicate name, invalid texture id, layer numbering (shared textures get one layer); ids of grass, dirt, stone are 1, 2, 3; the game looks the same.
+
+**S5. Block textures on the CPU** (world-dev). `vox-content/src/textures.rs`: PNG decode through `png`, the missing texture, tile size and nearest upscaling, `BlockTextures`, warnings; `load_content` combines S4 and this. Add `assets/base/textures/block/{grass_top,grass_side,dirt,stone}.png` (16x16). Done: tests with in-memory PNGs (encoded by the `png` crate in the test) for RGB, RGBA, grayscale and palette input, upscaling 16 to 32, rejection of non-square, non-power-of-two and oversized images (each gives layer 0 and a warning), missing file (layer 0 and a warning), the pixel layout of layer 0; nothing rendered yet.
+
+**S6. Texture support in the renderer** (render-dev, `vox-render` only). `TextureLayers`, `set_block_textures`, `RenderError::InvalidTextures`, the descriptor set layout, pool and set, the sampler, a new `vulkan/texture.rs` (staging upload, image, view), the default missing texture, `ResourceBinding` in `interface/` and the shader check. Shaders unchanged (a shader that declares no resource still passes). Done: tests for `TextureLayers` validation and for the shader check (a fragment shader with the two bindings passes; a wrong binding, a wrong type, a storage buffer and any resource in a vertex shader or in the overlay are rejected); the game looks the same and the Vulkan validation layer is clean in one debug run.
+
+**S6a. Mesher writes texture layers** (world-dev). `mesh.rs`: `build_mesh*` take `&FaceTextures`, `ChunkVertex::block` becomes `texture: TextureLayer`; streaming jobs and `remesh` get an `Arc<FaceTextures>`; the mesh benchmark passes a table. The game passes a table where the layer equals the block id for every face, so the palette shader still colours correctly. Done: all mesh tests pass with that identity table; a new test checks that a grass block gets different layers on top, side and bottom with a real table; the mesh benchmark is within noise of `docs/benchmarks.md` (one lookup per quad).
+
+**S7. Textured blocks** (render-dev; touches `assets/core/shaders/chunk.*`, `interface/chunk.rs` docs and `vox-game/src/main.rs`). The game calls `load_content`, prints warnings, passes the real `FaceTextures` to the mesher and `BlockTextures` to `set_block_textures`; the shaders sample the array as described. Done: one window check showing grass tops, grass sides with the dirt under them, dirt and stone tiled once per block on merged quads, upright on sides, not mirrored; a `--pack` with a different `stone.png` replaces only stone; deleting a texture shows the magenta checker and a warning; GPU time from the frame statistics at the default view radius recorded in `docs/benchmarks.md` before and after.
+
+**S8. Mipmaps** (render-dev, `vox-render` only). CPU mip chain (`mip_levels = log2(size) + 1`), uploaded with the base level, sampler `LINEAR` between levels. Done: unit tests for the box filter (sizes of every level, a uniform texture stays uniform, a 2x2 checker averages to its mean); one window check that distant terrain no longer shimmers; GPU time recorded again.
+
+## Reasons
+- **Separate `vox-resources`:** the file system is used by shaders now and by mods, sounds and translations later; it must not know blocks or images. Keeping it dependency-free keeps it cheap to depend on from anywhere.
+- **`vox-content` between files and core types:** `vox-world` stays dependency-free and testable without files; the renderer stays free of parsers; the game crate only wires.
+- **Texture layer in the vertex rather than the block id:** the shader needs a layer per face; looking it up once per quad on the CPU costs nothing measurable and keeps the vertex at 6 bytes with no extra GPU table (a per-block table in the shader would need a storage buffer, another descriptor and another check).
+- **UVs from positions:** greedy quads have integer corners, so no vertex bytes are spent on UVs.
+- **Identity table in S6a:** splits the mesher change from the visual switch, so each PR is small and the game never shows wrong colours.
+
+## Rejected
+- **Atlas with `fract()` in the shader:** mip seams along every block edge and bleeding between tiles, or `textureGrad` and padding to fix them; see (c).
+- **One texture per draw / per block kind:** a bind per block kind per chunk; the array needs one bind per frame.
+- **Storing UVs or quad extent in the vertex:** 2 to 4 more bytes per vertex for what the position already tells.
+- **A storage buffer table block id to layers, looked up in the shader:** more descriptors and checks for no gain now; reconsider if shader packs need the block id (it no longer reaches the shader).
+- **TOML (`toml`):** a larger dependency tree (`toml_edit`/`winnow`/`indexmap`), awkward for lists of nested tables. **RON (`ron`):** Rust-specific syntax that modders do not know. **`nanoserde`:** no dependencies, but a second serialization framework beside serde, which is already in the tree.
+- **`image` crate:** many formats and much more code for one format.
+- **A `Pack` trait and zip packs now:** one implementation exists; added with the second.
+- **Keeping `GRASS`/`DIRT`/`STONE` and asserting the registry matches them:** a pack that reorders the blocks file would break the generator; the migration is small.
+- **`vkCmdBlitImage` for mipmaps:** format feature checks and per-level barriers for a one-time job the CPU does in milliseconds.
+- **sRGB texture format now:** with the `UNORM` swapchain the colours would come out darker than the files; switching both is its own decision.
+
+## Risks
+- **naga GLSL front end and separate samplers:** expected to accept `texture2DArray` + `sampler` (the Vulkan GLSL style naga documents), not combined `sampler2DArray` uniforms. S6 verifies this first, before building the Vulkan side.
+- **256 layers** is the guaranteed limit. Many mods could exceed it; then a second array or larger layer count per device is needed. `set_block_textures` reports it clearly until then.
+- **Ids follow load order.** Changing the blocks file reorders ids; harmless while nothing is saved, and the reason world saves must store a name-to-id table.
+- **Packs are trusted local folders.** Ids cannot leave a pack root through `..`, but a symlink inside a pack can; acceptable for local packs, revisited for downloaded ones.
+- **Shader packs lose the block id** in the vertex (they see the texture layer); revisit when a pack needs per-block effects.
+- **Gamma-space filtering** darkens mips slightly; fixed together with the linear-light decision.
+- **Placeholder art:** the four PNGs must be original or freely licensed (see open questions).
