@@ -79,6 +79,12 @@ impl World {
         self.chunks.insert(pos, chunk)
     }
 
+    /// Removes the chunk at `pos` and returns it, or `None` if it was not loaded. This is
+    /// how unloaded chunks are dropped, so memory stays flat while the player moves.
+    pub fn remove(&mut self, pos: ChunkPos) -> Option<Chunk> {
+        self.chunks.remove(&pos)
+    }
+
     /// The chunk at `pos`, or `None` if it is not loaded.
     pub fn get(&self, pos: ChunkPos) -> Option<&Chunk> {
         self.chunks.get(&pos)
@@ -311,6 +317,16 @@ mod tests {
         let mut world = World::new();
         assert!(world.set_block([0, 0, 0], BlockId(1)).is_none());
         assert!(world.is_empty());
+    }
+
+    #[test]
+    fn remove_returns_the_chunk_once_and_unloads_it() {
+        let mut world = world_with_empty_chunks(&[ChunkPos::ORIGIN, ChunkPos::new(1, 0, 0)]);
+        assert!(world.remove(ChunkPos::ORIGIN).is_some());
+        assert!(world.remove(ChunkPos::ORIGIN).is_none());
+        assert!(!world.contains(ChunkPos::ORIGIN));
+        assert!(world.contains(ChunkPos::new(1, 0, 0)));
+        assert_eq!(world.block_at([0, 0, 0]), None);
     }
 
     #[test]

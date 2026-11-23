@@ -60,7 +60,7 @@ impl Camera {
     }
 
     /// Unit vector the camera looks along.
-    fn forward(&self) -> Vec3 {
+    pub fn forward(&self) -> Vec3 {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
         Vec3::new(sin_yaw * cos_pitch, sin_pitch, -cos_yaw * cos_pitch)

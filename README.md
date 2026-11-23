@@ -43,9 +43,13 @@ Fly over the generated terrain:
 | W, A, S, D | move forward, left, back, right |
 | Space / Shift | go up / go down |
 | Right mouse button + mouse | look around |
+| Left mouse button | break the block under the crosshair (within a few blocks) |
+| F | place a stone block on the face under the crosshair |
 | L | turn the frame limit on or off |
 | F3 | show or hide the metrics panel |
 | Esc | quit |
+
+Edits are not saved: a chunk that streams out of range and back in is generated again (decision 0011). Blocks can only be placed in the loaded terrain layer.
 
 Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--help` lists the options.
 

@@ -14,11 +14,13 @@ use std::num::NonZeroUsize;
 use std::thread;
 use std::time::Duration;
 
-use vox_world::{ChunkMesh, ChunkPos};
+use vox_world::{Chunk, ChunkMesh, ChunkPos};
 
+pub use job::remesh;
 pub use tracker::StreamStats;
 pub use workers::StreamError;
 
+use job::Built;
 use tracker::ChunkTracker;
 use workers::Workers;
 
@@ -34,17 +36,21 @@ pub const MAX_UPLOADS_PER_FRAME: usize = 4;
 /// What the renderer has to do after one frame of streaming.
 #[derive(Debug, Default)]
 pub struct Changes {
-    /// Chunks to remove from the renderer. Applied before the uploads, so the memory of
-    /// a removed mesh is released first.
+    /// Chunks that are unloaded: to drop from the game's world and to remove from the
+    /// renderer. Applied before the uploads, so the memory of a removed mesh is released first.
     pub removed: Vec<ChunkPos>,
-    /// Meshes to hand to the renderer, at most [`MAX_UPLOADS_PER_FRAME`].
+    /// Freshly generated chunks for the game's world, including those with nothing to draw.
+    /// Each position appears at most once and never together with a removal in one frame.
+    pub loaded: Vec<(ChunkPos, Chunk)>,
+    /// Meshes to hand to the renderer, at most [`MAX_UPLOADS_PER_FRAME`]. Each belongs to a
+    /// chunk in `loaded` of the same frame.
     pub uploads: Vec<(ChunkPos, ChunkMesh)>,
 }
 
 /// Loads and unloads chunks around a moving centre on background threads.
 pub struct ChunkStreamer {
     tracker: ChunkTracker,
-    workers: Workers,
+    workers: Workers<Built>,
     worker_count: usize,
     /// Jobs finished so far and the time they took together, for the average.
     jobs_done: u32,
@@ -67,7 +73,7 @@ impl ChunkStreamer {
         Self {
             tracker: ChunkTracker::new(radius, JOBS_PER_WORKER * worker_count),
             workers: Workers::spawn(worker_count, move |pos, scratch| {
-                job::build_chunk_mesh(seed, pos, scratch)
+                job::build_chunk(seed, pos, scratch)
             }),
             worker_count,
             jobs_done: 0,
@@ -86,14 +92,26 @@ impl ChunkStreamer {
         while let Some(result) = self.workers.try_recv()? {
             self.jobs_done = self.jobs_done.saturating_add(1);
             self.job_time += result.took;
-            self.tracker.finish(result.pos, result.mesh);
+            self.tracker.finish(result.pos, result.output);
         }
         // Uploads come before new jobs: they free the slots the new jobs take.
-        let uploads = self.tracker.take_uploads(MAX_UPLOADS_PER_FRAME);
+        let taken = self.tracker.take_loaded(MAX_UPLOADS_PER_FRAME);
         for pos in self.tracker.next_jobs() {
             self.workers.send(pos)?;
         }
-        Ok(Changes { removed, uploads })
+        let mut loaded = Vec::with_capacity(taken.len());
+        let mut uploads = Vec::new();
+        for (pos, built) in taken {
+            if !built.mesh.indices.is_empty() {
+                uploads.push((pos, built.mesh));
+            }
+            loaded.push((pos, built.chunk));
+        }
+        Ok(Changes {
+            removed,
+            loaded,
+            uploads,
+        })
     }
 
     /// How many chunks are loaded and how many are still to come.
@@ -128,19 +146,30 @@ mod tests {
     /// Pause between two frames of the test.
     const FRAME: Duration = Duration::from_millis(1);
 
-    /// Runs frames at `centre` until nothing is queued; returns what was uploaded and the
-    /// removals of every frame.
-    fn fill(
-        streamer: &mut ChunkStreamer,
-        centre: ChunkPos,
-    ) -> (HashMap<ChunkPos, ChunkMesh>, Vec<ChunkPos>) {
+    /// What a run of frames gave: the meshes, the loaded chunk positions and the removals.
+    struct Run {
+        uploaded: HashMap<ChunkPos, ChunkMesh>,
+        loaded: Vec<ChunkPos>,
+        removed: Vec<ChunkPos>,
+    }
+
+    /// Runs frames at `centre` until nothing is queued.
+    fn fill(streamer: &mut ChunkStreamer, centre: ChunkPos) -> Run {
         let started = Instant::now();
         let mut uploaded = HashMap::new();
         let mut removed = Vec::new();
+        let mut loaded = Vec::new();
         loop {
             let changes = streamer.update(centre).expect("workers run");
             assert!(changes.uploads.len() <= MAX_UPLOADS_PER_FRAME);
             removed.extend(changes.removed);
+            for (pos, _) in &changes.loaded {
+                assert!(
+                    !loaded.contains(pos) || removed.contains(pos),
+                    "{pos:?} loaded twice"
+                );
+            }
+            loaded.extend(changes.loaded.into_iter().map(|(pos, _)| pos));
             for (pos, mesh) in changes.uploads {
                 assert!(
                     uploaded.insert(pos, mesh).is_none(),
@@ -148,7 +177,11 @@ mod tests {
                 );
             }
             if streamer.stats().queued == 0 {
-                return (uploaded, removed);
+                return Run {
+                    uploaded,
+                    loaded,
+                    removed,
+                };
             }
             assert!(started.elapsed() < TIMEOUT, "timed out");
             thread::sleep(FRAME);
@@ -159,24 +192,34 @@ mod tests {
     fn the_area_fills_and_a_far_move_removes_it() {
         let mut streamer = ChunkStreamer::new(SEED, RADIUS);
         let centre = ChunkPos::ORIGIN;
-        let (uploaded, removed) = fill(&mut streamer, centre);
+        let Run {
+            uploaded,
+            loaded,
+            removed,
+        } = fill(&mut streamer, centre);
 
         let mut scratch = ChunkMesh::default();
         let mut expected = HashMap::new();
         for pos in area::wanted(centre, RADIUS) {
-            let mesh = job::build_chunk_mesh(SEED, pos, &mut scratch);
+            let mesh = job::build_chunk(SEED, pos, &mut scratch).mesh;
             if !mesh.indices.is_empty() {
                 expected.insert(pos, mesh);
             }
         }
         assert_eq!(uploaded, expected);
         assert!(removed.is_empty());
+        // Every wanted chunk reaches the world, also those with nothing to draw.
+        let mut wanted = area::wanted(centre, RADIUS);
+        let mut loaded_sorted = loaded;
+        wanted.sort_by_key(|pos| (pos.z, pos.x));
+        loaded_sorted.sort_by_key(|pos| (pos.z, pos.x));
+        assert_eq!(loaded_sorted, wanted);
         assert_eq!(streamer.stats().loaded, area::wanted(centre, RADIUS).len());
         assert!(streamer.average_job_time().is_some());
 
         // Beyond the keep range of every earlier position.
         let far = ChunkPos::new(2 * (RADIUS + area::UNLOAD_MARGIN) + 1, 0, 0);
-        let (_, removed) = fill(&mut streamer, far);
+        let removed = fill(&mut streamer, far).removed;
         for pos in uploaded.keys() {
             assert!(removed.contains(pos), "{pos:?} was not removed");
         }
