@@ -20,3 +20,11 @@ Generate less, not faster. LOD and culling first, micro-optimizations after.
 
 ## Before choosing a solution
 Check every speed decision with a measurement on a prototype: one chunk, generation time, mesh build time.
+
+## Measured: what the frame time is made of (2026-11-24)
+
+- Drawing the chunks front to back (to help early depth rejection) changed nothing at radius 16 and 30
+  (about 750 and 308 FPS either way): overdraw is not the bottleneck. Not kept.
+- Drawing only half of each chunk's indices roughly halved the GPU time (1.2 to 0.63 ms at radius 16,
+  3.2 to 1.84 ms at radius 30): the cost is proportional to the triangles, not to the draw calls.
+  Fewer triangles is the lever: greedy meshing, then level of detail for distant chunks.
