@@ -10,15 +10,27 @@ use crate::block::BlockId;
 use crate::chunk::{CHUNK_SIZE, Chunk, LocalPos};
 use crate::chunk_pos::ChunkPos;
 
-/// Grass, the top block of every column.
+/// The blocks the terrain generator places, as ids.
 ///
-/// The `GRASS`, `DIRT` and `STONE` ids are a temporary palette until the block registry
-/// exists, where blocks get their names and properties.
-pub const GRASS: BlockId = BlockId(1);
-/// Dirt, the layer right below the grass. See [`GRASS`] for the palette note.
-pub const DIRT: BlockId = BlockId(2);
-/// Stone, everything below the dirt. See [`GRASS`] for the palette note.
-pub const STONE: BlockId = BlockId(3);
+/// The generator names no content: whoever owns the [`BlockRegistry`](crate::BlockRegistry)
+/// looks the three blocks up by name and passes their ids in (decision 0013).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerrainBlocks {
+    /// The top block of every column.
+    pub grass: BlockId,
+    /// The layer right below the grass.
+    pub dirt: BlockId,
+    /// Everything below the dirt.
+    pub stone: BlockId,
+}
+
+/// Ids 1, 2 and 3, the ids the game's registry hands out, for tests in this crate.
+#[cfg(test)]
+pub(crate) const TEST_BLOCKS: TerrainBlocks = TerrainBlocks {
+    grass: BlockId(1),
+    dirt: BlockId(2),
+    stone: BlockId(3),
+};
 
 /// Lowest possible surface height (the `y` of the grass block).
 pub const MIN_SURFACE: usize = 8;
@@ -72,20 +84,22 @@ const DIRT_DEPTH_I32: i32 = DIRT_DEPTH as i32;
 /// Generates the chunk at the origin: rolling hills. The same `seed` always gives the same
 /// chunk. It is [`generate_chunk`] at [`ChunkPos::ORIGIN`].
 ///
-/// Every column has one [`GRASS`] block at a height in
-/// [`MIN_SURFACE`]`..=`[`MAX_SURFACE`], [`DIRT`] below it, [`STONE`] under that and air above.
+/// Every column has one `blocks.grass` block at a height in
+/// [`MIN_SURFACE`]`..=`[`MAX_SURFACE`], `blocks.dirt` below it, `blocks.stone` under that and
+/// air above.
 ///
 /// # Example
 ///
 /// ```
-/// use vox_world::{generate_terrain, LocalPos, GRASS};
+/// use vox_world::{generate_terrain, BlockId, LocalPos, TerrainBlocks};
 ///
-/// let chunk = generate_terrain(1);
-/// let has_grass = LocalPos::all().any(|pos| chunk.get(pos) == GRASS);
+/// let blocks = TerrainBlocks { grass: BlockId(1), dirt: BlockId(2), stone: BlockId(3) };
+/// let chunk = generate_terrain(1, &blocks);
+/// let has_grass = LocalPos::all().any(|pos| chunk.get(pos) == blocks.grass);
 /// assert!(has_grass);
 /// ```
-pub fn generate_terrain(seed: u32) -> Chunk {
-    generate_chunk(seed, ChunkPos::ORIGIN)
+pub fn generate_terrain(seed: u32, blocks: &TerrainBlocks) -> Chunk {
+    generate_chunk(seed, ChunkPos::ORIGIN, blocks)
 }
 
 /// Generates the terrain of the chunk at `pos`. The same `seed` and `pos` always give the
@@ -94,8 +108,8 @@ pub fn generate_terrain(seed: u32) -> Chunk {
 /// The surface height of a column depends only on its world column `(x, z)`, never on the
 /// chunk, so neighbouring chunks agree along their borders and the hills continue across
 /// them. For a block at world height `y` and a column with surface height `h` (in
-/// [`MIN_SURFACE`]`..=`[`MAX_SURFACE`]): above `h` is air, `y == h` is [`GRASS`], the three
-/// blocks below are [`DIRT`], everything deeper is [`STONE`].
+/// [`MIN_SURFACE`]`..=`[`MAX_SURFACE`]): above `h` is air, `y == h` is `blocks.grass`, the
+/// three blocks below are `blocks.dirt`, everything deeper is `blocks.stone`.
 ///
 /// Consequently every chunk with `pos.y >= 1` is all air (its lowest block is at height 32,
 /// above [`MAX_SURFACE`]) and every chunk with `pos.y < 0` is all stone (its highest block
@@ -104,12 +118,13 @@ pub fn generate_terrain(seed: u32) -> Chunk {
 /// # Example
 ///
 /// ```
-/// use vox_world::{generate_chunk, ChunkPos, LocalPos, GRASS};
+/// use vox_world::{generate_chunk, BlockId, ChunkPos, LocalPos, TerrainBlocks};
 ///
-/// let chunk = generate_chunk(1, ChunkPos::new(-1, 0, 2));
-/// assert!(LocalPos::all().any(|pos| chunk.get(pos) == GRASS));
+/// let blocks = TerrainBlocks { grass: BlockId(1), dirt: BlockId(2), stone: BlockId(3) };
+/// let chunk = generate_chunk(1, ChunkPos::new(-1, 0, 2), &blocks);
+/// assert!(LocalPos::all().any(|pos| chunk.get(pos) == blocks.grass));
 /// ```
-pub fn generate_chunk(seed: u32, pos: ChunkPos) -> Chunk {
+pub fn generate_chunk(seed: u32, pos: ChunkPos, blocks: &TerrainBlocks) -> Chunk {
     let [origin_x, origin_y, origin_z] = pos.origin();
     let mut chunk = Chunk::new();
     for z in 0..CHUNK_SIZE {
@@ -119,7 +134,7 @@ pub fn generate_chunk(seed: u32, pos: ChunkPos) -> Chunk {
             let world_x = origin_x.saturating_add(x as i32);
             let world_z = origin_z.saturating_add(z as i32);
             let height = surface_height(seed, world_x, world_z);
-            fill_column(&mut chunk, x, z, origin_y, height);
+            fill_column(&mut chunk, x, z, origin_y, height, blocks);
         }
     }
     chunk
@@ -140,14 +155,21 @@ fn surface_height(seed: u32, x: i32, z: i32) -> i32 {
 /// is then filled by a plain loop: stone below `stone_end`, dirt up to `dirt_end`, one grass
 /// block, and air above, which is left as it is. The boundaries are clamped to the chunk,
 /// so a chunk that holds only part of the column (or none of it) gets an empty range.
-fn fill_column(chunk: &mut Chunk, x: usize, z: usize, base_y: i32, height: i32) {
+fn fill_column(
+    chunk: &mut Chunk,
+    x: usize,
+    z: usize,
+    base_y: i32,
+    height: i32,
+    blocks: &TerrainBlocks,
+) {
     let grass = height.saturating_sub(base_y);
     let stone_end = clamp_to_chunk(grass.saturating_sub(DIRT_DEPTH_I32));
     let dirt_end = clamp_to_chunk(grass);
-    fill_range(chunk, x, z, 0..stone_end, STONE);
-    fill_range(chunk, x, z, stone_end..dirt_end, DIRT);
+    fill_range(chunk, x, z, 0..stone_end, blocks.stone);
+    fill_range(chunk, x, z, stone_end..dirt_end, blocks.dirt);
     if (0..CHUNK_SIZE_I32).contains(&grass) {
-        fill_range(chunk, x, z, dirt_end..dirt_end + 1, GRASS);
+        fill_range(chunk, x, z, dirt_end..dirt_end + 1, blocks.grass);
     }
 }
 
@@ -265,6 +287,20 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::mesh::{Face, build_mesh};
+
+    const GRASS: BlockId = TEST_BLOCKS.grass;
+    const DIRT: BlockId = TEST_BLOCKS.dirt;
+    const STONE: BlockId = TEST_BLOCKS.stone;
+
+    // The tests always use ids 1, 2 and 3 (the ids the game's registry gives), so these
+    // shadow the public functions with the blocks filled in.
+    fn generate_terrain(seed: u32) -> Chunk {
+        super::generate_terrain(seed, &TEST_BLOCKS)
+    }
+
+    fn generate_chunk(seed: u32, pos: ChunkPos) -> Chunk {
+        super::generate_chunk(seed, pos, &TEST_BLOCKS)
+    }
 
     fn block_at(chunk: &Chunk, x: usize, y: usize, z: usize) -> BlockId {
         LocalPos::new(x, y, z).map_or(BlockId::AIR, |pos| chunk.get(pos))

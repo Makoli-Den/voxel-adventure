@@ -5,7 +5,7 @@
 //! game's world in step with the chunk streaming. The game (`main.rs`) casts the ray, writes
 //! the block with `World::set_block` and rebuilds the meshes (decision 0011).
 
-use vox_world::{BlockId, Chunk, ChunkPos, RayHit, STONE, World};
+use vox_world::{BlockId, Chunk, ChunkPos, RayHit, World};
 
 use crate::physics::Body;
 
@@ -15,16 +15,12 @@ use crate::physics::Body;
 /// one meant.
 pub const REACH: f32 = 6.0;
 
-/// The block the place key puts down. Temporary: the base game mod will provide an inventory
-/// with a selected block.
-pub const PLACE_BLOCK: BlockId = STONE;
-
 /// What the player asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EditAction {
     /// Remove the block under the crosshair.
     Break,
-    /// Put [`PLACE_BLOCK`] on the face of the block under the crosshair.
+    /// Put the selected block on the face of the block under the crosshair.
     Place,
 }
 
@@ -82,6 +78,9 @@ mod tests {
 
     use super::*;
 
+    /// The block the tests place and hit; its value is arbitrary, the code only moves it around.
+    const PLACE_BLOCK: BlockId = BlockId(3);
+
     /// The eye of the tests: in the middle of block (0, 1, 0).
     const EYE: [f32; 3] = [0.5, 1.5, 0.5];
 
@@ -92,7 +91,7 @@ mod tests {
     fn hit(block: [i32; 3], face: Face, distance: f32) -> RayHit {
         RayHit {
             block,
-            id: STONE,
+            id: PLACE_BLOCK,
             face,
             distance,
         }

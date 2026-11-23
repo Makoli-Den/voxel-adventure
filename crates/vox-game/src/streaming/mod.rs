@@ -11,12 +11,13 @@ mod tracker;
 mod workers;
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use vox_world::{Chunk, ChunkMesh, ChunkPos};
 
-pub use job::remesh;
+pub use job::{Terrain, remesh};
 pub use tracker::StreamStats;
 pub use workers::StreamError;
 
@@ -67,13 +68,13 @@ fn worker_count() -> usize {
 }
 
 impl ChunkStreamer {
-    /// Starts the workers for the terrain of `seed`, to load a circle of `radius` chunks.
-    pub fn new(seed: u32, radius: i32) -> Self {
+    /// Starts the workers for `terrain`, to load a circle of `radius` chunks.
+    pub fn new(terrain: Arc<Terrain>, radius: i32) -> Self {
         let worker_count = worker_count();
         Self {
             tracker: ChunkTracker::new(radius, JOBS_PER_WORKER * worker_count),
             workers: Workers::spawn(worker_count, move |pos, scratch| {
-                job::build_chunk(seed, pos, scratch)
+                job::build_chunk(&terrain, pos, scratch)
             }),
             worker_count,
             jobs_done: 0,
@@ -135,12 +136,24 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Instant;
 
+    use vox_world::{BlockId, TerrainBlocks};
+
     use super::*;
 
     /// A small radius keeps the test fast: 13 columns.
     const RADIUS: i32 = 2;
     /// The seed of the tests' terrain.
     const SEED: u32 = 1;
+    /// The ids of the tests' blocks: the ones the game's registry hands out.
+    const BLOCKS: TerrainBlocks = TerrainBlocks {
+        grass: BlockId(1),
+        dirt: BlockId(2),
+        stone: BlockId(3),
+    };
+
+    fn terrain() -> Arc<Terrain> {
+        Arc::new(Terrain::new(SEED, BLOCKS))
+    }
     /// How long the test waits for the workers before it fails.
     const TIMEOUT: Duration = Duration::from_secs(10);
     /// Pause between two frames of the test.
@@ -190,7 +203,7 @@ mod tests {
 
     #[test]
     fn the_area_fills_and_a_far_move_removes_it() {
-        let mut streamer = ChunkStreamer::new(SEED, RADIUS);
+        let mut streamer = ChunkStreamer::new(terrain(), RADIUS);
         let centre = ChunkPos::ORIGIN;
         let Run {
             uploaded,
@@ -198,10 +211,11 @@ mod tests {
             removed,
         } = fill(&mut streamer, centre);
 
+        let terrain = terrain();
         let mut scratch = ChunkMesh::default();
         let mut expected = HashMap::new();
         for pos in area::wanted(centre, RADIUS) {
-            let mesh = job::build_chunk(SEED, pos, &mut scratch).mesh;
+            let mesh = job::build_chunk(&terrain, pos, &mut scratch).mesh;
             if !mesh.indices.is_empty() {
                 expected.insert(pos, mesh);
             }
@@ -227,7 +241,7 @@ mod tests {
 
     #[test]
     fn there_is_no_average_before_the_first_job() {
-        let streamer = ChunkStreamer::new(SEED, RADIUS);
+        let streamer = ChunkStreamer::new(terrain(), RADIUS);
         assert!(streamer.average_job_time().is_none());
         assert!(streamer.worker_count() >= 1);
     }

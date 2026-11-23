@@ -31,13 +31,13 @@ closure; inputs and outputs go through `std::hint::black_box`. Source:
 |---|---|---|
 | `mesh/empty` | all air | Fixed cost of walking the block array: iterator, `get`, `is_air`. |
 | `mesh/single_block` | one block in the middle | Same walk plus six emitted faces; shows the cost of a nearly empty mesh. |
-| `mesh/terrain_seed_1` | `generate_terrain(1)` | The realistic case: hills, air above, solid below. |
+| `mesh/terrain_seed_1` | `generate_terrain(1, &blocks)` | The realistic case: hills, air above, solid below. |
 | `mesh/solid` | every block solid | Maximum number of neighbour checks with almost no output (only the outer shell). |
 | `mesh/checkerboard` | blocks where `x + y + z` is even | Worst case: no two solid blocks touch, almost every face is emitted. |
 | `terrain/generate_seed_1` | seed 1 | Cost of generating the chunk (noise, column fill, allocating the chunk). |
 | `mesh_reused/terrain_seed_1`, `solid`, `checkerboard` | same chunks | `build_mesh_into` on one warmed-up mesh: the steady state of a worker, without allocation. |
 | `mesh_neighbours/terrain_seed_1` | the origin terrain chunk with all six neighbouring terrain chunks present | `build_mesh_with_neighbours_into` on a warmed-up mesh: the cost of looking into neighbouring chunks, to compare with `mesh_reused/terrain_seed_1`. |
-| `terrain/generate_chunk_far` | `generate_chunk(1, ChunkPos::new(3, 0, -2))` | Chunk generation away from the origin, with a negative coordinate. |
+| `terrain/generate_chunk_far` | `generate_chunk(1, ChunkPos::new(3, 0, -2), &blocks)` | Chunk generation away from the origin, with a negative coordinate. |
 
 Throughput is set to the number of blocks in the chunk, so "blocks per second" counts air
 blocks too; it is a way to compare cases, not a count of solid blocks processed.

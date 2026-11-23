@@ -7,6 +7,7 @@
 
 mod camera;
 mod cli;
+mod content;
 mod controls;
 mod editing;
 mod hud;
@@ -26,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use glam::Vec3;
 use vox_render::{RenderError, RenderStats, Renderer, ShaderSources, create_renderer};
-use vox_world::{ChunkMesh, World, raycast};
+use vox_world::{BlockId, ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -35,12 +36,13 @@ use winit::window::{Window, WindowId};
 
 use camera::{Camera, Movement};
 use cli::{Command, Options};
+use content::Content;
 use controls::Controls;
-use editing::{EditAction, PLACE_BLOCK, REACH};
+use editing::{EditAction, REACH};
 use metrics::FrameHistory;
 use pacing::MAX_FRAME_TIME;
 use physics::{Body, WalkInput};
-use streaming::{ChunkStreamer, area, remesh};
+use streaming::{ChunkStreamer, Terrain, area, remesh};
 
 /// The window title.
 const WINDOW_TITLE: &str = "Voxel Adventure";
@@ -125,6 +127,10 @@ struct App {
     run_started: Instant,
     window: Option<Arc<Window>>,
     renderer: Option<Box<dyn Renderer>>,
+    /// The terrain every streaming job and every remesh generates from.
+    terrain: Arc<Terrain>,
+    /// The block the place key puts down.
+    place_block: BlockId,
     /// Loads and unloads the terrain around the camera; set up with the renderer.
     streamer: Option<ChunkStreamer>,
     /// Progress of the first fill, for the log line.
@@ -171,8 +177,10 @@ struct App {
 }
 
 impl App {
-    fn new(options: Options, shaders: ShaderSources) -> Self {
+    fn new(options: Options, shaders: ShaderSources, content: &Content) -> Self {
         Self {
+            terrain: Arc::new(Terrain::new(WORLD_SEED, content.terrain)),
+            place_block: content.place_block,
             options,
             shaders,
             run_started: Instant::now(),
@@ -217,7 +225,10 @@ impl App {
 
         // No chunk is loaded here: the first frames stream them in, nearest first.
         self.fill = FillReport::new();
-        self.streamer = Some(ChunkStreamer::new(WORLD_SEED, self.options.view_radius));
+        self.streamer = Some(ChunkStreamer::new(
+            Arc::clone(&self.terrain),
+            self.options.view_radius,
+        ));
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.update_frame_interval();
@@ -323,7 +334,7 @@ impl App {
         let Some(hit) = raycast(&self.world, eye, direction, REACH) else {
             return Ok(());
         };
-        let Some(edit) = editing::plan(action, &hit, &self.body, PLACE_BLOCK) else {
+        let Some(edit) = editing::plan(action, &hit, &self.body, self.place_block) else {
             return Ok(());
         };
         // `None` when the chunk of the cell is not loaded, for example above the terrain layer.
@@ -334,7 +345,7 @@ impl App {
             return Ok(());
         };
         for pos in changed.as_slice() {
-            if remesh(WORLD_SEED, &self.world, *pos, &mut self.edit_scratch) {
+            if remesh(&self.terrain, &self.world, *pos, &mut self.edit_scratch) {
                 // An empty mesh removes the chunk's entry, so a chunk that was dug empty vanishes.
                 renderer.set_chunk_mesh(*pos, &self.edit_scratch)?;
             }
@@ -631,6 +642,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let content = match Content::new() {
+        Ok(content) => content,
+        Err(error) => {
+            eprintln!("error: cannot set up the blocks: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Blocks: {} registered", content.registry.len());
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
         Err(error) => {
@@ -640,7 +659,7 @@ fn main() -> ExitCode {
     };
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(options, shaders);
+    let mut app = App::new(options, shaders, &content);
     let result = event_loop.run_app(&mut app);
     // The summary is printed however the loop ended. A closed standard output is not a
     // reason to fail (`println!` would panic), so a write error is ignored.

@@ -14,9 +14,15 @@ use vox_world::{
     BlockId, CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, LocalPos,
 };
 use vox_world::{Neighbours, build_mesh, build_mesh_into, build_mesh_with_neighbours_into};
-use vox_world::{generate_chunk, generate_terrain};
+use vox_world::{TerrainBlocks, generate_chunk, generate_terrain};
 
-const STONE: BlockId = BlockId(1);
+/// The terrain blocks of the benchmarks. Plain ids: the generator only writes numbers, so no
+/// registry is needed to time it.
+const TERRAIN: TerrainBlocks = TerrainBlocks {
+    grass: BlockId(1),
+    dirt: BlockId(2),
+    stone: BlockId(3),
+};
 /// Coordinate of the middle of the chunk along an axis: far from every border, so the
 /// single block of `single_block_chunk` has all six neighbours inside the chunk.
 const MIDDLE: usize = CHUNK_SIZE / 2;
@@ -32,7 +38,7 @@ fn empty_chunk() -> Chunk {
 fn single_block_chunk() -> Chunk {
     let mut chunk = Chunk::new();
     if let Some(pos) = LocalPos::new(MIDDLE, MIDDLE, MIDDLE) {
-        chunk.set(pos, STONE);
+        chunk.set(pos, TERRAIN.stone);
     }
     chunk
 }
@@ -52,7 +58,7 @@ fn checkerboard_chunk() -> Chunk {
 fn chunk_where(solid: impl Fn(LocalPos) -> bool) -> Chunk {
     let mut chunk = Chunk::new();
     for pos in LocalPos::all().filter(|&pos| solid(pos)) {
-        chunk.set(pos, STONE);
+        chunk.set(pos, TERRAIN.stone);
     }
     chunk
 }
@@ -71,7 +77,7 @@ fn mesh_cases() -> Vec<(&'static str, Chunk)> {
     vec![
         ("empty", empty_chunk()),
         ("single_block", single_block_chunk()),
-        ("terrain_seed_1", generate_terrain(SEED)),
+        ("terrain_seed_1", generate_terrain(SEED, &TERRAIN)),
         ("slab", slab_chunk()),
         ("solid", solid_chunk()),
         ("checkerboard", checkerboard_chunk()),
@@ -125,7 +131,7 @@ fn bench_mesh_reused(c: &mut Criterion) {
     let mut group = c.benchmark_group("mesh_reused");
     group.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
     let cases = [
-        ("terrain_seed_1", generate_terrain(SEED)),
+        ("terrain_seed_1", generate_terrain(SEED, &TERRAIN)),
         ("solid", solid_chunk()),
         ("checkerboard", checkerboard_chunk()),
     ];
@@ -148,8 +154,9 @@ fn bench_mesh_reused(c: &mut Criterion) {
 fn bench_mesh_neighbours(c: &mut Criterion) {
     let mut group = c.benchmark_group("mesh_neighbours");
     group.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
-    let chunk = generate_terrain(SEED);
-    let around = Face::ALL.map(|face| generate_chunk(SEED, ChunkPos::ORIGIN.neighbour(face)));
+    let chunk = generate_terrain(SEED, &TERRAIN);
+    let around =
+        Face::ALL.map(|face| generate_chunk(SEED, ChunkPos::ORIGIN.neighbour(face), &TERRAIN));
     let neighbours = Neighbours::new(around.each_ref().map(Some));
     let mut mesh = ChunkMesh::default();
     build_mesh_with_neighbours_into(&chunk, &neighbours, &mut mesh);
@@ -171,11 +178,17 @@ fn bench_terrain(c: &mut Criterion) {
     let mut group = c.benchmark_group("terrain");
     group.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
     group.bench_function("generate_seed_1", |b| {
-        b.iter(|| generate_terrain(black_box(SEED)))
+        b.iter(|| generate_terrain(black_box(SEED), &TERRAIN))
     });
     // A chunk away from the origin, with a negative coordinate: the same work, other noise cells.
     group.bench_function("generate_chunk_far", |b| {
-        b.iter(|| generate_chunk(black_box(SEED), black_box(ChunkPos::new(3, 0, -2))))
+        b.iter(|| {
+            generate_chunk(
+                black_box(SEED),
+                black_box(ChunkPos::new(3, 0, -2)),
+                &TERRAIN,
+            )
+        })
     });
     group.finish();
 }
