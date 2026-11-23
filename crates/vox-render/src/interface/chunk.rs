@@ -32,8 +32,8 @@
 //! constants use, so a shader can declare the block as written in the table.
 
 use super::{
-    AttributeFormat, GUARANTEED_PUSH_CONSTANT_SIZE, PipelineInterface, PushConstants, Stage,
-    VertexAttribute,
+    AttributeFormat, F32_SIZE, GUARANTEED_PUSH_CONSTANT_SIZE, PipelineInterface, PushConstants,
+    Stage, VertexAttribute,
 };
 
 /// Byte offset of the block id inside a vertex, right after the position and face bytes.
@@ -42,16 +42,24 @@ const BLOCK_OFFSET: u32 = AttributeFormat::Uint8x4.size();
 /// Bytes from one vertex to the next.
 pub(crate) const VERTEX_STRIDE: u32 = BLOCK_OFFSET + AttributeFormat::Uint16.size();
 
-/// Size of the push constants, see the table in the module docs.
-pub(crate) const PUSH_CONSTANT_SIZE: u32 = 80;
+/// Floats in a GLSL `vec4`: the four homogeneous coordinates `x, y, z, w`.
+const VEC4_FLOATS: u32 = 4;
+
+/// Bytes of a `vec4` of `f32`, tightly packed as std430 lays it out.
+const VEC4_SIZE: u32 = VEC4_FLOATS * F32_SIZE;
+
+/// Bytes of a `mat4`: one `vec4` per column, one column per homogeneous coordinate.
+const MAT4_SIZE: u32 = VEC4_FLOATS * VEC4_SIZE;
 
 /// Byte offset of the chunk origin inside the push constants, right after the matrix.
-pub(crate) const CHUNK_ORIGIN_OFFSET: u32 = 64;
+pub(crate) const CHUNK_ORIGIN_OFFSET: u32 = MAT4_SIZE;
+
+/// Size of the push constants, see the table in the module docs: the matrix, then the
+/// origin `vec4` filling the rest of the block.
+pub(crate) const PUSH_CONSTANT_SIZE: u32 = CHUNK_ORIGIN_OFFSET + VEC4_SIZE;
 
 // Staying within the guaranteed size means no capability check is needed.
 const _: () = assert!(PUSH_CONSTANT_SIZE <= GUARANTEED_PUSH_CONSTANT_SIZE);
-// The origin `vec4` fills the rest of the block after the matrix.
-const _: () = assert!(CHUNK_ORIGIN_OFFSET + 16 == PUSH_CONSTANT_SIZE);
 
 /// Every vertex attribute, matching the layout table in the module docs.
 const ATTRIBUTES: [VertexAttribute; 2] = [

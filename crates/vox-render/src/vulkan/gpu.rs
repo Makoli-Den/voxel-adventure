@@ -6,6 +6,9 @@ use super::context::{Context, Surface};
 use super::timestamps::TimestampClock;
 use crate::RenderError;
 
+/// The GPU name shown when the driver reports one that is not valid text.
+const UNKNOWN_GPU_NAME: &str = "unknown GPU";
+
 /// A chosen GPU, its logical device and the single queue we use.
 ///
 /// One queue handles both graphics and presentation, which every desktop GPU supports.
@@ -67,7 +70,7 @@ impl Gpu {
             properties.limits.timestamp_period,
         );
         let name = properties.device_name_as_c_str().map_or_else(
-            |_| String::from("unknown GPU"),
+            |_| String::from(UNKNOWN_GPU_NAME),
             |n| n.to_string_lossy().into_owned(),
         );
 

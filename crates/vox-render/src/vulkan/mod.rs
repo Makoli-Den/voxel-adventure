@@ -29,6 +29,10 @@ use crate::RenderError;
 
 pub(crate) use renderer::VulkanRenderer;
 
+/// Timeout for fence waits and image acquisition that means "wait as long as it takes":
+/// Vulkan treats `u64::MAX` nanoseconds as no timeout at all.
+const NO_TIMEOUT: u64 = u64::MAX;
+
 // Backend errors are wrapped here, so `RenderError` itself stays free of Vulkan types.
 
 impl From<vk::Result> for RenderError {

@@ -11,6 +11,9 @@ use std::time::Duration;
 /// Frames drawn per monitor refresh.
 const FRAMES_PER_REFRESH: f64 = 2.0;
 
+/// winit reports refresh rates in millihertz; this converts them to hertz.
+const MILLIHERTZ_PER_HERTZ: f64 = 1000.0;
+
 /// Refresh rate assumed when the monitor does not report one, in millihertz (60 Hz).
 const DEFAULT_REFRESH_MILLIHERTZ: u32 = 60_000;
 
@@ -29,8 +32,8 @@ pub fn frame_interval(refresh_millihertz: Option<u32>) -> Duration {
         Some(rate) if rate > 0 => rate,
         _ => DEFAULT_REFRESH_MILLIHERTZ,
     };
-    let frames_per_second =
-        (f64::from(millihertz) / 1000.0 * FRAMES_PER_REFRESH).min(MAX_FRAMES_PER_SECOND);
+    let frames_per_second = (f64::from(millihertz) / MILLIHERTZ_PER_HERTZ * FRAMES_PER_REFRESH)
+        .min(MAX_FRAMES_PER_SECOND);
     Duration::from_secs_f64(1.0 / frames_per_second)
 }
 

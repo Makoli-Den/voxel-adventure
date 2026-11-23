@@ -33,10 +33,10 @@ use std::time::Duration;
 const ONE_PERCENT_DENOMINATOR: usize = 100;
 /// The "0.1% low" looks at the slowest frame out of this many.
 const ONE_PER_MILLE_DENOMINATOR: usize = 1000;
-/// The label of the 1% low in the printed figures.
-const LOW_1_PERCENT_LABEL: &str = "1% low";
-/// The label of the 0.1% low in the printed figures.
-const LOW_0_1_PERCENT_LABEL: &str = "0.1% low";
+/// The label of the 1% low in the printed figures and on the metrics panel.
+pub(crate) const LOW_1_PERCENT_LABEL: &str = "1% low";
+/// The label of the 0.1% low in the printed figures and on the metrics panel.
+pub(crate) const LOW_0_1_PERCENT_LABEL: &str = "0.1% low";
 /// Milliseconds in a second, for printing times. They are all shown in milliseconds, so the
 /// numbers can be compared at a glance and the text stays plain ASCII.
 const MILLIS_PER_SECOND: f64 = 1000.0;

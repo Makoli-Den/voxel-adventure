@@ -10,6 +10,12 @@ use crate::RenderError;
 /// The Khronos validation layer, enabled in debug builds when installed.
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
+/// The name the driver and debugging tools see for this application.
+const APPLICATION_NAME: &CStr = c"Voxel Adventure";
+
+/// The Vulkan version the renderer is written against: plain 1.0, so old GPUs work.
+const API_VERSION: u32 = vk::API_VERSION_1_0;
+
 /// The Vulkan library entry point and the instance created from it.
 ///
 /// Must be dropped after everything created from the instance (surface, device).
@@ -28,8 +34,8 @@ impl Context {
         let layers = enabled_layers(&entry)?;
 
         let app_info = vk::ApplicationInfo::default()
-            .application_name(c"Voxel Adventure")
-            .api_version(vk::make_api_version(0, 1, 0, 0));
+            .application_name(APPLICATION_NAME)
+            .api_version(API_VERSION);
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .enabled_extension_names(extensions)

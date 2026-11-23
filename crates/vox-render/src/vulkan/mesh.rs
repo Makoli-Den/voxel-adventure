@@ -95,7 +95,7 @@ impl MeshLayout {
 }
 
 /// Bytes per index (`u32`).
-const INDEX_SIZE: usize = 4;
+const INDEX_SIZE: usize = size_of::<u32>();
 
 /// Serializes `mesh` into the buffer layout: vertices, zero padding, indices.
 fn mesh_bytes(mesh: &ChunkMesh, layout: MeshLayout) -> Vec<u8> {
