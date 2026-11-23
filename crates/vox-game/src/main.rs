@@ -1,8 +1,8 @@
 //! Game entry point.
 //!
 //! This is where the layers are wired together: it opens the window, creates the
-//! renderer, generates a chunk of terrain and runs the event loop, flying a camera
-//! over the terrain. Mods and networking will join later.
+//! renderer, streams terrain chunks in around the camera and runs the event loop, flying
+//! a camera over the terrain. Mods and networking will join later.
 
 mod camera;
 mod cli;
@@ -10,7 +10,7 @@ mod controls;
 mod hud;
 mod metrics;
 mod pacing;
-mod world_loader;
+mod streaming;
 
 use std::env;
 use std::error::Error;
@@ -33,6 +33,7 @@ use camera::Camera;
 use cli::{Command, Options};
 use controls::Controls;
 use metrics::FrameHistory;
+use streaming::{ChunkStreamer, area};
 
 /// The window title.
 const WINDOW_TITLE: &str = "Voxel Adventure";
@@ -59,11 +60,70 @@ const LOOK_SENSITIVITY: f32 = 0.0025;
 /// drag, a breakpoint) the camera must not jump across the world.
 const MAX_FRAME_TIME: f32 = 0.1;
 
+/// Timing of the first fill of the area around the camera, for one log line: the time from
+/// the start until nothing is queued any more, and the time spent in uploads on the way.
+struct FillReport {
+    /// When streaming started.
+    started: Instant,
+    /// Time spent in `set_chunk_mesh` so far.
+    upload_time: Duration,
+    /// Meshes uploaded so far.
+    uploads: u32,
+    /// Whether the line has been printed; it is printed once.
+    printed: bool,
+}
+
+impl FillReport {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            upload_time: Duration::ZERO,
+            uploads: 0,
+            printed: false,
+        }
+    }
+
+    /// Adds a frame's uploads.
+    fn add_uploads(&mut self, count: usize, took: Duration) {
+        self.uploads = self
+            .uploads
+            .saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
+        self.upload_time += took;
+    }
+
+    /// The log line, the first time it is asked for after the queue emptied.
+    fn line_once(&mut self, streamer: &ChunkStreamer) -> Option<String> {
+        let stats = streamer.stats();
+        if self.printed || stats.queued > 0 {
+            return None;
+        }
+        self.printed = true;
+        let average_job = streamer.average_job_time().unwrap_or_default();
+        let average_upload = if self.uploads > 0 {
+            self.upload_time / self.uploads
+        } else {
+            Duration::ZERO
+        };
+        Some(format!(
+            "Streaming: {} chunks loaded in {:.1} ms, average job {:.3} ms, average upload {:.3} ms, {} workers",
+            stats.loaded,
+            metrics::millis(self.started.elapsed()),
+            metrics::millis(average_job),
+            metrics::millis(average_upload),
+            streamer.worker_count()
+        ))
+    }
+}
+
 /// Application state driven by the window event loop.
 struct App {
     options: Options,
     window: Option<Arc<Window>>,
     renderer: Option<Box<dyn Renderer>>,
+    /// Loads and unloads the terrain around the camera; set up with the renderer.
+    streamer: Option<ChunkStreamer>,
+    /// Progress of the first fill, for the log line.
+    fill: FillReport,
     camera: Camera,
     controls: Controls,
     /// Whether the frame rate is capped (twice the monitor's refresh rate, see `pacing`).
@@ -100,6 +160,8 @@ impl App {
             options,
             window: None,
             renderer: None,
+            streamer: None,
+            fill: FillReport::new(),
             camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
             controls: Controls::default(),
             frame_limit: false,
@@ -117,7 +179,7 @@ impl App {
         }
     }
 
-    /// Opens the window, creates the renderer and uploads the terrain.
+    /// Opens the window, creates the renderer and starts streaming the terrain.
     fn start(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
         // `--background` opens the window without taking the focus from whatever the
         // player is doing in another window.
@@ -130,18 +192,11 @@ impl App {
         let mut renderer =
             create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
         println!("Rendering on: {}", renderer.device_name());
-        let loaded = world_loader::load_area(WORLD_SEED, self.options.view_radius);
-        let uploading = Instant::now();
-        for (pos, mesh) in &loaded.meshes {
-            renderer.set_chunk_mesh(*pos, mesh)?;
-        }
-        println!(
-            "World: {}, uploaded in {:.1?}",
-            loaded.stats,
-            uploading.elapsed()
-        );
         renderer.set_camera(self.camera.view_projection(size.width, size.height));
 
+        // No chunk is loaded here: the first frames stream them in, nearest first.
+        self.fill = FillReport::new();
+        self.streamer = Some(ChunkStreamer::new(WORLD_SEED, self.options.view_radius));
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.update_frame_interval();
@@ -177,17 +232,47 @@ impl App {
         }
     }
 
-    /// Updates the camera, draws one frame and records how long it all took.
+    /// One frame of streaming: loads and unloads chunks around the camera and hands the
+    /// finished meshes to the renderer. Removals come first, so their memory is freed before
+    /// the uploads need it.
+    fn stream(&mut self) -> Result<(), Box<dyn Error>> {
+        let (Some(streamer), Some(renderer)) = (self.streamer.as_mut(), self.renderer.as_mut())
+        else {
+            return Ok(());
+        };
+        let changes = streamer.update(area::chunk_of(self.camera.position().to_array()))?;
+        for pos in &changes.removed {
+            renderer.remove_chunk_mesh(*pos);
+        }
+        let uploading = Instant::now();
+        for (pos, mesh) in &changes.uploads {
+            renderer.set_chunk_mesh(*pos, mesh)?;
+        }
+        if !changes.uploads.is_empty() {
+            self.fill
+                .add_uploads(changes.uploads.len(), uploading.elapsed());
+        }
+        if let Some(line) = self.fill.line_once(streamer) {
+            println!("{line}");
+        }
+        Ok(())
+    }
+
+    /// Updates the camera, streams chunks, draws one frame and records how long it all took.
     ///
-    /// The recorded work time covers moving the camera and the renderer's `render_frame`
-    /// (which includes waiting for the GPU), but not refreshing the metrics panel; that cost
-    /// shows up in the next frame's interval.
+    /// The recorded work time covers moving the camera, streaming and the renderer's
+    /// `render_frame` (which includes waiting for the GPU), but not refreshing the metrics
+    /// panel; that cost shows up in the next frame's interval.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let started = Instant::now();
         let interval = started.duration_since(self.last_frame);
         self.last_frame = started;
 
         self.update_camera(interval);
+        if let Err(error) = self.stream() {
+            self.fail(event_loop, error);
+            return;
+        }
         let result = self
             .renderer
             .as_mut()
@@ -228,9 +313,15 @@ impl App {
         };
         let rects = if self.hud_visible {
             let summary = self.live_frames.summary();
+            let stream_stats = self
+                .streamer
+                .as_ref()
+                .map(ChunkStreamer::stats)
+                .unwrap_or_default();
             hud::panel(&hud::lines(
                 summary.as_ref(),
                 &self.render_stats,
+                &stream_stats,
                 self.frame_limit,
             ))
         } else {

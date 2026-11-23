@@ -1,10 +1,11 @@
 //! Command-line options of the game.
 
-/// How many chunks around the start the world extends when `--view-radius` is not given.
+/// The radius of the streamed circle of chunks when `--view-radius` is not given.
 pub const DEFAULT_VIEW_RADIUS: i32 = 8;
 
-/// The largest accepted `--view-radius`: (2 * 30 + 1)^2 = 3721 chunk columns (about 6 million
-/// quads), enough to measure how the frame time grows with the chunk count.
+/// The largest accepted `--view-radius`: a circle of about 2800 chunk columns around the camera
+/// (about 3000 kept loaded with the unload margin), enough to measure how the frame time grows
+/// with the chunk count while staying under the 4096 memory allocations Vulkan guarantees.
 pub const MAX_VIEW_RADIUS: i32 = 30;
 
 /// How the game was asked to run.
@@ -13,7 +14,7 @@ pub struct Options {
     /// Open the window without taking the keyboard focus, so it does not interrupt
     /// whatever the player was doing in another window. Used by scripted checks.
     pub background: bool,
-    /// Chunks generated in each horizontal direction around the start, 0..=[`MAX_VIEW_RADIUS`].
+    /// Radius in chunks of the circle streamed in around the camera, 0..=[`MAX_VIEW_RADIUS`].
     pub view_radius: i32,
 }
 
@@ -43,7 +44,7 @@ pub fn usage() -> String {
 
 Options:
   --background     open the window without taking the keyboard focus
-  --view-radius N  chunks to generate around the start, 0 to {MAX_VIEW_RADIUS} (default {DEFAULT_VIEW_RADIUS})
+  --view-radius N  chunks to stream in around the camera (a circle), 0 to {MAX_VIEW_RADIUS} (default {DEFAULT_VIEW_RADIUS})
   -h, --help       print this text"
     )
 }
