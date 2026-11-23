@@ -1740,6 +1740,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox-resources"
+version = "0.1.0"
+
+[[package]]
 name = "vox-world"
 version = "0.1.0"
 dependencies = [
