@@ -29,7 +29,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use camera::Camera;
+use camera::{Camera, Movement};
 use cli::{Command, Options};
 use controls::Controls;
 use metrics::FrameHistory;
@@ -118,6 +118,8 @@ impl FillReport {
 /// Application state driven by the window event loop.
 struct App {
     options: Options,
+    /// When the app was created, for the `--fly` autopilot's duration.
+    run_started: Instant,
     window: Option<Arc<Window>>,
     renderer: Option<Box<dyn Renderer>>,
     /// Loads and unloads the terrain around the camera; set up with the renderer.
@@ -158,6 +160,7 @@ impl App {
     fn new(options: Options) -> Self {
         Self {
             options,
+            run_started: Instant::now(),
             window: None,
             renderer: None,
             streamer: None,
@@ -221,8 +224,19 @@ impl App {
 
     /// Moves the camera for the time since the last frame and hands it to the renderer.
     fn update_camera(&mut self, since_last_frame: Duration) {
-        let distance = MOVE_SPEED * since_last_frame.as_secs_f32().min(MAX_FRAME_TIME);
-        self.camera.translate(self.controls.movement(), distance);
+        let (movement, speed) = if self.options.fly_seconds.is_some() {
+            // The autopilot flies sideways, keeping the height, so the camera always meets
+            // terrain that has not been streamed in yet.
+            let sideways = Movement {
+                right: 1.0,
+                ..Movement::default()
+            };
+            (sideways, cli::FLY_SPEED)
+        } else {
+            (self.controls.movement(), MOVE_SPEED)
+        };
+        let distance = speed * since_last_frame.as_secs_f32().min(MAX_FRAME_TIME);
+        self.camera.translate(movement, distance);
 
         if let (Some(window), Some(renderer)) = (&self.window, self.renderer.as_mut()) {
             // The aspect ratio comes from the window. For a frame or so after a resize the
@@ -271,6 +285,12 @@ impl App {
         self.last_frame = started;
 
         self.update_camera(interval);
+        if let Some(seconds) = self.options.fly_seconds {
+            if self.run_started.elapsed().as_secs_f32() >= seconds {
+                event_loop.exit();
+                return;
+            }
+        }
         if let Err(error) = self.stream() {
             self.fail(event_loop, error);
             return;

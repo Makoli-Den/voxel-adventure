@@ -47,7 +47,7 @@ Fly over the generated terrain:
 | F3 | show or hide the metrics panel |
 | Esc | quit |
 
-Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--help` lists the options.
+Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--help` lists the options.
 
 ## Frame metrics
 A translucent panel in the top-left corner of the window shows live figures over the last ten seconds, refreshed twice a second: average FPS, the 1% and 0.1% lows (the average FPS of the slowest 1% and 0.1% of the frames, so they show stutter), the frame time, the time the game spent producing a frame, the GPU time (an upper bound, measured with timestamp queries) and how many chunks and triangles are drawn. F3 hides it. A summary of the whole run is printed when the game exits. The definitions are in `crates/vox-game/src/metrics.rs` and decision 0008.

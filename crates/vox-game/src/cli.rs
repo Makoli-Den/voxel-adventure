@@ -8,14 +8,21 @@ pub const DEFAULT_VIEW_RADIUS: i32 = 8;
 /// with the chunk count while staying under the 4096 memory allocations Vulkan guarantees.
 pub const MAX_VIEW_RADIUS: i32 = 30;
 
+/// How fast the `--fly` autopilot moves the camera, in blocks per second: 5 chunks per
+/// second, several times the player's speed, so streaming is stressed.
+pub const FLY_SPEED: f32 = 160.0;
+
 /// How the game was asked to run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Options {
     /// Open the window without taking the keyboard focus, so it does not interrupt
     /// whatever the player was doing in another window. Used by scripted checks.
     pub background: bool,
     /// Radius in chunks of the circle streamed in around the camera, 0..=[`MAX_VIEW_RADIUS`].
     pub view_radius: i32,
+    /// Fly sideways at [`FLY_SPEED`] for this many seconds and then quit, for measuring
+    /// how streaming behaves while the camera moves. `None` leaves the camera to the player.
+    pub fly_seconds: Option<f32>,
 }
 
 impl Default for Options {
@@ -23,12 +30,13 @@ impl Default for Options {
         Self {
             background: false,
             view_radius: DEFAULT_VIEW_RADIUS,
+            fly_seconds: None,
         }
     }
 }
 
 /// What the command line asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
     /// Run the game with these options.
     Run(Options),
@@ -40,11 +48,12 @@ pub enum Command {
 /// constants, so the text cannot disagree with what the parser accepts.
 pub fn usage() -> String {
     format!(
-        "Usage: vox-game [--background] [--view-radius N]
+        "Usage: vox-game [--background] [--view-radius N] [--fly SECONDS]
 
 Options:
   --background     open the window without taking the keyboard focus
   --view-radius N  chunks to stream in around the camera (a circle), 0 to {MAX_VIEW_RADIUS} (default {DEFAULT_VIEW_RADIUS})
+  --fly SECONDS    fly sideways automatically, then quit (for measuring)
   -h, --help       print this text"
     )
 }
@@ -59,6 +68,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--background" => options.background = true,
+            "--fly" => {
+                let value = args.next().ok_or("--fly needs a number of seconds")?;
+                options.fly_seconds = Some(parse_fly_seconds(&value)?);
+            }
             "--view-radius" => {
                 let value = args.next().ok_or("--view-radius needs a number")?;
                 options.view_radius = parse_view_radius(&value)?;
@@ -68,6 +81,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
         }
     }
     Ok(Command::Run(options))
+}
+
+fn parse_fly_seconds(value: &str) -> Result<f32, String> {
+    match value.parse::<f32>() {
+        Ok(seconds) if seconds.is_finite() && seconds > 0.0 => Ok(seconds),
+        _ => Err(format!(
+            "--fly must be a positive number of seconds, got: {value}"
+        )),
+    }
 }
 
 fn parse_view_radius(value: &str) -> Result<i32, String> {
@@ -129,6 +151,20 @@ mod tests {
         assert!(run(&["--view-radius", "-1"]).is_err());
         assert!(run(&["--view-radius", "x"]).is_err());
         assert!(run(&["--view-radius"]).is_err());
+    }
+
+    #[test]
+    fn fly_takes_positive_seconds() {
+        let fly = |args: &[&str]| match parse_all(args) {
+            Ok(Command::Run(options)) => Ok(options.fly_seconds),
+            other => Err(format!("{other:?}")),
+        };
+        assert_eq!(fly(&["--fly", "2.5"]), Ok(Some(2.5)));
+        assert_eq!(fly(&[]), Ok(None));
+        assert!(fly(&["--fly", "0"]).is_err());
+        assert!(fly(&["--fly", "-1"]).is_err());
+        assert!(fly(&["--fly", "NaN"]).is_err());
+        assert!(fly(&["--fly"]).is_err());
     }
 
     #[test]
