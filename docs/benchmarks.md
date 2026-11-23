@@ -252,3 +252,16 @@ Findings: the frame time grows linearly with the chunk count (about 5 us per chu
 "GPU" because the game waits for the GPU; the CPU is not the bottleneck. Hence the way to
 more frames is to draw less: cull chunks outside the view, drop faces that cannot be seen,
 and reduce detail with distance (see docs/performance-notes.md).
+
+### After chunk frustum culling (same setup, same day)
+
+| Radius | Chunks | FPS before | FPS after | GPU before | GPU after |
+|---|---|---|---|---|---|
+| 8 | 289 | 518 | 1051 | 1.86 ms | 0.79 ms |
+| 16 | 1089 | 163 | 448 | 6.11 ms | 2.22 ms |
+| 30 | 3721 | 52 | 168 | 19.35 ms | 5.89 ms |
+
+At radius 16 the start view draws 365 of 1089 chunks. The camera looks along one direction,
+so a view that sees more of the area gains less; a flight around the world is not measured yet.
+The remaining cost is still per drawn triangle (1.2 M triangles at radius 16): the next steps
+are skipping faces that point away from the camera and reducing detail with distance.
