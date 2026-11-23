@@ -9,6 +9,7 @@ use font8x8::legacy::BASIC_LEGACY;
 use vox_render::{OverlayRect, RenderStats};
 
 use crate::metrics::{LOW_0_1_PERCENT_LABEL, LOW_1_PERCENT_LABEL, Summary, millis};
+use crate::streaming::StreamStats;
 
 /// Pixels along each side of a font cell.
 const GLYPH_PIXELS: usize = 8;
@@ -126,9 +127,15 @@ fn line(label: &str, value: impl std::fmt::Display) -> String {
     format!("{label:<LABEL_WIDTH$}{value}")
 }
 
-/// The text of the panel: the frame figures, what is drawn, and how to use the keys.
+/// The text of the panel: the frame figures, what is drawn, how far streaming has come, and
+/// how to use the keys.
 /// `summary` is `None` until the first frames have been measured.
-pub fn lines(summary: Option<&Summary>, stats: &RenderStats, frame_limit: bool) -> Vec<String> {
+pub fn lines(
+    summary: Option<&Summary>,
+    stats: &RenderStats,
+    stream: &StreamStats,
+    frame_limit: bool,
+) -> Vec<String> {
     let mut lines = Vec::new();
     match summary {
         Some(summary) => {
@@ -177,6 +184,10 @@ pub fn lines(summary: Option<&Summary>, stats: &RenderStats, frame_limit: bool) 
         }
         None => lines.push(line("FPS", "measuring...")),
     }
+    lines.push(line(
+        "Chunks",
+        format!("loaded {}  queued {}", stream.loaded, stream.queued),
+    ));
     lines.push(line("Limit", if frame_limit { "on" } else { "off" }));
     lines.push(line("Keys", "L limit, F3 panel"));
     lines
@@ -293,7 +304,13 @@ mod tests {
 
     #[test]
     fn the_lines_show_the_figures() {
-        let text = lines(Some(&summary()), &RenderStats::default(), false).join("\n");
+        let text = lines(
+            Some(&summary()),
+            &RenderStats::default(),
+            &StreamStats::default(),
+            false,
+        )
+        .join("\n");
         assert!(text.contains("FPS      200"), "{text}");
         assert!(text.contains("1% low   150"), "{text}");
         assert!(text.contains("0.1% low 100"), "{text}");
@@ -306,14 +323,26 @@ mod tests {
     fn an_unknown_gpu_time_shows_as_not_available() {
         let mut figures = summary();
         figures.average_gpu = None;
-        let text = lines(Some(&figures), &RenderStats::default(), true).join("\n");
+        let text = lines(
+            Some(&figures),
+            &RenderStats::default(),
+            &StreamStats::default(),
+            true,
+        )
+        .join("\n");
         assert!(text.contains("GPU      n/a"), "{text}");
         assert!(text.contains("Limit    on"), "{text}");
     }
 
     #[test]
     fn before_the_first_measurement_the_panel_says_so_and_shows_no_counts() {
-        let text = lines(None, &RenderStats::default(), false).join("\n");
+        let text = lines(
+            None,
+            &RenderStats::default(),
+            &StreamStats::default(),
+            false,
+        )
+        .join("\n");
         assert!(text.contains("measuring"), "{text}");
         assert!(!text.contains("Drawn"), "{text}");
     }
@@ -325,13 +354,31 @@ mod tests {
             triangles: 1_014_652,
             ..RenderStats::default()
         };
-        let text = lines(Some(&summary()), &stats, false).join("\n");
+        let text = lines(Some(&summary()), &stats, &StreamStats::default(), false).join("\n");
         assert!(text.contains("289 chunks, 1014652 triangles"), "{text}");
     }
 
     #[test]
+    fn the_streaming_progress_has_a_line_before_the_first_measurement_too() {
+        let stream = StreamStats {
+            loaded: 120,
+            queued: 77,
+        };
+        for summary in [Some(summary()), None] {
+            let text = lines(summary.as_ref(), &RenderStats::default(), &stream, false).join("\n");
+            assert!(text.contains("Chunks   loaded 120  queued 77"), "{text}");
+        }
+    }
+
+    #[test]
     fn the_keys_have_a_line_of_their_own() {
-        let text = lines(Some(&summary()), &RenderStats::default(), false).join("\n");
+        let text = lines(
+            Some(&summary()),
+            &RenderStats::default(),
+            &StreamStats::default(),
+            false,
+        )
+        .join("\n");
         assert!(text.contains("Keys     L limit, F3 panel"), "{text}");
         assert!(!text.contains("Limit    off (L"), "{text}");
     }
@@ -346,7 +393,13 @@ mod tests {
 
     #[test]
     fn every_line_is_plain_ascii_the_font_can_draw() {
-        let text = lines(Some(&summary()), &RenderStats::default(), false).join("\n");
+        let text = lines(
+            Some(&summary()),
+            &RenderStats::default(),
+            &StreamStats::default(),
+            false,
+        )
+        .join("\n");
         assert!(text.is_ascii(), "{text}");
     }
 }

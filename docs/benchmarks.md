@@ -261,7 +261,26 @@ and reduce detail with distance (see docs/performance-notes.md).
 | 16 | 1089 | 163 | 448 | 6.11 ms | 2.22 ms |
 | 30 | 3721 | 52 | 168 | 19.35 ms | 5.89 ms |
 
+Note: the tables above were measured with the square area that existed before chunk streaming; `--view-radius` now means a circle (about 79 percent as many chunks), so later figures are not directly comparable.
+
 At radius 16 the start view draws 365 of 1089 chunks. The camera looks along one direction,
 so a view that sees more of the area gains less; a flight around the world is not measured yet.
 The remaining cost is still per drawn triangle (1.2 M triangles at radius 16): the next steps
 are skipping faces that point away from the camera and reducing detail with distance.
+
+## Streaming while flying (2026-11-24)
+
+`--fly 8` flies the camera sideways at 160 blocks per second (5 chunks per second, 4 times the
+player's speed) for 8 seconds, release build, upload budget 4 per frame, one run per radius.
+The first fill is the same as standing still: 44 ms (radius 8), 193 ms (16), 1.5 s (30).
+
+| Radius | Flying: FPS | 1% low | 0.1% low | Worst frame | Standing: FPS | 1% low |
+|---|---|---|---|---|---|---|
+| 8 | 1809 | 328 | 191 | 12.7 ms | 2059 | 365 |
+| 16 | 684 | 203 | 145 | 10.1 ms | 745 | 236 |
+| 30 | 285 | 78 | 71 | 14.2 ms | 307 | 141 |
+
+Streaming costs 7 to 10 percent of the frame rate while flying fast, and no frame is longer than
+14 ms, so the budget of 4 uploads per frame does not cause stutter at these speeds. The
+average job is about 0.5 to 0.6 ms on one of 15 workers and an upload about 0.11 ms. Not yet
+measured: smaller budgets, a slower machine, and how far the camera can outrun the loading.

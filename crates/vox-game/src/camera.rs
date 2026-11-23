@@ -54,6 +54,11 @@ impl Camera {
         }
     }
 
+    /// Where the eye is, in blocks.
+    pub fn position(&self) -> Vec3 {
+        self.position
+    }
+
     /// Unit vector the camera looks along.
     fn forward(&self) -> Vec3 {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();

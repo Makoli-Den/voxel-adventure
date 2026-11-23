@@ -2,7 +2,7 @@
 
 A voxel game: the open world, freedom of action and world generation of Minecraft, combined with the adventure, difficulty and boss fights of Terraria. The top priority is speed: the game must be extremely fast and run on old devices. Mods, texture packs and shader packs are part of the core.
 
-> Status: very early. The game opens a window, picks a GPU through Vulkan, generates a 17 by 17 area of hilly terrain chunks on all cores (faces between chunks are hidden), draws it and lets you fly over it (depth buffer, per-face shading), with shaders that are loaded from files and compiled at startup. Streaming chunks while you fly, textures, collision and mods are still to come.
+> Status: very early. The game opens a window, picks a GPU through Vulkan, streams a circle of hilly terrain chunks around the camera (generated and meshed on worker threads, faces between chunks hidden, chunks outside the view skipped), draws it and lets you fly over it (depth buffer, per-face shading), with shaders that are loaded from files and compiled at startup. Textures, collision and mods are still to come.
 
 ## Stack
 - A custom engine in **Rust**, graphics on **Vulkan** (`ash`). The decision and its reasons: [docs/decisions/0001-rust-vulkan-own-engine.md](docs/decisions/0001-rust-vulkan-own-engine.md)
@@ -47,7 +47,7 @@ Fly over the generated terrain:
 | F3 | show or hide the metrics panel |
 | Esc | quit |
 
-Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--help` lists the options.
+Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--help` lists the options.
 
 ## Frame metrics
 A translucent panel in the top-left corner of the window shows live figures over the last ten seconds, refreshed twice a second: average FPS, the 1% and 0.1% lows (the average FPS of the slowest 1% and 0.1% of the frames, so they show stutter), the frame time, the time the game spent producing a frame, the GPU time (an upper bound, measured with timestamp queries) and how many chunks and triangles are drawn. F3 hides it. A summary of the whole run is printed when the game exits. The definitions are in `crates/vox-game/src/metrics.rs` and decision 0008.
