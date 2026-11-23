@@ -658,7 +658,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("Blocks: {} registered", content.registry.len());
+    for warning in &content.warnings {
+        eprintln!("warning: {warning}");
+    }
+    println!(
+        "Content: {} blocks, {} textures",
+        content.registry.len(),
+        content.textures.layer_count
+    );
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
         Err(error) => {

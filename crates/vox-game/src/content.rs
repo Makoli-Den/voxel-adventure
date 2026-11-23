@@ -14,6 +14,7 @@
 use std::error::Error;
 use std::fmt;
 
+use vox_content::{BlockTextures, Warning};
 use vox_resources::PackStack;
 use vox_world::{BlockId, BlockRegistry, TerrainBlocks};
 
@@ -99,6 +100,10 @@ pub struct Content {
     pub terrain: TerrainBlocks,
     /// The block the place key puts down.
     pub place_block: BlockId,
+    /// The pixels of every block texture. Nothing draws them yet (steps S6 and S7).
+    pub textures: BlockTextures,
+    /// Textures that could not be used and were replaced by the missing picture.
+    pub warnings: Vec<Warning>,
 }
 
 impl Content {
@@ -107,8 +112,7 @@ impl Content {
     /// # Errors
     /// [`ContentError`] if the blocks file is missing or broken, or a needed block is not in it.
     pub fn new(stack: &PackStack) -> Result<Self, ContentError> {
-        // The texture ids per layer are for the texture loader (step S5); not used yet.
-        let (registry, _textures) = vox_content::load_blocks(stack)?;
+        let (registry, textures, warnings) = vox_content::load_content(stack)?;
         for (name, expected) in PALETTE_IDS {
             let found = registry.id(name).ok_or(ContentError::MissingBlock(name))?;
             if found != expected {
@@ -130,6 +134,8 @@ impl Content {
             registry,
             terrain,
             place_block,
+            textures,
+            warnings,
         })
     }
 }

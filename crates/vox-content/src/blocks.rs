@@ -11,6 +11,7 @@ use vox_resources::{NAMESPACE_SEPARATOR, PATH_SEPARATOR, PackStack, ResourceId};
 use vox_world::{BlockRegistry, Face, TextureLayer};
 
 use crate::error::ContentError;
+use crate::textures::MAX_LAYERS;
 
 /// Resource id of the blocks file. A pack that has this file replaces the whole list.
 pub const BLOCKS_FILE: &str = "base:blocks.json";
@@ -19,8 +20,8 @@ pub const BLOCKS_FILE: &str = "base:blocks.json";
 /// changes in a way an old reader could not understand.
 pub const BLOCKS_FORMAT: u32 = 1;
 
-/// The name of the texture of layer 0, the "missing texture". The renderer generates that
-/// picture in code (step S5), so no pack has a file by this id; it only fills index 0 of the
+/// The name of the texture of layer 0, the "missing texture". `build_textures` generates that
+/// picture in code, so no pack has a file by this id; it only fills index 0 of the
 /// texture list so that an index in the list is a [`TextureLayer`].
 pub const MISSING_TEXTURE: &str = "core:textures/missing.png";
 
@@ -102,7 +103,11 @@ impl Layers {
         if let Some(layer) = self.by_id.get(id) {
             return Some(*layer);
         }
-        let layer = TextureLayer(u16::try_from(self.textures.len()).ok()?);
+        if self.textures.len() >= MAX_LAYERS {
+            return None;
+        }
+        // Below MAX_LAYERS (256), so the number fits u16.
+        let layer = TextureLayer(self.textures.len() as u16);
         self.textures.push(id.clone());
         self.by_id.insert(id.clone(), layer);
         Some(layer)
@@ -551,5 +556,26 @@ mod tests {
     #[test]
     fn the_missing_texture_id_is_a_valid_resource_id() {
         assert!(ResourceId::parse(MISSING_TEXTURE).is_ok());
+    }
+
+    /// A blocks file with `count` blocks, each with its own texture.
+    fn file_with_textures(count: usize) -> String {
+        let blocks: Vec<String> = (0..count)
+            .map(|i| block(&format!("b{i}"), &format!(r#""all": "base:t{i}.png""#)))
+            .collect();
+        file_of(&blocks)
+    }
+
+    #[test]
+    fn the_layer_cap_is_enforced_exactly() {
+        // Layer 0 is the missing texture, so MAX_LAYERS - 1 distinct textures fit.
+        let (_, textures) = load(&file_with_textures(MAX_LAYERS - 1)).unwrap();
+        assert_eq!(textures.len(), MAX_LAYERS);
+        let error = load(&file_with_textures(MAX_LAYERS)).unwrap_err();
+        assert!(
+            matches!(error, ContentError::TooManyTextures { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains(&MAX_LAYERS.to_string()));
     }
 }
