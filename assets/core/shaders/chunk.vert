@@ -22,10 +22,9 @@ layout(location = 0) out vec3 v_color;
 // darkest, and every side differs, so block edges read clearly without lighting.
 const float FACE_SHADE[6] = float[6](0.80, 0.65, 1.00, 0.50, 0.90, 0.72);
 
-// Temporary base colors for block ids 0..3, until textures and the block registry
-// exist. The ids must match the ones the demo scene uses (vox-game's demo module:
-// 1 grass, 2 dirt, 3 stone); keep them in step with vox-world's terrain ids when
-// those appear. Id 0 is air and never meshed.
+// Temporary base colors, until textures are used (decision 0013). The palette is indexed
+// by the registry id, which the registration order of BASE_BLOCKS in vox-game's content.rs
+// fixes (1 grass, 2 dirt, 3 stone); keep the two in step. Id 0 is air and never meshed.
 const vec3 PALETTE[4] = vec3[4](
     vec3(1.00, 0.00, 1.00), // air (unused)
     vec3(0.36, 0.66, 0.24), // 1: grass
@@ -38,6 +37,6 @@ const vec3 UNKNOWN = vec3(1.00, 0.00, 1.00);
 
 void main() {
     gl_Position = draw.view_projection * vec4(vec3(in_pos_face.xyz) + draw.chunk_origin.xyz, 1.0);
-    vec3 base = (in_block >= 1u && in_block <= 3u) ? PALETTE[in_block] : UNKNOWN;
+    vec3 base = (in_block >= 1u && in_block < uint(PALETTE.length())) ? PALETTE[in_block] : UNKNOWN;
     v_color = base * FACE_SHADE[in_pos_face.w];
 }

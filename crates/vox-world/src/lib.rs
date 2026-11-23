@@ -8,6 +8,7 @@ mod chunk;
 mod chunk_pos;
 mod mesh;
 mod raycast;
+mod registry;
 mod terrain;
 mod world;
 
@@ -19,5 +20,6 @@ pub use mesh::{
     build_mesh_with_neighbours_into,
 };
 pub use raycast::{RayHit, raycast};
-pub use terrain::{DIRT, GRASS, MAX_SURFACE, MIN_SURFACE, STONE, generate_chunk, generate_terrain};
+pub use registry::{AIR_NAME, BlockRegistry, FaceTextures, RegistryError, TextureLayer};
+pub use terrain::{MAX_SURFACE, MIN_SURFACE, TerrainBlocks, generate_chunk, generate_terrain};
 pub use world::{ChangedChunks, MAX_CHANGED_CHUNKS, Neighbours, World};

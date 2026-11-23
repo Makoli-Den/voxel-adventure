@@ -455,10 +455,16 @@ pub(crate) fn naive_mesh(chunk: &Chunk, neighbours: &Neighbours<'_>) -> ChunkMes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::TEST_BLOCKS;
     use crate::world::World;
     use crate::{ChunkPos, generate_chunk};
 
     const STONE: BlockId = BlockId(1);
+
+    /// The terrain of `seed` at the origin, with the ids 1, 2 and 3 for its blocks.
+    fn terrain_chunk(seed: u32) -> Chunk {
+        crate::generate_terrain(seed, &TEST_BLOCKS)
+    }
 
     fn pos(x: usize, y: usize, z: usize) -> LocalPos {
         LocalPos::new(x, y, z).expect("test coordinates are known to be inside the chunk")
@@ -591,8 +597,8 @@ mod tests {
             single_block_chunk(10, 10, 10),
             solid,
             checkerboard,
-            crate::generate_terrain(1),
-            crate::generate_terrain(2),
+            terrain_chunk(1),
+            terrain_chunk(2),
         ];
         // Start from a mesh far bigger than any result but the checkerboard, so stale
         // contents would show if they leaked through.
@@ -606,7 +612,7 @@ mod tests {
     #[test]
     fn build_into_keeps_capacity() {
         let chunk = single_block_chunk(10, 10, 10);
-        let mut mesh = build_mesh(&crate::generate_terrain(1));
+        let mut mesh = build_mesh(&terrain_chunk(1));
         let capacity = mesh.vertices.capacity();
         build_mesh_into(&chunk, &mut mesh);
         assert_eq!(mesh.vertices.len(), 24);
@@ -666,8 +672,8 @@ mod tests {
             single_block_chunk(10, 10, 10),
             solid_chunk(),
             checkerboard_chunk(),
-            crate::generate_terrain(1),
-            crate::generate_terrain(2),
+            terrain_chunk(1),
+            terrain_chunk(2),
         ] {
             let naive = naive_mesh(&chunk, &Neighbours::none());
             assert_eq!(
@@ -840,8 +846,7 @@ mod tests {
     #[test]
     fn greedy_covers_the_same_squares_on_terrain() {
         for seed in 1..=3 {
-            let (greedy, naive) =
-                assert_matches_naive(&crate::generate_terrain(seed), &Neighbours::none());
+            let (greedy, naive) = assert_matches_naive(&terrain_chunk(seed), &Neighbours::none());
             assert!(greedy < naive);
         }
     }
@@ -1078,7 +1083,7 @@ mod tests {
             for z in -1..=1 {
                 for x in -1..=1 {
                     let pos = ChunkPos::new(x, y, z);
-                    world.insert(pos, generate_chunk(1, pos));
+                    world.insert(pos, generate_chunk(1, pos, &TEST_BLOCKS));
                 }
             }
         }

@@ -16,7 +16,7 @@ A voxel game: the open world, freedom of action and world generation of Minecraf
 assets/          the built-in resource pack; a file `assets/<namespace>/<path>` is the resource `namespace:path`
   core/shaders/  built-in GLSL shaders (`core:shaders/chunk.vert`, `chunk.frag`, `overlay.vert`, `overlay.frag`), read and compiled when the game starts
 crates/
-  vox-world/     blocks, chunks, the world of chunks, meshing and demo terrain; knows nothing about rendering, mods or networking
+  vox-world/     blocks and the block registry, chunks, the world of chunks, meshing and demo terrain; knows nothing about rendering, mods or networking
   vox-resources/ virtual resource file system: `namespace:path` ids and layered packs; no dependencies
   vox-render/    rendering behind the `Renderer` trait; the only crate that touches Vulkan
   vox-game/      the executable: window, event loop, wires the layers together

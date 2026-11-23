@@ -264,7 +264,10 @@ pub fn is_solid(world: &World, position: [i32; 3]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use vox_world::{CHUNK_SIZE, Chunk, LocalPos, STONE};
+    use vox_world::{BlockId, CHUNK_SIZE, Chunk, LocalPos};
+
+    /// Any solid block: physics only asks whether a cell is air.
+    const SOLID: BlockId = BlockId(3);
 
     use super::*;
 
@@ -288,7 +291,7 @@ mod tests {
                             if fill(wx, wy, wz) {
                                 if let Some(pos) = LocalPos::new(x as usize, y as usize, z as usize)
                                 {
-                                    chunk.set(pos, STONE);
+                                    chunk.set(pos, SOLID);
                                 }
                             }
                         }
