@@ -382,12 +382,18 @@ mod tests {
         );
     }
 
+    /// Quads of the greedy mesh of `generate_terrain(1)`.
+    const GREEDY_QUADS: usize = 760;
+
     #[test]
     fn terrain_mesh_has_the_pinned_number_of_quads() {
-        // The exact count for seed 1, so a change in the terrain or the mesher shows up.
-        // Recompute it when either changes on purpose.
-        let mesh = build_mesh(&generate_terrain(1));
-        assert_eq!(mesh.quad_count(), 4848);
+        // The exact counts for seed 1, so a change in the terrain or the mesher shows up.
+        // Recompute them when either changes on purpose. The naive mesher gives one quad
+        // per visible face; the greedy one merges them.
+        let chunk = generate_terrain(1);
+        let naive = crate::mesh::naive_mesh(&chunk, &crate::Neighbours::none());
+        assert_eq!(naive.quad_count(), 4848);
+        assert_eq!(build_mesh(&chunk).quad_count(), GREEDY_QUADS);
     }
 
     /// The most the surface height can change between two adjacent columns. The noise has

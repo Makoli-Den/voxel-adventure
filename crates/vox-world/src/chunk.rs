@@ -11,6 +11,26 @@ pub const CHUNK_SIZE: usize = 32;
 /// Number of blocks in a chunk.
 pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
+/// Distance in the flat block array between two blocks that differ by one along the
+/// axis X, Y or Z. Layers go along `y`, then `z` within a layer, then `x`. The mesher
+/// walks the array with these strides, so they and [`LocalPos`]'s index come from here.
+pub(crate) const AXIS_STRIDES: [usize; 3] = {
+    let mut strides = [0; 3];
+    strides[AXIS_X] = 1;
+    strides[AXIS_Y] = CHUNK_SIZE * CHUNK_SIZE;
+    strides[AXIS_Z] = CHUNK_SIZE;
+    strides
+};
+
+/// Index of the X axis in per-axis arrays such as [`AXIS_STRIDES`] or a coordinate triple.
+pub(crate) const AXIS_X: usize = 0;
+
+/// Index of the Y axis in per-axis arrays.
+pub(crate) const AXIS_Y: usize = 1;
+
+/// Index of the Z axis in per-axis arrays.
+pub(crate) const AXIS_Z: usize = 2;
+
 /// Position of a block inside a chunk.
 ///
 /// Exists only with valid coordinates (each less than [`CHUNK_SIZE`]), so accessing
@@ -83,19 +103,29 @@ impl LocalPos {
         (0..CHUNK_VOLUME).map(Self::from_index)
     }
 
-    /// Inverse of [`LocalPos::index`]. The masks keep every coordinate below 32.
+    /// Inverse of [`LocalPos::index`], derived from [`AXIS_STRIDES`] so the layout is
+    /// written in one place. The remainder keeps every coordinate below `CHUNK_SIZE`, so
+    /// the cast to `u8` cannot lose bits.
     const fn from_index(index: usize) -> Self {
         Self {
-            x: (index & (CHUNK_SIZE - 1)) as u8,
-            z: ((index / CHUNK_SIZE) & (CHUNK_SIZE - 1)) as u8,
-            y: ((index / (CHUNK_SIZE * CHUNK_SIZE)) & (CHUNK_SIZE - 1)) as u8,
+            x: coordinate_of(index, AXIS_X),
+            y: coordinate_of(index, AXIS_Y),
+            z: coordinate_of(index, AXIS_Z),
         }
     }
 
     /// Index of the block in the chunk's flat array. Layers go along `y`, then `z` within a layer, then `x`.
     const fn index(self) -> usize {
-        (self.y as usize * CHUNK_SIZE + self.z as usize) * CHUNK_SIZE + self.x as usize
+        self.x as usize * AXIS_STRIDES[AXIS_X]
+            + self.y as usize * AXIS_STRIDES[AXIS_Y]
+            + self.z as usize * AXIS_STRIDES[AXIS_Z]
     }
+}
+
+/// Coordinate along `axis` of the block at `index` in the flat array. The remainder keeps
+/// it below `CHUNK_SIZE`, so the cast to `u8` cannot lose bits.
+const fn coordinate_of(index: usize, axis: usize) -> u8 {
+    (index / AXIS_STRIDES[axis] % CHUNK_SIZE) as u8
 }
 
 /// A chunk stores its blocks in a single flat array.
@@ -121,6 +151,12 @@ impl Chunk {
         self.blocks[pos.index()]
     }
 
+    /// All blocks in storage order, indexed by [`AXIS_STRIDES`]. For the mesher, which
+    /// walks whole slices and cannot afford a position check per block.
+    pub(crate) fn blocks(&self) -> &[BlockId] {
+        &self.blocks
+    }
+
     /// Sets the block at the given position.
     pub fn set(&mut self, pos: LocalPos, block: BlockId) {
         self.blocks[pos.index()] = block;
@@ -139,6 +175,16 @@ mod tests {
 
     fn pos(x: usize, y: usize, z: usize) -> LocalPos {
         LocalPos::new(x, y, z).expect("test coordinates are known to be inside the chunk")
+    }
+
+    #[test]
+    fn blocks_are_laid_out_by_the_axis_strides() {
+        let mut chunk = Chunk::new();
+        chunk.set(pos(3, 4, 5), BlockId(7));
+        let index = 3 * AXIS_STRIDES[AXIS_X] + 4 * AXIS_STRIDES[AXIS_Y] + 5 * AXIS_STRIDES[AXIS_Z];
+        assert_eq!(chunk.blocks()[index], BlockId(7));
+        assert_eq!(chunk.blocks().len(), CHUNK_VOLUME);
+        assert_eq!(chunk.blocks().iter().filter(|b| !b.is_air()).count(), 1);
     }
 
     #[test]
