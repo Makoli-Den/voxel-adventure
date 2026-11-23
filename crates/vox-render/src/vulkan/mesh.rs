@@ -1,8 +1,8 @@
-//! Chunk meshes on the GPU: the vertex input state and the buffer that holds one mesh.
+//! Chunk meshes on the GPU: the buffer that holds one mesh.
 //!
-//! The byte layout of a vertex is defined once, in `crate::interface`; this module
-//! serializes [`ChunkVertex`] into it and turns it into Vulkan vertex input state.
-//! Indices are little-endian `u32` and follow the vertices in the same buffer.
+//! The byte layout of a vertex is defined once, in `crate::interface::chunk`; this
+//! module serializes [`ChunkVertex`] into it. Indices are little-endian `u32` and follow
+//! the vertices in the same buffer.
 
 use ash::vk;
 use vox_world::{ChunkMesh, ChunkVertex};
@@ -10,35 +10,7 @@ use vox_world::{ChunkMesh, ChunkVertex};
 use super::buffer::Buffer;
 use super::gpu::Gpu;
 use crate::RenderError;
-use crate::interface::{AttributeFormat, VERTEX_ATTRIBUTES, VERTEX_STRIDE};
-
-/// The vertex buffer binding: one tightly packed vertex after another.
-pub fn vertex_bindings() -> [vk::VertexInputBindingDescription; 1] {
-    [vk::VertexInputBindingDescription {
-        binding: 0,
-        stride: VERTEX_STRIDE,
-        input_rate: vk::VertexInputRate::VERTEX,
-    }]
-}
-
-/// The vertex attributes, built from [`VERTEX_ATTRIBUTES`].
-pub fn vertex_attributes() -> [vk::VertexInputAttributeDescription; VERTEX_ATTRIBUTES.len()] {
-    VERTEX_ATTRIBUTES.map(|attribute| vk::VertexInputAttributeDescription {
-        location: attribute.location,
-        binding: 0,
-        format: vk_format(attribute.format),
-        offset: attribute.offset,
-    })
-}
-
-/// The Vulkan format of an attribute. Both are required vertex formats in Vulkan 1.0;
-/// `R8G8B8_UINT` is not, which is why the position is read as four bytes.
-fn vk_format(format: AttributeFormat) -> vk::Format {
-    match format {
-        AttributeFormat::Uint8x4 => vk::Format::R8G8B8A8_UINT,
-        AttributeFormat::Uint16 => vk::Format::R16_UINT,
-    }
-}
+use crate::interface::chunk::VERTEX_STRIDE;
 
 /// One chunk mesh in a single GPU buffer, ready to draw: the vertices first, then the
 /// `u32` indices from [`Self::index_offset`] on.
@@ -93,6 +65,11 @@ impl GpuMesh {
     /// How many indices to draw.
     pub fn index_count(&self) -> u32 {
         self.index_count
+    }
+
+    /// Gives up the mesh, keeping only its buffer, so it can be retired with the others.
+    pub fn into_buffer(self) -> Buffer {
+        self.buffer
     }
 }
 
@@ -193,14 +170,6 @@ mod tests {
     #[test]
     fn vertex_bytes_are_position_face_block_little_endian() {
         assert_eq!(vertex_bytes(&[sample()]), [1, 2, 32, 5, 0x02, 0x03]);
-    }
-
-    #[test]
-    fn vulkan_attributes_follow_the_interface() {
-        let attributes = vertex_attributes();
-        assert_eq!(attributes[0].format, vk::Format::R8G8B8A8_UINT);
-        assert_eq!(attributes[1].format, vk::Format::R16_UINT);
-        assert_eq!((attributes[1].location, attributes[1].offset), (1, 4));
     }
 
     #[test]

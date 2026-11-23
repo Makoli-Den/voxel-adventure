@@ -1,17 +1,18 @@
-//! Checks that a shader only asks for what the chunk pipeline provides.
+//! Checks that a shader only asks for what its pipeline provides.
 //!
 //! naga's validator proves a module is well formed, but not that it fits our pipeline.
 //! A shader that declares a larger push-constant block, an unknown vertex input or a
 //! descriptor resource would make pipeline creation invalid, which Vulkan does not
 //! have to report and a driver may crash on. These checks turn that into an error.
 //!
-//! Checked: descriptor resources (none exist), push constants (vertex stage only, at
-//! most `PUSH_CONSTANT_SIZE` bytes), vertex inputs (locations and exact types from
-//! `crate::interface`, built-ins limited to vertex and instance index), and every
-//! fragment input location against a vertex output of the same scalar or vector type.
-//! Not checked: interpolation qualifiers, and fragment outputs (writes to a location
-//! without a color attachment are discarded, which is valid). Matrices, arrays and
-//! structs are rejected as fragment inputs rather than compared.
+//! Every check compares against the pipeline's own [`PipelineInterface`] from
+//! `crate::interface`. Checked: descriptor resources (none exist), push constants (only
+//! in the interface's stage, at most its size in bytes), vertex inputs (locations and
+//! exact types of the interface's attributes, built-ins limited to vertex and instance
+//! index), and every fragment input location against a vertex output of the same scalar
+//! or vector type. Not checked: interpolation qualifiers, and fragment outputs (writes
+//! to a location without a color attachment are discarded, which is valid). Matrices,
+//! arrays and structs are rejected as fragment inputs rather than compared.
 
 use naga::proc::Layouter;
 use naga::{
@@ -19,7 +20,7 @@ use naga::{
     TypeInner,
 };
 
-use crate::interface::{self, PUSH_CONSTANT_SIZE, VERTEX_ATTRIBUTES};
+use crate::interface::{PipelineInterface, Stage};
 
 /// A scalar or vector type: the only types the checks compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,12 +32,16 @@ struct Shape {
 /// A value crossing a stage boundary: its binding and type.
 type Io = (Binding, Handle<Type>);
 
-/// Checks one stage's module against what the pipeline provides for that stage.
-pub(super) fn check_stage(module: &Module, stage: ShaderStage) -> Result<(), String> {
+/// Checks one stage's module against what `interface` provides for that stage.
+pub(super) fn check_stage(
+    module: &Module,
+    stage: ShaderStage,
+    interface: &PipelineInterface,
+) -> Result<(), String> {
     check_no_resources(module)?;
-    check_push_constants(module, stage)?;
+    check_push_constants(module, stage, interface)?;
     if stage == ShaderStage::Vertex {
-        check_vertex_inputs(module)?;
+        check_vertex_inputs(module, interface)?;
     }
     Ok(())
 }
@@ -91,18 +96,34 @@ fn check_no_resources(module: &Module) -> Result<(), String> {
     Ok(())
 }
 
-/// Push constants exist only for the vertex stage, and only `PUSH_CONSTANT_SIZE` bytes.
-fn check_push_constants(module: &Module, stage: ShaderStage) -> Result<(), String> {
-    let size = push_constant_size(module)?;
-    match size {
+/// Push constants exist only in the interface's stage, and only as many bytes as it has.
+fn check_push_constants(
+    module: &Module,
+    stage: ShaderStage,
+    interface: &PipelineInterface,
+) -> Result<(), String> {
+    let provided = interface.push_constants;
+    match push_constant_size(module)? {
         None => Ok(()),
-        Some(_) if stage != ShaderStage::Vertex => Err(String::from(
-            "push constants are only available in the vertex stage",
+        Some(_) if pipeline_stage(stage) != Some(provided.stage) => Err(format!(
+            "push constants are only available in the {} stage",
+            provided.stage.name()
         )),
-        Some(size) if size > PUSH_CONSTANT_SIZE => Err(format!(
-            "push constants use {size} bytes, the pipeline provides {PUSH_CONSTANT_SIZE} bytes"
+        Some(size) if size > provided.size => Err(format!(
+            "push constants use {size} bytes, the pipeline provides {} bytes",
+            provided.size
         )),
         Some(_) => Ok(()),
+    }
+}
+
+/// The pipeline stage a naga stage stands for, or `None` for the stages no pipeline of
+/// the renderer has (compute, task and mesh shaders), which then match no interface.
+fn pipeline_stage(stage: ShaderStage) -> Option<Stage> {
+    match stage {
+        ShaderStage::Vertex => Some(Stage::Vertex),
+        ShaderStage::Fragment => Some(Stage::Fragment),
+        ShaderStage::Compute | ShaderStage::Task | ShaderStage::Mesh => None,
     }
 }
 
@@ -121,7 +142,7 @@ fn push_constant_size(module: &Module) -> Result<Option<u32>, String> {
 }
 
 /// Vertex inputs must be attributes the pipeline feeds, declared with their exact type.
-fn check_vertex_inputs(module: &Module) -> Result<(), String> {
+fn check_vertex_inputs(module: &Module, interface: &PipelineInterface) -> Result<(), String> {
     let entry = entry_point(module, ShaderStage::Vertex)?;
     for (binding, ty) in inputs(module, entry) {
         match binding {
@@ -129,16 +150,23 @@ fn check_vertex_inputs(module: &Module) -> Result<(), String> {
             Binding::BuiltIn(other) => {
                 return Err(format!("vertex input built-in {other:?} is not available"));
             }
-            Binding::Location { location, .. } => check_attribute(location, shape(module, ty))?,
+            Binding::Location { location, .. } => {
+                check_attribute(interface, location, shape(module, ty))?;
+            }
         }
     }
     Ok(())
 }
 
 /// Checks one vertex input against the attribute the pipeline feeds at `location`.
-fn check_attribute(location: u32, declared: Option<Shape>) -> Result<(), String> {
-    let Some(attribute) = interface::vertex_attribute(location) else {
-        let provided: Vec<String> = VERTEX_ATTRIBUTES
+fn check_attribute(
+    interface: &PipelineInterface,
+    location: u32,
+    declared: Option<Shape>,
+) -> Result<(), String> {
+    let Some(attribute) = interface.attribute(location) else {
+        let provided: Vec<String> = interface
+            .attributes
             .iter()
             .map(|a| a.location.to_string())
             .collect();
@@ -147,10 +175,9 @@ fn check_attribute(location: u32, declared: Option<Shape>) -> Result<(), String>
             provided.join(", ")
         ));
     };
-    // Every attribute format is an unsigned integer format, read as 32-bit unsigned.
     let expected = Shape {
         components: attribute.format.components(),
-        scalar: Scalar::U32,
+        scalar: attribute.format.shader_scalar(),
     };
     if declared != Some(expected) {
         return Err(format!(

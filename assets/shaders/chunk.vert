@@ -4,7 +4,7 @@
 // the camera matrix and colors it by block and face. Vulkan clip space: x right,
 // y down, depth 0..1.
 
-// Pushed once per chunk; the layout is fixed by the renderer (vox-render's interface.rs).
+// Pushed once per chunk; the layout is fixed by the renderer (vox-render's interface/chunk.rs).
 layout(push_constant) uniform Draw {
     mat4 view_projection;
     // xyz: world position of the chunk's corner (0, 0, 0) in blocks; w is 0.

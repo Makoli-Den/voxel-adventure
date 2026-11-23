@@ -10,37 +10,44 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vox_world::{ChunkMesh, ChunkPos};
 
+use super::buffer::Buffer;
 use super::context::{Context, Surface};
 use super::depth;
 use super::frames::{FRAMES_IN_FLIGHT, FrameSlot, Frames};
 use super::gpu::Gpu;
 use super::mesh::GpuMesh;
-use super::pipeline::Pipeline;
+use super::overlay::GpuOverlay;
+use super::pipeline::{self, Pipeline};
 use super::render_pass::RenderPass;
 use super::retired::{self, Retired};
 use super::swapchain::{self, Swapchain};
 use super::timestamps;
-use crate::interface::{CHUNK_ORIGIN_OFFSET, PUSH_CONSTANT_SIZE};
-use crate::{RenderError, RenderStats, Renderer};
+use crate::interface::chunk::{CHUNK_ORIGIN_OFFSET, PUSH_CONSTANT_SIZE};
+use crate::overlay::window_size_bytes;
+use crate::{OverlayRect, RenderError, RenderStats, Renderer};
 
 /// The sky: everything the meshes do not cover is cleared to this color.
 const SKY_COLOR: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
 
 /// Draws into a window with Vulkan.
 ///
-/// For now a frame is the chunk meshes in front of a plain sky color.
+/// A frame is the chunk meshes in front of a plain sky color, then the overlay on top.
 pub struct VulkanRenderer {
     // Rust drops fields in declaration order, so each object comes before the
-    // ones it depends on: buffers, framebuffers (in the swapchain) and the pipeline
+    // ones it depends on: buffers, framebuffers (in the swapchain) and the pipelines
     // before the render pass, everything before the device. Do not reorder.
     frames: Frames,
     /// The meshes drawn every frame, one per chunk that has something to draw.
     meshes: HashMap<ChunkPos, GpuMesh>,
-    /// Replaced and removed meshes that frames in flight may still read.
-    retired: Retired<GpuMesh>,
+    /// The overlay drawn over every frame, `None` while there is none.
+    overlay: Option<GpuOverlay>,
+    /// Buffers of replaced and removed meshes and overlays that frames in flight may
+    /// still read.
+    retired: Retired<Buffer>,
     /// `None` while the window has no area to draw into (minimized).
     swapchain: Option<Swapchain>,
-    pipeline: Pipeline,
+    chunk_pipeline: Pipeline,
+    overlay_pipeline: Pipeline,
     render_pass: RenderPass,
     gpu: Gpu,
     surface: Surface,
@@ -86,7 +93,10 @@ impl VulkanRenderer {
         let format = swapchain::surface_format(&surface, &gpu)?;
         let depth_format = depth::depth_format(&context, &gpu)?;
         let render_pass = RenderPass::new(gpu.device(), format, depth_format)?;
-        let pipeline = Pipeline::new(gpu.device(), &render_pass, shader_dir)?;
+        let chunk_pipeline = Pipeline::chunk(gpu.device(), &render_pass, shader_dir)?;
+        let blending_supported = pipeline::supports_blending(&context, &gpu, format.format);
+        let overlay_pipeline =
+            Pipeline::overlay(gpu.device(), &render_pass, shader_dir, blending_supported)?;
         let swapchain = Swapchain::new(
             &context,
             &surface,
@@ -104,10 +114,12 @@ impl VulkanRenderer {
         Ok(Self {
             frames,
             meshes: HashMap::new(),
+            overlay: None,
             retired: Retired::new(),
             needs_recreate: swapchain.is_none(),
             swapchain,
-            pipeline,
+            chunk_pipeline,
+            overlay_pipeline,
             render_pass,
             gpu,
             surface,
@@ -141,7 +153,7 @@ impl VulkanRenderer {
         // SAFETY: the device is alive. Waiting for idle makes it safe to destroy the old
         // swapchain with its framebuffers and views, and the per-image semaphores below.
         unsafe { self.gpu.device().device_wait_idle()? };
-        // Idle means every submitted frame finished, so no retired mesh is in use.
+        // Idle means every submitted frame finished, so no retired buffer is in use.
         self.retired.release(self.frames.submitted());
         self.swapchain = Some(new); // the old swapchain is destroyed here
         // SAFETY: the GPU is idle, see above.
@@ -151,11 +163,11 @@ impl VulkanRenderer {
 
     /// Records one frame into the command buffer of `slot`: the render pass clears the
     /// swapchain image `image_index` to the sky color and the depth buffer to the far
-    /// plane, then the chunk meshes are drawn. The render pass also moves the image to the
-    /// present layout, so no barriers are needed. If the slot has a query pool, a
-    /// timestamp is written before the first and after the last command.
+    /// plane, then the chunk meshes are drawn, then the overlay over them. The render pass
+    /// also moves the image to the present layout, so no barriers are needed. If the slot
+    /// has a query pool, a timestamp is written before the first and after the last command.
     ///
-    /// Returns the draw counts of the recorded frame.
+    /// Returns the draw counts of the recorded frame (chunk meshes only).
     // HOT PATH: runs every frame. Everything lives on the stack, nothing is allocated.
     fn record_frame(
         &self,
@@ -193,11 +205,13 @@ impl VulkanRenderer {
         // SAFETY: the command buffer belongs to this device and is not in use (the frame's
         // fence was waited on; beginning implicitly resets it because the pool allows resets).
         // The framebuffer belongs to the acquired image and was built for this render pass,
-        // which the pipeline was built for too. Viewport and scissor are set before the
-        // draws. The matrix push (bytes 0..64, vertex stage) lies inside the layout's only
-        // range, and it stays valid for every draw below because they all use this
+        // which both pipelines were built for too. Viewport and scissor are set before the
+        // draws; both pipelines declare them dynamic, so binding the second keeps them. The
+        // matrix push (bytes 0..64, vertex stage) lies inside the chunk layout's only
+        // range, and it stays valid for every mesh draw because they all use this
         // pipeline's layout. The meshes live in `self`; a replaced mesh moves to `retired`
-        // and is freed only after the frames that may use it have finished. The query pool
+        // and is freed only after the frames that may use it have finished. The overlay
+        // draw follows all mesh draws, see `record_overlay`. The query pool
         // is a timestamp pool with the frame's queries; it exists only if the queue writes
         // timestamps, and the fence wait proved the previous frame in this slot, its last
         // user, finished. Its reset and both writes lie outside the render pass.
@@ -213,12 +227,12 @@ impl VulkanRenderer {
                 device.cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
-                    self.pipeline.handle(),
+                    self.chunk_pipeline.handle(),
                 );
                 device.cmd_push_constants(
                     command_buffer,
-                    self.pipeline.layout(),
-                    vk::ShaderStageFlags::VERTEX,
+                    self.chunk_pipeline.layout(),
+                    self.chunk_pipeline.push_constant_stages(),
                     0,
                     &matrix_bytes(&self.camera),
                 );
@@ -226,6 +240,9 @@ impl VulkanRenderer {
                     self.record_mesh(command_buffer, pos, mesh);
                     drawn.count_chunk_draw(mesh.index_count());
                 }
+            }
+            if let Some(overlay) = &self.overlay {
+                self.record_overlay(command_buffer, overlay, extent);
             }
             device.cmd_end_render_pass(command_buffer);
             if let Some(pool) = slot.timestamps {
@@ -255,8 +272,8 @@ impl VulkanRenderer {
         unsafe {
             device.cmd_push_constants(
                 command_buffer,
-                self.pipeline.layout(),
-                vk::ShaderStageFlags::VERTEX,
+                self.chunk_pipeline.layout(),
+                self.chunk_pipeline.push_constant_stages(),
                 CHUNK_ORIGIN_OFFSET,
                 &origin_bytes(pos.origin()),
             );
@@ -271,20 +288,63 @@ impl VulkanRenderer {
         }
     }
 
-    /// Parks a replaced or removed mesh until no frame in flight can read it.
-    fn retire(&mut self, mesh: GpuMesh) {
-        self.retired.retire(mesh, self.frames.submitted());
+    /// Records the overlay: binds its pipeline, pushes the image size and draws every
+    /// rectangle in one call. Not counted in the frame's [`RenderStats`].
+    ///
+    /// # Safety
+    /// `command_buffer` must be recording inside the render pass both pipelines were
+    /// built for, after every mesh draw, with viewport and scissor set. `extent` must be
+    /// the size of the framebuffer being drawn. `overlay` must stay alive until the GPU
+    /// has finished the command buffer.
+    // HOT PATH: runs every frame while an overlay is shown; one bind of each kind, one
+    // 8-byte push and one draw, whatever the number of rectangles.
+    unsafe fn record_overlay(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        overlay: &GpuOverlay,
+        extent: vk::Extent2D,
+    ) {
+        let device = self.gpu.device();
+        let pipeline = &self.overlay_pipeline;
+        // SAFETY: the caller guarantees the recording state, the extent and the overlay
+        // lifetime. The pipeline, its layout and the buffer belong to this device. The
+        // push (bytes 0..8, the stages of the layout's only range) is made after binding
+        // this pipeline, so it does not depend on what the chunk layout left behind. The
+        // buffer was created with VERTEX usage and holds exactly `vertex_count` vertices
+        // of the stride the pipeline's binding declares, so the draw reads only inside it.
+        unsafe {
+            device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.handle(),
+            );
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline.layout(),
+                pipeline.push_constant_stages(),
+                0,
+                &window_size_bytes(extent.width, extent.height),
+            );
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[overlay.buffer()], &[0]);
+            device.cmd_draw(command_buffer, overlay.vertex_count(), 1, 0, 0);
+        }
+    }
+
+    /// Parks the buffer of a replaced or removed mesh or overlay until no frame in flight
+    /// can read it.
+    fn retire(&mut self, buffer: Buffer) {
+        self.retired.retire(buffer, self.frames.submitted());
         self.release_if_gpu_idle();
     }
 
-    /// Frees every retired mesh if a poll of the fences, without waiting, shows that all
+    /// Frees every retired buffer if a poll of the fences, without waiting, shows that all
     /// submitted frames finished. Otherwise leaves them for a later frame or poll.
     ///
-    /// The frame loop frees retired meshes after its fence wait, but while no frames are
+    /// The frame loop frees retired buffers after its fence wait, but while no frames are
     /// drawn (the game does not even call `render_frame` while the window is minimized)
-    /// that never happens. Polling here, where meshes are retired, keeps the list
+    /// that never happens. Polling here, where buffers are retired, keeps the list
     /// bounded by what changed since the GPU last went idle.
-    // HOT PATH: runs for every mesh change; two non-blocking fence queries.
+    // HOT PATH: runs for every mesh or overlay change; two non-blocking fence queries.
     fn release_if_gpu_idle(&mut self) {
         // An error (a lost device) proves nothing; `render_frame` reports it next time.
         let all_signaled = self.frames.all_fences_signaled().unwrap_or(false);
@@ -412,15 +472,24 @@ impl Renderer for VulkanRenderer {
             None => self.meshes.remove(&pos),
         };
         if let Some(old) = old {
-            self.retire(old);
+            self.retire(old.into_buffer());
         }
         Ok(())
     }
 
     fn remove_chunk_mesh(&mut self, pos: ChunkPos) {
         if let Some(old) = self.meshes.remove(&pos) {
-            self.retire(old);
+            self.retire(old.into_buffer());
         }
+    }
+
+    fn set_overlay(&mut self, rects: &[OverlayRect]) -> Result<(), RenderError> {
+        // Upload first: if it fails, the old overlay stays and keeps being drawn.
+        let new = GpuOverlay::new(&self.gpu, rects)?;
+        if let Some(old) = std::mem::replace(&mut self.overlay, new) {
+            self.retire(old.into_buffer());
+        }
+        Ok(())
     }
 
     fn set_camera(&mut self, view_projection: [[f32; 4]; 4]) {
@@ -438,7 +507,7 @@ impl Renderer for VulkanRenderer {
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         // SAFETY: the device is alive. Waiting for idle means no GPU work still uses the
-        // objects that the fields destroy next, retired meshes included. A failure here
+        // objects that the fields destroy next, retired buffers included. A failure here
         // cannot be handled in `drop`, and the process is shutting down anyway.
         unsafe {
             let _ = self.gpu.device().device_wait_idle();

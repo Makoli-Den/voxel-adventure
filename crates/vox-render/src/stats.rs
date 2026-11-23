@@ -11,7 +11,9 @@ pub(crate) const INDICES_PER_TRIANGLE: u32 = 3;
 
 /// What the renderer drew and how long the GPU took.
 ///
-/// Returned by [`crate::Renderer::stats`].
+/// Returned by [`crate::Renderer::stats`]. The counts cover the chunk meshes only: the
+/// overlay ([`crate::Renderer::set_overlay`]) adds no chunks, draw calls or triangles,
+/// though its GPU work is inside `gpu_time`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderStats {
     /// Chunk meshes drawn in the most recently recorded frame.
@@ -21,7 +23,8 @@ pub struct RenderStats {
     /// window image out of date) leaves the previous counts in place. Zero before the
     /// first frame and for a frame without any mesh.
     pub chunks_drawn: usize,
-    /// Draw calls in that frame (one per chunk today).
+    /// Draw calls of chunk meshes in that frame (one per chunk today); the overlay's draw
+    /// is not counted.
     pub draw_calls: usize,
     /// Triangles in that frame: the sum over its draws of the index count divided by
     /// three (the meshes are triangle lists), saturating at `u64::MAX`.

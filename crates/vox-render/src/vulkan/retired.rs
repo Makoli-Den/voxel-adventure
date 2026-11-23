@@ -1,9 +1,9 @@
 //! Deferred freeing: GPU resources that frames still in flight may read.
 //!
-//! When a chunk mesh is replaced or removed, frames that were already submitted can
-//! still draw its buffer. Waiting for the whole device to go idle on every change
-//! would stall the CPU and the GPU, so the old mesh is parked here instead, stamped
-//! with the frame number, and dropped once the fences prove no frame can use it.
+//! When a chunk mesh or the overlay is replaced or removed, frames that were already
+//! submitted can still draw its buffer. Waiting for the whole device to go idle on every
+//! change would stall the CPU and the GPU, so the old buffer is parked here instead,
+//! stamped with the frame number, and dropped once the fences prove no frame can use it.
 //!
 //! This module is pure bookkeeping, generic over what it holds, so the policy is
 //! unit tested without a GPU.
@@ -49,7 +49,7 @@ impl<T> Retired<T> {
     /// Drops every item that no unfinished frame can use, given that frames
     /// `0..completed` are known to be finished.
     // HOT PATH: runs every frame. With nothing retired it is one length check; otherwise
-    // one pass over a list that holds at most the meshes changed in the last few frames.
+    // one pass over a list that holds at most the buffers replaced in the last few frames.
     pub fn release(&mut self, completed: u64) {
         if !self.items.is_empty() {
             self.items.retain(|(stamp, _)| !can_free(*stamp, completed));
