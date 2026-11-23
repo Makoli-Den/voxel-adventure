@@ -6,6 +6,8 @@ use std::fmt;
 use vox_resources::{ResourceError, ResourceId};
 use vox_world::{Face, RegistryError};
 
+use crate::textures::MAX_LAYERS;
+
 /// Why content could not be loaded. Every variant names the file, and the block where one is
 /// involved, so the message alone says what to fix.
 #[derive(Debug)]
@@ -64,7 +66,7 @@ pub enum ContentError {
         /// The registry's reason.
         source: RegistryError,
     },
-    /// More distinct textures than a texture layer number can hold.
+    /// More distinct textures than [`MAX_LAYERS`] (the array layers every device has).
     TooManyTextures {
         /// The blocks file.
         file: ResourceId,
@@ -108,7 +110,10 @@ impl fmt::Display for ContentError {
                 source,
             } => write!(f, "blocks file `{file}`, block `{block}`: {source}"),
             Self::TooManyTextures { file } => {
-                write!(f, "blocks file `{file}`: too many different textures")
+                write!(
+                    f,
+                    "blocks file `{file}`: more than {MAX_LAYERS} different textures"
+                )
             }
         }
     }

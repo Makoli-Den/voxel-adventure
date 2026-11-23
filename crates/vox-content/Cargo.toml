@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+# PNG decoding; the crate has no default features to switch off, so the tree is already minimal.
+png = "0.18.1"
 vox-resources = { path = "../vox-resources" }
 vox-world = { path = "../vox-world" }
 
