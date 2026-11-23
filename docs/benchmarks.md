@@ -297,32 +297,38 @@ change, run just before.
 
 | Case | Per-face mesher | Greedy mesher | Quads before / after |
 |---|---|---|---|
-| `mesh/terrain_seed_1` | 262.3 us (249.9 - 322.5) | 188.1 us (186.7 - 189.7) | 4,848 / 760 |
-| `mesh_reused/terrain_seed_1` | 224.9 us (220.8 - 294.7) | 181.5 us (180.8 - 183.5) | 4,848 / 760 |
+| `mesh/terrain_seed_1` | 262.3 us (249.9 - 322.5) | 185.4 us (182.6 - 186.4) | 4,848 / 760 |
+| `mesh_reused/terrain_seed_1` | 224.9 us (220.8 - 294.7) | 187.5 us (183.6 - 191.4) | 4,848 / 760 |
 | `mesh_neighbours/terrain_seed_1` (six neighbours) | 209.0 us (205.0 - 266.5) | 180.7 us (179.0 - 192.7) | 1,642 / 610 |
 | `mesh/slab` (stone up to y = 8, new case) | not run | 108.2 us (107.8 - 109.4) | 3,072 / 6 |
-| `mesh/solid` | 387.9 us (387.6 - 495.2) | 147.7 us (146.6 - 149.8) | 6,144 / 6 |
+| `mesh/solid` | 387.9 us (387.6 - 495.2) | 147.8 us (146.6 - 148.4) | 6,144 / 6 |
 | `mesh_reused/solid` | 370.0 us (363.8 - 497.3) | 145.7 us (145.7 - 148.5) | 6,144 / 6 |
 | `mesh/checkerboard` | 1.97 ms (1.96 - 2.32) | 2.55 ms (2.53 - 2.56) | 98,304 / 98,304 |
-| `mesh_reused/checkerboard` | 0.93 ms (0.93 - 1.26) | 1.55 ms (1.55 - 1.57) | 98,304 / 98,304 |
-| `mesh/empty` | 15.1 us (14.9 - 21.9) | 92.0 us (91.8 - 95.6) | 0 / 0 |
-| `mesh/single_block` | 15.8 us (15.5 - 22.7) | 95.1 us (94.2 - 95.5) | 6 / 6 |
+| `mesh_reused/checkerboard` | 0.93 ms (0.93 - 1.26) | 1.67 ms (1.65 - 1.74) | 98,304 / 98,304 |
+| `mesh/empty` | 15.1 us (14.9 - 21.9) | 1.39 us (1.39 - 1.40) | 0 / 0 |
+| `mesh/single_block` | 15.8 us (15.5 - 22.7) | 6.72 us (6.67 - 6.76) | 6 / 6 |
 | `terrain/generate_seed_1` | 28.1 us | 27.7 us | unchanged |
 
 - Terrain: 6.4 times fewer quads (4,848 to 760; with neighbours 1,642 to 610, 2.7 times) and
-  the mesh is 28 percent faster to build. Mesh bytes drop from 232,704 to 36,480. The quad
-  counts are exact; the faster build is outside the noise of the greedy runs (1 percent
-  spread), but the old runs had one slow run each (10 to 25 percent above the others), so
-  the size of the gain (between 16 and 28 percent) is not precise.
-- The keep rule holds: fewer quads everywhere or equal (checkerboard cannot merge), and the
-  slowest case against the old one is `mesh_reused/checkerboard` at 1.65 times, under 2.
-  Greedy is kept.
-- Worse cases, so nobody is surprised: an empty or nearly empty chunk costs about 92 us
-  instead of 15 us, because the mask is filled for all 6 x 32 slices (196,608 cells) before
-  anything is known to be empty. The checkerboard, where nothing merges, pays for the mask
-  with 1.3 to 1.65 times the time. Neither is a realistic chunk; a quick test "is this
-  chunk empty" before meshing (or per-slice occupancy) would remove the first cost and has
-  not been measured.
+  `mesh/terrain_seed_1` is 29 percent faster to build (262.3 to 185.4 us). The reused-buffer
+  variant, which is the one a worker uses, is 17 percent faster (224.9 to 187.5 us). Mesh bytes
+  drop from 232,704 to 36,480. The quad counts are exact; the old runs had one slow run each
+  (10 to 25 percent above the others), so the size of the time gain is not precise, and the
+  reused figure is the more honest one. The rows for `mesh/slab`, `mesh_reused/solid` and
+  `mesh_neighbours` come from the earlier greedy runs, before the empty-chunk early-out below;
+  they were not re-run.
+- Keep rule: fewer quads everywhere or equal (checkerboard cannot merge). No case is above
+  2x the time of the per-face mesher now. The slowest is the checkerboard, where nothing
+  merges: `mesh_reused/checkerboard` is 1.80 times (0.93 to 1.67 ms; the first greedy runs
+  gave 1.65 times) and `mesh/checkerboard` 1.3 times (1.97 to 2.55 ms, not re-run). Greedy is
+  kept.
+- Empty and sparse chunks: the greedy mesher first made an empty chunk 6 times slower
+  (92 us against 15 us) because it filled the mask for all 6 x 32 slices (196,608 cells).
+  `solid_slices` now makes one linear pass that records which slices hold a solid block; an
+  all-air chunk returns right after it, and slices without a block are skipped. Empty is
+  1.39 us (11 times faster than the per-face mesher, 15.1 us) and a single block 6.7 us
+  (2.3 times faster than 15.8 us). Chunks full of blocks pay the extra pass (about a microsecond
+  or two, inside the noise of the solid and terrain figures).
 - What made the first version too slow: it built a `LocalPos` for every cell and called the
   visibility test through the position (820 us for terrain, 3.3 times the old mesher,
   540 us for an empty chunk). Reading the block array directly with strides, walking the
@@ -332,6 +338,9 @@ change, run just before.
   stationary benchmark) and will be recorded when someone runs it.
 
 ### Frame time with greedy meshing (2026-11-24, release, standing still, same setup)
+
+Command line for each row: `vox-game.exe --background --view-radius N` (release build, default
+window size, 7 s, camera standing still).
 
 | Radius | FPS before | FPS after | GPU before | GPU after | Triangles at radius 16 |
 |---|---|---|---|---|---|

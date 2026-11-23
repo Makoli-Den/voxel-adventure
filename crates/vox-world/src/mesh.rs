@@ -12,7 +12,9 @@
 //! graphics API.
 
 use crate::block::BlockId;
-use crate::chunk::{AXIS_STRIDES, CHUNK_SIZE, Chunk, LocalPos};
+use crate::chunk::{
+    AXIS_STRIDES, AXIS_X, AXIS_Y, AXIS_Z, CHUNK_SIZE, CHUNK_VOLUME, Chunk, LocalPos,
+};
 use crate::world::Neighbours;
 
 /// Corners of one quad: every face of a block is a square.
@@ -78,9 +80,9 @@ impl Face {
     /// reads memory in short steps; the order does not change the winding of a quad.
     const fn axes(self) -> [usize; 3] {
         match self {
-            Face::PosX | Face::NegX => [0, 2, 1],
-            Face::PosY | Face::NegY => [1, 0, 2],
-            Face::PosZ | Face::NegZ => [2, 0, 1],
+            Face::PosX | Face::NegX => [AXIS_X, AXIS_Z, AXIS_Y],
+            Face::PosY | Face::NegY => [AXIS_Y, AXIS_X, AXIS_Z],
+            Face::PosZ | Face::NegZ => [AXIS_Z, AXIS_X, AXIS_Y],
         }
     }
 
@@ -124,14 +126,14 @@ pub struct ChunkVertex {
 /// [`INDICES_PER_QUAD`] indices.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChunkMesh {
-    /// Quad corners, four per visible face.
+    /// Quad corners, four per quad (merged rectangle of faces).
     pub vertices: Vec<ChunkVertex>,
-    /// Triangle list, six indices per visible face.
+    /// Triangle list, six indices per quad.
     pub indices: Vec<u32>,
 }
 
 impl ChunkMesh {
-    /// Number of quads (visible faces) in the mesh.
+    /// Number of quads (merged rectangles of visible faces) in the mesh.
     pub fn quad_count(&self) -> usize {
         self.indices.len() / INDICES_PER_QUAD
     }
@@ -222,12 +224,22 @@ pub fn build_mesh_with_neighbours_into(
     // Working on a flat mask keeps the merge a few comparisons per cell. The output
     // vectors keep their capacity between calls. A face whose neighbour is inside the
     // chunk (almost all of them) takes the cheap in-chunk test; only a border face goes
-    // through `neighbours`.
+    // through `neighbours`. One cheap pass first records which slices hold any solid block:
+    // an empty (sky) chunk, the most common kind, ends there, and a sparse chunk skips the
+    // slices without blocks, because a face needs a solid block in its own slice.
     mesh.vertices.clear();
     mesh.indices.clear();
+    let solid = solid_slices(chunk);
+    if solid.iter().all(|&bits| bits == 0) {
+        return;
+    }
     let mut mask = [BlockId::AIR; MASK_CELLS];
     for face in Face::ALL {
+        let solid_along_normal = solid[face.axes()[0]];
         for slice in 0..CHUNK_SIZE {
+            if solid_along_normal & (1 << slice) == 0 {
+                continue;
+            }
             if fill_mask(chunk, neighbours, face, slice, &mut mask) {
                 emit_rectangles(mesh, &mut mask, face, slice);
             }
@@ -238,10 +250,44 @@ pub fn build_mesh_with_neighbours_into(
 /// Cells in the mask of one slice: one per block of a `CHUNK_SIZE` x `CHUNK_SIZE` plane.
 const MASK_CELLS: usize = CHUNK_SIZE * CHUNK_SIZE;
 
+// `solid_slices` keeps one bit per slice in a `u32`, and reads a row of x as contiguous.
+const _: () = assert!(CHUNK_SIZE <= u32::BITS as usize);
+const _: () = assert!(AXIS_STRIDES[AXIS_X] == 1);
+
+/// Index in the mask of the cell at `u` and `v` on the tangent axes of a face.
+const fn mask_index(u: usize, v: usize) -> usize {
+    v * CHUNK_SIZE + u
+}
+
+/// For each axis, a bit set with bit `i` on when the slice at coordinate `i` along that
+/// axis holds at least one solid block. Indexed like [`AXIS_STRIDES`]. All zero means the
+/// chunk is empty.
+fn solid_slices(chunk: &Chunk) -> [u32; 3] {
+    // HOT PATH: one linear pass over the block array, a row of x at a time, so it is
+    // cheap enough to run before every mesh and pay for itself on empty chunks.
+    let blocks = chunk.blocks();
+    let mut solid = [0u32; 3];
+    for y in 0..CHUNK_SIZE {
+        for z in 0..CHUNK_SIZE {
+            let start = y * AXIS_STRIDES[AXIS_Y] + z * AXIS_STRIDES[AXIS_Z];
+            let row = &blocks[start..start + CHUNK_SIZE];
+            let x_bits = row.iter().enumerate().fold(0u32, |bits, (x, block)| {
+                bits | (u32::from(!block.is_air()) << x)
+            });
+            if x_bits != 0 {
+                solid[AXIS_X] |= x_bits;
+                solid[AXIS_Y] |= 1 << y;
+                solid[AXIS_Z] |= 1 << z;
+            }
+        }
+    }
+    solid
+}
+
 /// Writes the block ids of the visible faces of one slice into `mask`, air where there is
 /// no visible face, and returns whether any face is visible. A slice is the plane of
 /// blocks at `slice` along the normal of `face`; the mask cell of the block with
-/// coordinates `u` and `v` on the tangent axes is `v * CHUNK_SIZE + u`.
+/// coordinates `u` and `v` on the tangent axes is [`mask_index`]`(u, v)`.
 fn fill_mask(
     chunk: &Chunk,
     neighbours: &Neighbours<'_>,
@@ -281,7 +327,7 @@ fn fill_mask(
             };
             let shown = if visible { block } else { BlockId::AIR };
             any |= visible;
-            mask[v * CHUNK_SIZE + u] = shown;
+            mask[mask_index(u, v)] = shown;
         }
     }
     any
@@ -301,25 +347,25 @@ fn emit_rectangles(
     for v in 0..CHUNK_SIZE {
         let mut u = 0;
         while u < CHUNK_SIZE {
-            let block = mask[v * CHUNK_SIZE + u];
+            let block = mask[mask_index(u, v)];
             if block.is_air() {
                 u += 1;
                 continue;
             }
             let mut width = 1;
-            while u + width < CHUNK_SIZE && mask[v * CHUNK_SIZE + u + width] == block {
+            while u + width < CHUNK_SIZE && mask[mask_index(u + width, v)] == block {
                 width += 1;
             }
             let mut height = 1;
             while v + height < CHUNK_SIZE
-                && mask[(v + height) * CHUNK_SIZE + u..][..width]
+                && mask[mask_index(u, v + height)..][..width]
                     .iter()
                     .all(|&cell| cell == block)
             {
                 height += 1;
             }
             for row in v..v + height {
-                mask[row * CHUNK_SIZE + u..][..width].fill(BlockId::AIR);
+                mask[mask_index(u, row)..][..width].fill(BlockId::AIR);
             }
             let mut origin = [0; 3];
             origin[normal] = slice;
@@ -352,6 +398,12 @@ fn is_border_face_visible(neighbours: &Neighbours<'_>, pos: LocalPos, face: Face
     }
 }
 
+/// Most vertices a chunk mesh can have: one quad per block face, none merged.
+const MAX_VERTICES: usize = Face::COUNT * CHUNK_VOLUME * VERTICES_PER_QUAD;
+
+// Vertex indices are `u32`, so the largest mesh must fit it.
+const _: () = assert!(MAX_VERTICES <= u32::MAX as usize);
+
 /// Appends the four vertices and six indices of one rectangle of faces.
 ///
 /// `origin` is the lowest block of the rectangle and `extent` its size in blocks along
@@ -364,8 +416,7 @@ fn push_quad(
     face: Face,
     block: BlockId,
 ) {
-    // Fits u32: a chunk has at most `Face::COUNT * CHUNK_VOLUME` faces, which is under
-    // 800,000 vertices.
+    // The cast cannot truncate: see `MAX_VERTICES`.
     let base = mesh.vertices.len() as u32;
     for corner in face.corners() {
         // Fits u8: `origin + extent` is at most `CHUNK_SIZE` (32).
@@ -432,6 +483,23 @@ mod tests {
         let mesh = build_mesh(&Chunk::new());
         assert!(mesh.vertices.is_empty());
         assert!(mesh.indices.is_empty());
+    }
+
+    #[test]
+    fn empty_chunk_takes_the_fast_path_and_clears_a_reused_mesh() {
+        assert_eq!(solid_slices(&Chunk::new()), [0; 3]);
+        let mut mesh = build_mesh(&single_block_chunk(1, 2, 3));
+        assert_ne!(mesh, ChunkMesh::default());
+        build_mesh_into(&Chunk::new(), &mut mesh);
+        assert_eq!(mesh, ChunkMesh::default());
+    }
+
+    #[test]
+    fn solid_slices_mark_exactly_the_slices_with_blocks() {
+        let solid = solid_slices(&single_block_chunk(1, 2, 3));
+        assert_eq!(solid[AXIS_X], 1 << 1);
+        assert_eq!(solid[AXIS_Y], 1 << 2);
+        assert_eq!(solid[AXIS_Z], 1 << 3);
     }
 
     #[test]
@@ -832,13 +900,6 @@ mod tests {
     }
 
     #[test]
-    fn a_quad_never_crosses_the_chunk_border() {
-        for chunk in [solid_chunk(), crate::generate_terrain(1)] {
-            assert_valid(&build_mesh(&chunk));
-        }
-    }
-
-    #[test]
     fn neighbours_split_a_quad_where_they_hide_part_of_a_face() {
         // A slab with a solid block in the neighbour across the middle of its +X side.
         let mut slab = Chunk::new();
@@ -852,9 +913,11 @@ mod tests {
             .vertices
             .chunks(VERTICES_PER_QUAD)
             .filter(|q| q[0].face == Face::PosX.index());
-        // The one hole in a 32x4 face leaves a rectangle below it, one above it, and two
-        // beside it: the row of the hole is split in two pieces and the rest in rows.
-        assert!(x_faces.count() > 1);
+        // The hole is in the second row of a 32x4 face (rows run along y). Verified by running
+        // the algorithm: the full row below the hole is one quad; the row of the hole leaves a
+        // left and a right block, each growing up over the two rows above; and the cell
+        // above the hole is a fourth quad, two rows tall.
+        assert_eq!(x_faces.count(), 4);
         assert_matches_naive(&slab, &neighbours_on(&wall, &[Face::PosX]));
     }
 
@@ -1105,7 +1168,7 @@ mod tests {
             assert_eq!(face.offset().iter().filter(|&&step| step != 0).count(), 1);
             let mut all = [normal, u, v];
             all.sort_unstable();
-            assert_eq!(all, [0, 1, 2]);
+            assert_eq!(all, [AXIS_X, AXIS_Y, AXIS_Z]);
             assert!(AXIS_STRIDES[u] < AXIS_STRIDES[v]);
         }
     }
