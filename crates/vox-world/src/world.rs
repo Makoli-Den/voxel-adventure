@@ -5,9 +5,59 @@
 
 use std::collections::HashMap;
 
-use crate::chunk::Chunk;
+use crate::block::BlockId;
+use crate::chunk::{AXIS_COUNT, CHUNK_SIZE, Chunk, LocalPos};
 use crate::chunk_pos::ChunkPos;
 use crate::mesh::Face;
+
+/// The most chunks one block edit can change: the chunk of the block plus one neighbour
+/// per axis, which a block in a corner of its chunk touches (one face per axis).
+pub const MAX_CHANGED_CHUNKS: usize = 1 + AXIS_COUNT;
+
+/// The loaded chunks whose mesh must be rebuilt after one block edit.
+///
+/// A fixed array with a length instead of a `Vec`: an edit happens in the game loop and
+/// the answer never exceeds [`MAX_CHANGED_CHUNKS`], so it needs no allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChangedChunks {
+    chunks: [ChunkPos; MAX_CHANGED_CHUNKS],
+    len: usize,
+}
+
+impl ChangedChunks {
+    const fn empty() -> Self {
+        Self {
+            chunks: [ChunkPos::ORIGIN; MAX_CHANGED_CHUNKS],
+            len: 0,
+        }
+    }
+
+    /// Adds a chunk. The edit code adds at most [`MAX_CHANGED_CHUNKS`]; extra ones are
+    /// dropped instead of panicking.
+    fn push(&mut self, pos: ChunkPos) {
+        debug_assert!(self.len < MAX_CHANGED_CHUNKS, "too many changed chunks");
+        if let Some(slot) = self.chunks.get_mut(self.len) {
+            *slot = pos;
+            self.len += 1;
+        }
+    }
+
+    /// The changed chunks. The chunk that holds the block comes first, then the
+    /// neighbours in [`Face::ALL`] order. Empty if the block already had that value.
+    pub fn as_slice(&self) -> &[ChunkPos] {
+        self.chunks.get(..self.len).unwrap_or_default()
+    }
+
+    /// Whether `pos` is among the changed chunks.
+    pub fn contains(&self, pos: ChunkPos) -> bool {
+        self.as_slice().contains(&pos)
+    }
+
+    /// Whether nothing changed.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
 
 /// The loaded chunks of the world, keyed by their [`ChunkPos`].
 ///
@@ -54,12 +104,57 @@ impl World {
         self.chunks.iter().map(|(&pos, chunk)| (pos, chunk))
     }
 
+    /// The block at world block position `pos`, or `None` if its chunk is not loaded.
+    pub fn block_at(&self, pos: [i32; 3]) -> Option<BlockId> {
+        let (chunk, local) = ChunkPos::containing(pos);
+        self.get(chunk).map(|chunk| chunk.get(local))
+    }
+
+    /// Sets the block at world block position `pos`.
+    ///
+    /// Returns `None` if the chunk of `pos` is not loaded (nothing is written). Otherwise
+    /// returns the loaded chunks whose mesh is now out of date: the chunk of the block,
+    /// and, when the block lies on a chunk border, the loaded chunk behind that border,
+    /// because its mesh hides or shows faces depending on this block. Neighbours that are
+    /// not loaded have no mesh and are left out. Writing the value the block already has
+    /// changes nothing and returns an empty set.
+    pub fn set_block(&mut self, pos: [i32; 3], block: BlockId) -> Option<ChangedChunks> {
+        let (chunk_pos, local) = ChunkPos::containing(pos);
+        let chunk = self.chunks.get_mut(&chunk_pos)?;
+        let mut changed = ChangedChunks::empty();
+        if chunk.get(local) == block {
+            return Some(changed);
+        }
+        chunk.set(local, block);
+        changed.push(chunk_pos);
+        for face in Face::ALL {
+            if on_border(local, face) {
+                let neighbour = chunk_pos.neighbour(face);
+                if self.contains(neighbour) {
+                    changed.push(neighbour);
+                }
+            }
+        }
+        Some(changed)
+    }
+
     /// The six chunks around `pos`; the ones that are not loaded are missing.
     ///
     /// The result borrows the world, so the world cannot change while it is in use.
     pub fn neighbours(&self, pos: ChunkPos) -> Neighbours<'_> {
         Neighbours::new(Face::ALL.map(|face| self.get(pos.neighbour(face))))
     }
+}
+
+/// Whether the block at `local` touches the border of its chunk on the side of `face`.
+fn on_border(local: LocalPos, face: Face) -> bool {
+    let [dx, dy, dz] = face.offset();
+    let edge = |coordinate: u8, step: i8| match step {
+        1 => usize::from(coordinate) == CHUNK_SIZE - 1,
+        -1 => coordinate == 0,
+        _ => false,
+    };
+    edge(local.x(), dx) || edge(local.y(), dy) || edge(local.z(), dz)
 }
 
 /// The six chunks next to one chunk, one per [`Face`], each possibly missing.
@@ -189,6 +284,89 @@ mod tests {
         for face in [Face::PosX, Face::NegX, Face::PosY, Face::NegY, Face::PosZ] {
             assert!(neighbours.get(face).is_none(), "{face:?}");
         }
+    }
+
+    fn world_with_empty_chunks(positions: &[ChunkPos]) -> World {
+        let mut world = World::new();
+        for &pos in positions {
+            world.insert(pos, Chunk::new());
+        }
+        world
+    }
+
+    #[test]
+    fn block_at_reads_world_coordinates_including_negative() {
+        let mut world = world_with_empty_chunks(&[ChunkPos::new(-1, 0, 0), ChunkPos::ORIGIN]);
+        world.set_block([-1, 5, 0], BlockId(9));
+        assert_eq!(world.block_at([-1, 5, 0]), Some(BlockId(9)));
+        assert_eq!(world.block_at([0, 5, 0]), Some(BlockId::AIR));
+        assert_eq!(world.block_at([-33, 5, 0]), None);
+        let chunk = world.get(ChunkPos::new(-1, 0, 0));
+        let local = LocalPos::new(31, 5, 0).unwrap();
+        assert_eq!(chunk.map(|c| c.get(local)), Some(BlockId(9)));
+    }
+
+    #[test]
+    fn set_block_in_an_unloaded_chunk_does_nothing() {
+        let mut world = World::new();
+        assert!(world.set_block([0, 0, 0], BlockId(1)).is_none());
+        assert!(world.is_empty());
+    }
+
+    #[test]
+    fn set_block_inside_a_chunk_changes_only_that_chunk() {
+        let mut world = world_with_empty_chunks(&[ChunkPos::ORIGIN, ChunkPos::new(1, 0, 0)]);
+        let changed = world.set_block([10, 10, 10], BlockId(1)).unwrap();
+        assert_eq!(changed.as_slice(), [ChunkPos::ORIGIN]);
+    }
+
+    #[test]
+    fn set_block_on_a_border_also_changes_the_loaded_neighbour() {
+        let mut world = world_with_empty_chunks(&[
+            ChunkPos::ORIGIN,
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(0, -1, 0),
+        ]);
+        let changed = world.set_block([31, 0, 7], BlockId(1)).unwrap();
+        assert_eq!(changed.as_slice().len(), 3);
+        assert_eq!(changed.as_slice()[0], ChunkPos::ORIGIN);
+        assert!(changed.contains(ChunkPos::new(1, 0, 0)));
+        assert!(changed.contains(ChunkPos::new(0, -1, 0)));
+    }
+
+    #[test]
+    fn set_block_skips_unloaded_neighbours() {
+        let mut world = world_with_empty_chunks(&[ChunkPos::ORIGIN]);
+        let changed = world.set_block([0, 0, 0], BlockId(1)).unwrap();
+        assert_eq!(changed.as_slice(), [ChunkPos::ORIGIN]);
+    }
+
+    #[test]
+    fn set_block_in_a_corner_reaches_the_maximum() {
+        let mut positions = vec![ChunkPos::ORIGIN];
+        positions.extend(
+            [Face::NegX, Face::NegY, Face::NegZ].map(|face| ChunkPos::ORIGIN.neighbour(face)),
+        );
+        let mut world = world_with_empty_chunks(&positions);
+        let changed = world.set_block([0, 0, 0], BlockId(1)).unwrap();
+        assert_eq!(changed.as_slice().len(), MAX_CHANGED_CHUNKS);
+    }
+
+    #[test]
+    fn border_neighbour_of_a_negative_chunk_is_found() {
+        let a = ChunkPos::new(-1, -1, -1);
+        let mut world = world_with_empty_chunks(&[a, ChunkPos::new(-2, -1, -1)]);
+        // Block -32 is local 0 of chunk -1: the -X neighbour is chunk -2.
+        let changed = world.set_block([-32, -1, -1], BlockId(1)).unwrap();
+        assert!(changed.contains(ChunkPos::new(-2, -1, -1)));
+        assert_eq!(changed.as_slice().len(), 2);
+    }
+
+    #[test]
+    fn writing_the_same_block_changes_nothing() {
+        let mut world = world_with_empty_chunks(&[ChunkPos::ORIGIN]);
+        let changed = world.set_block([0, 0, 0], BlockId::AIR).unwrap();
+        assert!(changed.is_empty());
     }
 
     #[test]

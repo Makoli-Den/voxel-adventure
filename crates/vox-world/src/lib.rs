@@ -7,6 +7,7 @@ mod block;
 mod chunk;
 mod chunk_pos;
 mod mesh;
+mod raycast;
 mod terrain;
 mod world;
 
@@ -17,5 +18,6 @@ pub use mesh::{
     ChunkMesh, ChunkVertex, Face, INDICES_PER_QUAD, VERTICES_PER_QUAD, build_mesh, build_mesh_into,
     build_mesh_with_neighbours_into,
 };
+pub use raycast::{RayHit, raycast};
 pub use terrain::{DIRT, GRASS, MAX_SURFACE, MIN_SURFACE, STONE, generate_chunk, generate_terrain};
-pub use world::{Neighbours, World};
+pub use world::{ChangedChunks, MAX_CHANGED_CHUNKS, Neighbours, World};

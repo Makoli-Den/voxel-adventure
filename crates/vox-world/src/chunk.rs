@@ -22,6 +22,14 @@ pub(crate) const AXIS_STRIDES: [usize; 3] = {
     strides
 };
 
+/// Number of spatial axes (X, Y, Z).
+pub(crate) const AXIS_COUNT: usize = 3;
+
+/// Bit mask that keeps the position inside a chunk: the low bits of a coordinate. It is
+/// the remainder modulo `CHUNK_SIZE` only for a power of two, which is checked here.
+const COORD_MASK: usize = CHUNK_SIZE - 1;
+const _: () = assert!(CHUNK_SIZE.is_power_of_two());
+
 /// Index of the X axis in per-axis arrays such as [`AXIS_STRIDES`] or a coordinate triple.
 pub(crate) const AXIS_X: usize = 0;
 
@@ -54,6 +62,21 @@ impl LocalPos {
             })
         } else {
             None
+        }
+    }
+
+    /// The position inside its chunk of the block at world coordinates `block`.
+    ///
+    /// The mask keeps the low bits of each coordinate. For a power-of-two `CHUNK_SIZE`
+    /// and two's complement integers that is the floor remainder, so negative world
+    /// coordinates land correctly and the result is always valid, with no `Option`.
+    pub(crate) const fn from_block_coords(block: [i32; 3]) -> Self {
+        const MASK: i32 = COORD_MASK as i32;
+        // The casts are safe: the mask leaves values below CHUNK_SIZE (32), which fit u8.
+        Self {
+            x: (block[AXIS_X] & MASK) as u8,
+            y: (block[AXIS_Y] & MASK) as u8,
+            z: (block[AXIS_Z] & MASK) as u8,
         }
     }
 
@@ -90,7 +113,7 @@ impl LocalPos {
     /// position of the touching block inside the neighbouring chunk. The mask keeps every
     /// coordinate below [`CHUNK_SIZE`], so the invariant of `LocalPos` holds.
     pub(crate) fn wrapped(self, offset: [i8; 3]) -> Self {
-        const MASK: u8 = (CHUNK_SIZE - 1) as u8;
+        const MASK: u8 = COORD_MASK as u8;
         Self {
             x: self.x.wrapping_add_signed(offset[0]) & MASK,
             y: self.y.wrapping_add_signed(offset[1]) & MASK,
