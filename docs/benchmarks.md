@@ -284,3 +284,59 @@ Streaming costs 7 to 10 percent of the frame rate while flying fast, and no fram
 14 ms, so the budget of 4 uploads per frame does not cause stutter at these speeds. The
 average job is about 0.5 to 0.6 ms on one of 15 workers and an upload about 0.11 ms. Not yet
 measured: smaller budgets, a slower machine, and how far the camera can outrun the loading.
+
+## Greedy meshing (2026-11-24)
+
+`build_mesh_with_neighbours_into` now merges visible faces of the same block and direction in
+one plane into rectangles (performance notes, item 8). The keep rule set beforehand: keep it
+only if it gives fewer quads (cheaper to render) and is not more than about 2x slower to mesh.
+Three consecutive runs of `cargo bench -p vox-world --bench mesh` for each version, same
+machine, nothing else running; the table shows the median of the three run medians and the
+lowest and highest run median. The old numbers come from the same binary built before the
+change, run just before.
+
+| Case | Per-face mesher | Greedy mesher | Quads before / after |
+|---|---|---|---|
+| `mesh/terrain_seed_1` | 262.3 us (249.9 - 322.5) | 188.1 us (186.7 - 189.7) | 4,848 / 760 |
+| `mesh_reused/terrain_seed_1` | 224.9 us (220.8 - 294.7) | 181.5 us (180.8 - 183.5) | 4,848 / 760 |
+| `mesh_neighbours/terrain_seed_1` (six neighbours) | 209.0 us (205.0 - 266.5) | 180.7 us (179.0 - 192.7) | 1,642 / 610 |
+| `mesh/slab` (stone up to y = 8, new case) | not run | 108.2 us (107.8 - 109.4) | 3,072 / 6 |
+| `mesh/solid` | 387.9 us (387.6 - 495.2) | 147.7 us (146.6 - 149.8) | 6,144 / 6 |
+| `mesh_reused/solid` | 370.0 us (363.8 - 497.3) | 145.7 us (145.7 - 148.5) | 6,144 / 6 |
+| `mesh/checkerboard` | 1.97 ms (1.96 - 2.32) | 2.55 ms (2.53 - 2.56) | 98,304 / 98,304 |
+| `mesh_reused/checkerboard` | 0.93 ms (0.93 - 1.26) | 1.55 ms (1.55 - 1.57) | 98,304 / 98,304 |
+| `mesh/empty` | 15.1 us (14.9 - 21.9) | 92.0 us (91.8 - 95.6) | 0 / 0 |
+| `mesh/single_block` | 15.8 us (15.5 - 22.7) | 95.1 us (94.2 - 95.5) | 6 / 6 |
+| `terrain/generate_seed_1` | 28.1 us | 27.7 us | unchanged |
+
+- Terrain: 6.4 times fewer quads (4,848 to 760; with neighbours 1,642 to 610, 2.7 times) and
+  the mesh is 28 percent faster to build. Mesh bytes drop from 232,704 to 36,480. The quad
+  counts are exact; the faster build is outside the noise of the greedy runs (1 percent
+  spread), but the old runs had one slow run each (10 to 25 percent above the others), so
+  the size of the gain (between 16 and 28 percent) is not precise.
+- The keep rule holds: fewer quads everywhere or equal (checkerboard cannot merge), and the
+  slowest case against the old one is `mesh_reused/checkerboard` at 1.65 times, under 2.
+  Greedy is kept.
+- Worse cases, so nobody is surprised: an empty or nearly empty chunk costs about 92 us
+  instead of 15 us, because the mask is filled for all 6 x 32 slices (196,608 cells) before
+  anything is known to be empty. The checkerboard, where nothing merges, pays for the mask
+  with 1.3 to 1.65 times the time. Neither is a realistic chunk; a quick test "is this
+  chunk empty" before meshing (or per-slice occupancy) would remove the first cost and has
+  not been measured.
+- What made the first version too slow: it built a `LocalPos` for every cell and called the
+  visibility test through the position (820 us for terrain, 3.3 times the old mesher,
+  540 us for an empty chunk). Reading the block array directly with strides, walking the
+  slice in memory order (the inner mask axis is the one with the smaller stride), and using
+  the position-based test only on the border slice, gave the numbers above.
+- The effect on frame time is not measured here; it needs the renderer (`--fly` or the
+  stationary benchmark) and will be recorded when someone runs it.
+
+### Frame time with greedy meshing (2026-11-24, release, standing still, same setup)
+
+| Radius | FPS before | FPS after | GPU before | GPU after | Triangles at radius 16 |
+|---|---|---|---|---|---|
+| 8 | 2059 | 3562 | 0.31 ms | 0.09 ms | |
+| 16 | 745 | 1761 | 1.23 ms | 0.42 ms | 1.22 M to 0.26 M |
+| 30 | 307 | 674 | 3.20 ms | 1.41 ms | |
+
+The picture is identical to the per-face mesh (checked on a screenshot), as the coverage tests promise.

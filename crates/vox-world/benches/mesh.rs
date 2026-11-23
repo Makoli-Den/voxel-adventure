@@ -57,12 +57,22 @@ fn chunk_where(solid: impl Fn(LocalPos) -> bool) -> Chunk {
     chunk
 }
 
+/// Height of the stone layer of `slab_chunk`, in blocks: a quarter of the chunk.
+const SLAB_HEIGHT: usize = CHUNK_SIZE / 4;
+
+/// A flat layer of stone from the bottom up to `SLAB_HEIGHT`: the best case for greedy
+/// meshing, since every side is one rectangle.
+fn slab_chunk() -> Chunk {
+    chunk_where(|pos| usize::from(pos.y()) < SLAB_HEIGHT)
+}
+
 /// The mesher cases in the order they appear in the report.
 fn mesh_cases() -> Vec<(&'static str, Chunk)> {
     vec![
         ("empty", empty_chunk()),
         ("single_block", single_block_chunk()),
         ("terrain_seed_1", generate_terrain(SEED)),
+        ("slab", slab_chunk()),
         ("solid", solid_chunk()),
         ("checkerboard", checkerboard_chunk()),
     ]

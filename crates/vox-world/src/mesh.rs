@@ -1,12 +1,18 @@
-//! Naive chunk mesher: turns a [`Chunk`] into vertices and indices.
+//! Greedy chunk mesher: turns a [`Chunk`] into vertices and indices.
 //!
 //! Only faces that can be seen are generated (see `docs/performance-notes.md`,
-//! item 2): a face is emitted when its block is solid and the neighbour on that
+//! item 2): a face is visible when its block is solid and the neighbour on that
 //! side is air. On the chunk border the neighbour lives in the next chunk, which the
-//! caller passes as [`Neighbours`]; a missing chunk counts as air. The output is plain data, so it has no dependency on any graphics API.
+//! caller passes as [`Neighbours`]; a missing chunk counts as air.
+//!
+//! Visible faces are then merged (item 8): neighbouring faces of the same block and
+//! the same direction in one plane become one rectangle, so a flat top of 100 blocks
+//! costs one quad, not 100. The GPU cost is proportional to the triangles, so fewer
+//! quads is a direct gain. The output is plain data, so it has no dependency on any
+//! graphics API.
 
 use crate::block::BlockId;
-use crate::chunk::{Chunk, LocalPos};
+use crate::chunk::{AXIS_STRIDES, CHUNK_SIZE, Chunk, LocalPos};
 use crate::world::Neighbours;
 
 /// Corners of one quad: every face of a block is a square.
@@ -64,10 +70,25 @@ impl Face {
         }
     }
 
+    /// Axes of the plane of this face: `[normal, u, v]`, each 0 for X, 1 for Y, 2 for Z.
+    ///
+    /// `normal` is the axis of [`Face::offset`]; `u` and `v` are the two axes a
+    /// merged rectangle grows along. `u` is the one that lies closer together in the
+    /// chunk's block array (see [`AXIS_STRIDES`]), so the inner loop of the mask fill
+    /// reads memory in short steps; the order does not change the winding of a quad.
+    const fn axes(self) -> [usize; 3] {
+        match self {
+            Face::PosX | Face::NegX => [0, 2, 1],
+            Face::PosY | Face::NegY => [1, 0, 2],
+            Face::PosZ | Face::NegZ => [2, 0, 1],
+        }
+    }
+
     /// Quad corners relative to the block origin, counter-clockwise seen from outside.
     ///
     /// Every face uses the same winding, so the cross product of the first two
-    /// edges always points along [`Face::offset`].
+    /// edges always points along [`Face::offset`]. A merged quad stretches these unit
+    /// corners along its two tangent axes, which keeps the winding.
     const fn corners(self) -> [[u8; 3]; VERTICES_PER_QUAD] {
         match self {
             Face::PosX => [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]],
@@ -116,7 +137,8 @@ impl ChunkMesh {
     }
 }
 
-/// Builds the mesh of a chunk, skipping every face hidden by a solid neighbour.
+/// Builds the mesh of a chunk, skipping every face hidden by a solid neighbour and
+/// merging neighbouring visible faces of the same block and direction into one quad.
 ///
 /// Neighbours outside the chunk count as air, so faces on the chunk border are always
 /// emitted. Use [`build_mesh_with_neighbours_into`] to look into neighbouring chunks.
@@ -193,23 +215,121 @@ pub fn build_mesh_with_neighbours_into(
     neighbours: &Neighbours<'_>,
     mesh: &mut ChunkMesh,
 ) {
-    // HOT PATH: runs for every chunk that is generated or edited. It walks the flat
-    // block array once in storage order, so memory is read sequentially, and writes
-    // 6-byte vertices, so little data has to travel to the GPU. The output vectors
-    // keep their capacity between calls; a capacity estimate for a first call waits
-    // for a benchmark. A face whose neighbour is inside the chunk (almost all of them)
-    // takes the same cheap test as before; only a border face goes through `neighbours`.
+    // HOT PATH: runs for every chunk that is generated or edited. For each of the six
+    // directions it sweeps the 32 slices across the chunk, and for each slice it first
+    // writes the visible block ids into one flat 32x32 mask (a stack array reused for
+    // every slice, so nothing is allocated), then cuts rectangles out of the mask.
+    // Working on a flat mask keeps the merge a few comparisons per cell. The output
+    // vectors keep their capacity between calls. A face whose neighbour is inside the
+    // chunk (almost all of them) takes the cheap in-chunk test; only a border face goes
+    // through `neighbours`.
     mesh.vertices.clear();
     mesh.indices.clear();
-    for pos in LocalPos::all() {
-        let block = chunk.get(pos);
-        if block.is_air() {
-            continue;
-        }
-        for face in Face::ALL {
-            if is_face_visible(chunk, neighbours, pos, face) {
-                push_quad(mesh, pos, face, block);
+    let mut mask = [BlockId::AIR; MASK_CELLS];
+    for face in Face::ALL {
+        for slice in 0..CHUNK_SIZE {
+            if fill_mask(chunk, neighbours, face, slice, &mut mask) {
+                emit_rectangles(mesh, &mut mask, face, slice);
             }
+        }
+    }
+}
+
+/// Cells in the mask of one slice: one per block of a `CHUNK_SIZE` x `CHUNK_SIZE` plane.
+const MASK_CELLS: usize = CHUNK_SIZE * CHUNK_SIZE;
+
+/// Writes the block ids of the visible faces of one slice into `mask`, air where there is
+/// no visible face, and returns whether any face is visible. A slice is the plane of
+/// blocks at `slice` along the normal of `face`; the mask cell of the block with
+/// coordinates `u` and `v` on the tangent axes is `v * CHUNK_SIZE + u`.
+fn fill_mask(
+    chunk: &Chunk,
+    neighbours: &Neighbours<'_>,
+    face: Face,
+    slice: usize,
+    mask: &mut [BlockId; MASK_CELLS],
+) -> bool {
+    let [normal, u_axis, v_axis] = face.axes();
+    let [u_stride, v_stride, normal_stride] =
+        [u_axis, v_axis, normal].map(|axis| AXIS_STRIDES[axis]);
+    let blocks = chunk.blocks();
+    let base = slice * normal_stride;
+    // Where the block a face looks at lies, relative to the block, in the flat array. Only
+    // meaningful when that block is inside the chunk, that is, not on the border slice.
+    // The cast cannot wrap: a stride is at most `CHUNK_SIZE * CHUNK_SIZE`.
+    let towards = isize::from(face.offset()[normal]) * normal_stride as isize;
+    let on_border = match face.offset()[normal] {
+        step if step > 0 => slice == CHUNK_SIZE - 1,
+        _ => slice == 0,
+    };
+    let mut any = false;
+    for v in 0..CHUNK_SIZE {
+        for u in 0..CHUNK_SIZE {
+            let index = base + v * v_stride + u * u_stride;
+            let block = blocks[index];
+            let visible = if block.is_air() {
+                false
+            } else if on_border {
+                let mut coords = [0; 3];
+                coords[normal] = slice;
+                coords[u_axis] = u;
+                coords[v_axis] = v;
+                LocalPos::new(coords[0], coords[1], coords[2])
+                    .is_some_and(|pos| is_face_visible(chunk, neighbours, pos, face))
+            } else {
+                blocks[index.wrapping_add_signed(towards)].is_air()
+            };
+            let shown = if visible { block } else { BlockId::AIR };
+            any |= visible;
+            mask[v * CHUNK_SIZE + u] = shown;
+        }
+    }
+    any
+}
+
+/// Cuts the faces left in `mask` into rectangles and appends one quad per rectangle.
+/// Each rectangle starts at the first free cell in row order, grows along `u` as far as
+/// the block stays the same, then along `v` as long as the whole row segment matches.
+/// The cells it covers are cleared, so the mask is all air afterwards.
+fn emit_rectangles(
+    mesh: &mut ChunkMesh,
+    mask: &mut [BlockId; MASK_CELLS],
+    face: Face,
+    slice: usize,
+) {
+    let [normal, u_axis, v_axis] = face.axes();
+    for v in 0..CHUNK_SIZE {
+        let mut u = 0;
+        while u < CHUNK_SIZE {
+            let block = mask[v * CHUNK_SIZE + u];
+            if block.is_air() {
+                u += 1;
+                continue;
+            }
+            let mut width = 1;
+            while u + width < CHUNK_SIZE && mask[v * CHUNK_SIZE + u + width] == block {
+                width += 1;
+            }
+            let mut height = 1;
+            while v + height < CHUNK_SIZE
+                && mask[(v + height) * CHUNK_SIZE + u..][..width]
+                    .iter()
+                    .all(|&cell| cell == block)
+            {
+                height += 1;
+            }
+            for row in v..v + height {
+                mask[row * CHUNK_SIZE + u..][..width].fill(BlockId::AIR);
+            }
+            let mut origin = [0; 3];
+            origin[normal] = slice;
+            origin[u_axis] = u;
+            origin[v_axis] = v;
+            let mut extent = [1; 3];
+            extent[u_axis] = width;
+            extent[v_axis] = height;
+            push_quad(mesh, origin, extent, face, block);
+            u += width;
         }
     }
 }
@@ -232,18 +352,27 @@ fn is_border_face_visible(neighbours: &Neighbours<'_>, pos: LocalPos, face: Face
     }
 }
 
-/// Appends the four vertices and six indices of one face.
-fn push_quad(mesh: &mut ChunkMesh, pos: LocalPos, face: Face, block: BlockId) {
+/// Appends the four vertices and six indices of one rectangle of faces.
+///
+/// `origin` is the lowest block of the rectangle and `extent` its size in blocks along
+/// each axis (1 along the normal of `face`). Both are at most `CHUNK_SIZE` in total
+/// reach, so every coordinate fits a `u8`.
+fn push_quad(
+    mesh: &mut ChunkMesh,
+    origin: [usize; 3],
+    extent: [usize; 3],
+    face: Face,
+    block: BlockId,
+) {
     // Fits u32: a chunk has at most `Face::COUNT * CHUNK_VOLUME` faces, which is under
     // 800,000 vertices.
     let base = mesh.vertices.len() as u32;
     for corner in face.corners() {
+        // Fits u8: `origin + extent` is at most `CHUNK_SIZE` (32).
+        let position =
+            std::array::from_fn(|axis| origin[axis] as u8 + corner[axis] * extent[axis] as u8);
         mesh.vertices.push(ChunkVertex {
-            position: [
-                pos.x() + corner[0],
-                pos.y() + corner[1],
-                pos.z() + corner[2],
-            ],
+            position,
             face: face.index(),
             block,
         });
@@ -252,10 +381,29 @@ fn push_quad(mesh: &mut ChunkMesh, pos: LocalPos, face: Face, block: BlockId) {
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
+/// The simple mesher the greedy one replaced: one unit quad per visible face, with the
+/// same visibility rule. It stays as the reference the greedy mesher is checked against.
+#[cfg(test)]
+pub(crate) fn naive_mesh(chunk: &Chunk, neighbours: &Neighbours<'_>) -> ChunkMesh {
+    let mut mesh = ChunkMesh::default();
+    for pos in LocalPos::all() {
+        let block = chunk.get(pos);
+        if block.is_air() {
+            continue;
+        }
+        for face in Face::ALL {
+            if is_face_visible(chunk, neighbours, pos, face) {
+                let origin = [pos.x(), pos.y(), pos.z()].map(usize::from);
+                push_quad(&mut mesh, origin, [1; 3], face, block);
+            }
+        }
+    }
+    mesh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunk::CHUNK_SIZE;
     use crate::world::World;
     use crate::{ChunkPos, generate_chunk};
 
@@ -298,16 +446,22 @@ mod tests {
     fn adjacent_blocks_hide_touching_faces() {
         let mut chunk = single_block_chunk(10, 10, 10);
         chunk.set(pos(11, 10, 10), STONE);
-        assert_counts(&build_mesh(&chunk), 10);
+        // Ten visible faces, and the four long sides of the pair merge in twos: 6 quads.
+        assert_eq!(naive_mesh(&chunk, &Neighbours::none()).quad_count(), 10);
+        assert_counts(&build_mesh(&chunk), 6);
     }
 
     #[test]
-    fn solid_chunk_gives_only_outer_shell() {
-        let mut chunk = Chunk::new();
-        for p in LocalPos::all() {
-            chunk.set(p, STONE);
-        }
-        assert_counts(&build_mesh(&chunk), Face::COUNT * CHUNK_SIZE * CHUNK_SIZE);
+    fn solid_chunk_gives_only_outer_shell_in_six_quads() {
+        let mesh = build_mesh(&solid_chunk());
+        assert_counts(&mesh, Face::COUNT);
+        // Each quad covers a whole side of the chunk.
+        let side = CHUNK_SIZE as u8;
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|v| v.position.iter().all(|&c| c == 0 || c == side))
+        );
     }
 
     #[test]
@@ -410,47 +564,298 @@ mod tests {
         Neighbours::new(Face::ALL.map(|face| present.contains(&face).then_some(chunk)))
     }
 
-    /// The plain mesher as it was before neighbouring chunks existed: a face is hidden by
-    /// a solid block inside the chunk and never by anything outside it.
-    fn reference_mesh(chunk: &Chunk) -> ChunkMesh {
-        let mut mesh = ChunkMesh::default();
+    fn checkerboard_chunk() -> Chunk {
+        let mut chunk = Chunk::new();
+        for p in LocalPos::all() {
+            if (p.x() + p.y() + p.z()) % 2 == 0 {
+                chunk.set(p, STONE);
+            }
+        }
+        chunk
+    }
+
+    /// The old per-block mesher written once more, independently of `is_face_visible`: a
+    /// face is hidden by a solid block inside the chunk and never by anything outside it.
+    /// It guards the visibility rule itself, which `naive_mesh` shares with the mesher.
+    fn count_visible_faces_without_neighbours(chunk: &Chunk) -> usize {
+        let mut count = 0;
         for pos in LocalPos::all() {
-            let block = chunk.get(pos);
             for face in Face::ALL {
                 let hidden = pos
                     .offset(face.offset())
                     .is_some_and(|next| !chunk.get(next).is_air());
-                if !block.is_air() && !hidden {
-                    push_quad(&mut mesh, pos, face, block);
+                if !chunk.get(pos).is_air() && !hidden {
+                    count += 1;
                 }
             }
         }
-        mesh
+        count
     }
 
-    // The real guards of the old behaviour are the pinned 4,848 quads of the terrain test
-    // and the older mesher tests above; this test adds a second, independent mesher.
     #[test]
-    fn explicit_no_neighbours_equal_the_reference_mesher() {
-        let mut checkerboard = Chunk::new();
-        for p in LocalPos::all() {
-            if (p.x() + p.y() + p.z()) % 2 == 0 {
-                checkerboard.set(p, STONE);
-            }
-        }
-        let chunks = [
-            Chunk::new(),
+    fn naive_reference_matches_an_independent_face_count() {
+        for chunk in [
             single_block_chunk(10, 10, 10),
             solid_chunk(),
-            checkerboard,
+            checkerboard_chunk(),
             crate::generate_terrain(1),
             crate::generate_terrain(2),
-        ];
-        for chunk in &chunks {
-            let expected = reference_mesh(chunk);
-            assert_eq!(mesh_with(chunk, &Neighbours::none()), expected);
-            assert_eq!(build_mesh(chunk), expected);
+        ] {
+            let naive = naive_mesh(&chunk, &Neighbours::none());
+            assert_eq!(
+                naive.quad_count(),
+                count_visible_faces_without_neighbours(&chunk)
+            );
         }
+    }
+
+    /// Every visible face as `(face index, block id, block position)`, one entry per
+    /// unit square of every quad, sorted. A merged quad is expanded into its squares, so
+    /// two meshes with the same list cover the same squares with the same blocks no
+    /// matter how the squares are grouped into quads. The block position (not the
+    /// position of the square) identifies a face: the square of a positive face lies one
+    /// block further along its normal.
+    fn unit_faces(mesh: &ChunkMesh) -> Vec<(u8, u16, [i32; 3])> {
+        let mut faces = Vec::new();
+        for quad in mesh.vertices.chunks(VERTICES_PER_QUAD) {
+            let face = Face::ALL[usize::from(quad[0].face)];
+            let low: [i32; 3] = std::array::from_fn(|axis| {
+                quad.iter()
+                    .map(|v| i32::from(v.position[axis]))
+                    .min()
+                    .unwrap_or(0)
+            });
+            let high: [i32; 3] = std::array::from_fn(|axis| {
+                quad.iter()
+                    .map(|v| i32::from(v.position[axis]))
+                    .max()
+                    .unwrap_or(0)
+            });
+            let offset = face.offset();
+            let [normal, u, v] = face.axes();
+            assert_eq!(high[normal] - low[normal], 0, "a quad is flat");
+            for a in low[u]..high[u] {
+                for b in low[v]..high[v] {
+                    let mut block = low;
+                    block[normal] -= i32::from(offset[normal].max(0));
+                    block[u] = a;
+                    block[v] = b;
+                    faces.push((quad[0].face, quad[0].block.0, block));
+                }
+            }
+        }
+        faces.sort_unstable();
+        faces
+    }
+
+    /// Asserts the geometry of `mesh` is sound and covers exactly the squares of the naive
+    /// mesh, each once, with no more quads than the naive mesh. Returns the quad counts
+    /// as `(greedy, naive)`.
+    fn assert_matches_naive(chunk: &Chunk, neighbours: &Neighbours<'_>) -> (usize, usize) {
+        let greedy = mesh_with(chunk, neighbours);
+        let naive = naive_mesh(chunk, neighbours);
+        assert_valid(&greedy);
+        let faces = unit_faces(&greedy);
+        assert_eq!(faces, unit_faces(&naive));
+        let mut unique = faces.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), faces.len(), "quads must not overlap");
+        assert!(greedy.quad_count() <= naive.quad_count());
+        (greedy.quad_count(), naive.quad_count())
+    }
+
+    /// Indices in range, six per four vertices, positions within the chunk, and every quad
+    /// wound so that its normal points along its face, with the length of its area.
+    fn assert_valid(mesh: &ChunkMesh) {
+        assert_counts(mesh, mesh.vertices.len() / VERTICES_PER_QUAD);
+        let size = CHUNK_SIZE as u8;
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|v| v.position.iter().all(|&c| c <= size))
+        );
+        for (quad, triangles) in mesh
+            .vertices
+            .chunks(VERTICES_PER_QUAD)
+            .zip(mesh.indices.chunks(INDICES_PER_QUAD))
+        {
+            let face = Face::ALL[usize::from(quad[0].face)];
+            let [a, b, c, d] = [0, 1, 2, 3].map(|i| quad[i].position.map(f32::from));
+            // The four corners form a parallelogram, so the first two edges give the area.
+            assert_eq!(sub(d, a), sub(c, b));
+            let normal = cross(sub(b, a), sub(d, a));
+            let area = (0..3).map(|i| normal[i].abs()).sum::<f32>();
+            assert!(area >= 1.0);
+            let expected = face.offset().map(|step| f32::from(step) * area);
+            assert_eq!(normal, expected, "{face:?} winding");
+            // The triangle pattern is the same as for a unit quad.
+            let base = triangles[0];
+            assert_eq!(
+                triangles,
+                [base, base + 1, base + 2, base, base + 2, base + 3]
+            );
+        }
+    }
+
+    /// A small deterministic generator (xorshift32), so the random tests need no crate and
+    /// give the same chunks on every run.
+    struct Rng(u32);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+    }
+
+    /// A chunk of `kinds` block kinds in cubic clumps of `clump` blocks, solid with the
+    /// given chance in percent. Clumps of one block give noise; larger ones give runs that merge.
+    fn random_chunk(rng: &mut Rng, kinds: u32, clump: usize, solid_percent: u32) -> Chunk {
+        let cells = CHUNK_SIZE.div_ceil(clump);
+        let mut table = vec![BlockId::AIR; cells * cells * cells];
+        for cell in &mut table {
+            if rng.next() % 100 < solid_percent {
+                *cell = BlockId((rng.next() % kinds + 1) as u16);
+            }
+        }
+        let mut chunk = Chunk::new();
+        for p in LocalPos::all() {
+            let [x, y, z] = [p.x(), p.y(), p.z()].map(|c| usize::from(c) / clump);
+            chunk.set(p, table[(y * cells + z) * cells + x]);
+        }
+        chunk
+    }
+
+    /// Seeds, kinds, clump sizes and densities of the random chunks.
+    fn random_chunks() -> Vec<Chunk> {
+        let mut rng = Rng(0x9E37_79B9);
+        let mut chunks = Vec::new();
+        for (kinds, clump, percent) in [(1, 1, 50), (3, 1, 70), (2, 3, 60), (3, 5, 50), (4, 8, 80)]
+        {
+            for _ in 0..4 {
+                chunks.push(random_chunk(&mut rng, kinds, clump, percent));
+            }
+        }
+        chunks
+    }
+
+    #[test]
+    fn greedy_covers_the_same_squares_as_the_naive_mesher_on_random_chunks() {
+        let mut merged_somewhere = false;
+        for chunk in &random_chunks() {
+            let (greedy, naive) = assert_matches_naive(chunk, &Neighbours::none());
+            merged_somewhere |= greedy < naive;
+        }
+        assert!(
+            merged_somewhere,
+            "the clumped chunks must give something to merge"
+        );
+    }
+
+    #[test]
+    fn greedy_covers_the_same_squares_with_random_neighbours() {
+        let mut rng = Rng(0x1234_5678);
+        let chunks = random_chunks();
+        let around: Vec<Chunk> = (0..Face::COUNT)
+            .map(|_| random_chunk(&mut rng, 2, 4, 60))
+            .collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            // Leave a different side out each time so missing neighbours are covered too.
+            let missing = i % (Face::COUNT + 1);
+            let sides = std::array::from_fn(|side| (side != missing).then(|| &around[side]));
+            assert_matches_naive(chunk, &Neighbours::new(sides));
+        }
+    }
+
+    #[test]
+    fn greedy_covers_the_same_squares_on_terrain() {
+        for seed in 1..=3 {
+            let (greedy, naive) =
+                assert_matches_naive(&crate::generate_terrain(seed), &Neighbours::none());
+            assert!(greedy < naive);
+        }
+    }
+
+    #[test]
+    fn greedy_covers_the_same_squares_on_terrain_with_neighbours() {
+        let world = terrain_world();
+        for (chunk_pos, chunk) in world.iter() {
+            assert_matches_naive(chunk, &world.neighbours(chunk_pos));
+        }
+    }
+
+    #[test]
+    fn flat_slab_merges_to_six_quads() {
+        let mut slab = Chunk::new();
+        for p in LocalPos::all().filter(|p| p.y() < 8) {
+            slab.set(p, STONE);
+        }
+        let (greedy, naive) = assert_matches_naive(&slab, &Neighbours::none());
+        assert_eq!(greedy, Face::COUNT);
+        assert!(naive > greedy);
+    }
+
+    #[test]
+    fn checkerboard_cannot_merge() {
+        let (greedy, naive) = assert_matches_naive(&checkerboard_chunk(), &Neighbours::none());
+        assert_eq!(greedy, naive);
+    }
+
+    #[test]
+    fn different_blocks_do_not_merge() {
+        let dirt = BlockId(2);
+        let mut chunk = Chunk::new();
+        for x in 0..4 {
+            chunk.set(pos(x, 0, 0), if x < 2 { STONE } else { dirt });
+        }
+        let mesh = build_mesh(&chunk);
+        // Top, bottom, front and back each split in two by the block change; the two
+        // ends are one square each, and the shared faces are hidden.
+        assert_eq!(mesh.quad_count(), 4 * 2 + 2);
+        assert_valid(&mesh);
+    }
+
+    #[test]
+    fn an_l_shape_is_cut_into_two_rectangles() {
+        let mut chunk = Chunk::new();
+        for (x, z) in [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)] {
+            chunk.set(pos(x, 0, z), STONE);
+        }
+        let mesh = build_mesh(&chunk);
+        let top = mesh
+            .vertices
+            .chunks(VERTICES_PER_QUAD)
+            .filter(|q| q[0].face == Face::PosY.index());
+        assert_eq!(top.count(), 2);
+    }
+
+    #[test]
+    fn a_quad_never_crosses_the_chunk_border() {
+        for chunk in [solid_chunk(), crate::generate_terrain(1)] {
+            assert_valid(&build_mesh(&chunk));
+        }
+    }
+
+    #[test]
+    fn neighbours_split_a_quad_where_they_hide_part_of_a_face() {
+        // A slab with a solid block in the neighbour across the middle of its +X side.
+        let mut slab = Chunk::new();
+        for p in LocalPos::all().filter(|p| p.y() < 4) {
+            slab.set(p, STONE);
+        }
+        let mut wall = Chunk::new();
+        wall.set(pos(0, 1, 7), STONE);
+        let mesh = mesh_with(&slab, &neighbours_on(&wall, &[Face::PosX]));
+        let x_faces = mesh
+            .vertices
+            .chunks(VERTICES_PER_QUAD)
+            .filter(|q| q[0].face == Face::PosX.index());
+        // The one hole in a 32x4 face leaves a rectangle below it, one above it, and two
+        // beside it: the row of the hole is split in two pieces and the rest in rows.
+        assert!(x_faces.count() > 1);
+        assert_matches_naive(&slab, &neighbours_on(&wall, &[Face::PosX]));
     }
 
     #[test]
@@ -526,7 +931,8 @@ mod tests {
     #[test]
     fn touching_solid_chunks_hide_their_shared_faces() {
         let (left, right) = (solid_chunk(), solid_chunk());
-        let expected = Face::COUNT * CHUNK_SIZE * CHUNK_SIZE - CHUNK_SIZE * CHUNK_SIZE;
+        // The five other sides remain, one merged quad each.
+        let expected = Face::COUNT - 1;
         // `right` lies on the +X side of `left`, and `left` on the -X side of `right`.
         let left_mesh = mesh_with(&left, &neighbours_on(&right, &[Face::PosX]));
         let right_mesh = mesh_with(&right, &neighbours_on(&left, &[Face::NegX]));
@@ -560,11 +966,7 @@ mod tests {
         for missing in Face::ALL {
             let present: Vec<Face> = Face::ALL.into_iter().filter(|&f| f != missing).collect();
             let mesh = mesh_with(&solid, &neighbours_on(&solid, &present));
-            assert_eq!(
-                mesh.quad_count(),
-                CHUNK_SIZE * CHUNK_SIZE,
-                "missing {missing:?}"
-            );
+            assert_eq!(mesh.quad_count(), 1, "missing {missing:?}");
             assert!(mesh.vertices.iter().all(|v| v.face == missing.index()));
         }
     }
@@ -575,7 +977,7 @@ mod tests {
         let solid = solid_chunk();
         let mesh = mesh_with(&solid, &neighbours_on(&air, &Face::ALL));
         assert_eq!(mesh, build_mesh(&solid));
-        assert_counts(&mesh, Face::COUNT * CHUNK_SIZE * CHUNK_SIZE);
+        assert_counts(&mesh, Face::COUNT);
     }
 
     #[test]
@@ -650,9 +1052,10 @@ mod tests {
         let mut hidden = 0;
         let mut mesh = ChunkMesh::default();
         for (chunk_pos, chunk) in world.iter() {
-            isolated += build_mesh(chunk).quad_count();
+            // Quads are merged, so count the unit squares they cover.
+            isolated += unit_faces(&build_mesh(chunk)).len();
             build_mesh_with_neighbours_into(chunk, &world.neighbours(chunk_pos), &mut mesh);
-            meshed += mesh.quad_count();
+            meshed += unit_faces(&mesh).len();
             assert_no_face_towards_solid(&world, chunk_pos, &mesh);
             // Each pair of chunks is visited once, from its lower chunk.
             if let Some(next) = world.get(chunk_pos.neighbour(Face::PosX)) {
@@ -672,22 +1075,12 @@ mod tests {
         assert_eq!(meshed, isolated - 2 * hidden);
     }
 
-    /// Brute force: no quad of `mesh` may look at a solid block of a neighbouring chunk.
+    /// Brute force: no square of `mesh` may look at a solid block of a neighbouring chunk.
     fn assert_no_face_towards_solid(world: &World, chunk_pos: ChunkPos, mesh: &ChunkMesh) {
         let size = CHUNK_SIZE as i32;
-        for quad in mesh.vertices.chunks(VERTICES_PER_QUAD) {
-            let face = Face::ALL[usize::from(quad[0].face)];
+        for (face_index, _, block) in unit_faces(mesh) {
+            let face = Face::ALL[usize::from(face_index)];
             let offset = face.offset();
-            // The block is the lowest corner of the quad, moved back by one along the
-            // axis of a face that points to a positive direction.
-            let block: [i32; 3] = std::array::from_fn(|axis| {
-                let low = quad
-                    .iter()
-                    .map(|v| i32::from(v.position[axis]))
-                    .min()
-                    .unwrap_or(0);
-                low - i32::from(offset[axis].max(0))
-            });
             let target: [i32; 3] =
                 std::array::from_fn(|axis| block[axis] + i32::from(offset[axis]));
             if target.iter().all(|&c| (0..size).contains(&c)) {
@@ -701,6 +1094,19 @@ mod tests {
                 other.get(pos(wrapped[0], wrapped[1], wrapped[2])).is_air(),
                 "{chunk_pos:?}: quad of block {block:?} faces a solid block"
             );
+        }
+    }
+
+    #[test]
+    fn face_axes_follow_the_normal_and_the_memory_order() {
+        for face in Face::ALL {
+            let [normal, u, v] = face.axes();
+            assert_ne!(face.offset()[normal], 0);
+            assert_eq!(face.offset().iter().filter(|&&step| step != 0).count(), 1);
+            let mut all = [normal, u, v];
+            all.sort_unstable();
+            assert_eq!(all, [0, 1, 2]);
+            assert!(AXIS_STRIDES[u] < AXIS_STRIDES[v]);
         }
     }
 

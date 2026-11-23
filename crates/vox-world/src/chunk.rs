@@ -11,6 +11,11 @@ pub const CHUNK_SIZE: usize = 32;
 /// Number of blocks in a chunk.
 pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
+/// Distance in the flat block array between two blocks that differ by one along the
+/// axis X, Y or Z. Layers go along `y`, then `z` within a layer, then `x`. The mesher
+/// walks the array with these strides, so they and [`LocalPos`]'s index come from here.
+pub(crate) const AXIS_STRIDES: [usize; 3] = [1, CHUNK_SIZE * CHUNK_SIZE, CHUNK_SIZE];
+
 /// Position of a block inside a chunk.
 ///
 /// Exists only with valid coordinates (each less than [`CHUNK_SIZE`]), so accessing
@@ -94,7 +99,9 @@ impl LocalPos {
 
     /// Index of the block in the chunk's flat array. Layers go along `y`, then `z` within a layer, then `x`.
     const fn index(self) -> usize {
-        (self.y as usize * CHUNK_SIZE + self.z as usize) * CHUNK_SIZE + self.x as usize
+        self.x as usize * AXIS_STRIDES[0]
+            + self.y as usize * AXIS_STRIDES[1]
+            + self.z as usize * AXIS_STRIDES[2]
     }
 }
 
@@ -121,6 +128,12 @@ impl Chunk {
         self.blocks[pos.index()]
     }
 
+    /// All blocks in storage order, indexed by [`AXIS_STRIDES`]. For the mesher, which
+    /// walks whole slices and cannot afford a position check per block.
+    pub(crate) fn blocks(&self) -> &[BlockId] {
+        &self.blocks
+    }
+
     /// Sets the block at the given position.
     pub fn set(&mut self, pos: LocalPos, block: BlockId) {
         self.blocks[pos.index()] = block;
@@ -139,6 +152,16 @@ mod tests {
 
     fn pos(x: usize, y: usize, z: usize) -> LocalPos {
         LocalPos::new(x, y, z).expect("test coordinates are known to be inside the chunk")
+    }
+
+    #[test]
+    fn blocks_are_laid_out_by_the_axis_strides() {
+        let mut chunk = Chunk::new();
+        chunk.set(pos(3, 4, 5), BlockId(7));
+        let index = 3 * AXIS_STRIDES[0] + 4 * AXIS_STRIDES[1] + 5 * AXIS_STRIDES[2];
+        assert_eq!(chunk.blocks()[index], BlockId(7));
+        assert_eq!(chunk.blocks().len(), CHUNK_VOLUME);
+        assert_eq!(chunk.blocks().iter().filter(|b| !b.is_air()).count(), 1);
     }
 
     #[test]

@@ -10,7 +10,7 @@ Source of ideas: a breakdown of the video "My game is 262,000 times faster than 
 5. Cubic chunks, so the world is infinite in height as well. (Done: `ChunkPos` has three coordinates and `World` stores chunks by it, see decision 0006. Faces hidden by a neighbouring chunk are skipped too, item 2.)
 6. Chunk generation and mesh building run off the main thread.
 7. Chunk LOD: distant chunks at lower resolution, merged into larger meshes.
-8. Greedy meshing.
+8. Greedy meshing. (Done: `build_mesh_with_neighbours_into` merges coplanar faces of the same block and direction into rectangles, see `docs/benchmarks.md` for the quad counts and the cost.)
 9. Multiplayer: only the world seed and modified chunks go over the network.
 10. GPU-driven rendering: indirect draw, push constants, GPU occlusion culling (depth pyramid).
 11. Graphics (AO, volumetric light, shadow cascades, TAA) only after the world core is stable.
