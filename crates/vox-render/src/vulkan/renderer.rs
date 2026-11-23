@@ -2,7 +2,6 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +25,7 @@ use super::timestamps;
 use crate::frustum::Frustum;
 use crate::interface::chunk::{CHUNK_ORIGIN_OFFSET, PUSH_CONSTANT_SIZE};
 use crate::overlay::window_size_bytes;
-use crate::{OverlayRect, RenderError, RenderStats, Renderer};
+use crate::{OverlayRect, RenderError, RenderStats, Renderer, ShaderSources};
 
 /// The sky: everything the meshes do not cover is cleared to this color.
 const SKY_COLOR: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
@@ -75,7 +74,7 @@ pub struct VulkanRenderer {
 
 impl VulkanRenderer {
     /// Creates the renderer for `window`, whose current size is `width` by `height` pixels,
-    /// with the shaders from `shader_dir`.
+    /// with the GLSL text in `shaders`.
     ///
     /// If a step fails, the locals created so far are dropped in reverse order of
     /// creation, which is the same safe order as the struct fields. Nothing has been
@@ -84,7 +83,7 @@ impl VulkanRenderer {
         window: Arc<W>,
         width: u32,
         height: u32,
-        shader_dir: &Path,
+        shaders: &ShaderSources,
     ) -> Result<Self, RenderError>
     where
         W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
@@ -100,10 +99,10 @@ impl VulkanRenderer {
         let format = swapchain::surface_format(&surface, &gpu)?;
         let depth_format = depth::depth_format(&context, &gpu)?;
         let render_pass = RenderPass::new(gpu.device(), format, depth_format)?;
-        let chunk_pipeline = Pipeline::chunk(gpu.device(), &render_pass, shader_dir)?;
+        let chunk_pipeline = Pipeline::chunk(gpu.device(), &render_pass, shaders)?;
         let blending_supported = pipeline::supports_blending(&context, &gpu, format.format);
         let overlay_pipeline =
-            Pipeline::overlay(gpu.device(), &render_pass, shader_dir, blending_supported)?;
+            Pipeline::overlay(gpu.device(), &render_pass, shaders, blending_supported)?;
         let swapchain = Swapchain::new(
             &context,
             &surface,

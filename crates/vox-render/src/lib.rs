@@ -12,13 +12,13 @@ mod shader;
 mod stats;
 mod vulkan;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 pub use error::RenderError;
 pub use overlay::OverlayRect;
+pub use shader::{ShaderSource, ShaderSources};
 pub use stats::RenderStats;
 
 /// What the game needs from a renderer.
@@ -115,21 +115,23 @@ pub trait Renderer {
 /// The renderer keeps the `Arc` alive for as long as it exists, which guarantees
 /// the native window outlives the surface created from it.
 ///
-/// `shader_dir` is the folder with the GLSL shader files (`chunk.vert`, `chunk.frag`,
-/// `overlay.vert`, `overlay.frag`). They are read and compiled once, here.
+/// `shaders` holds the GLSL text of every pipeline's shaders; the renderer reads no files,
+/// so the caller decides where they come from (the game resolves them through its resource
+/// packs). They are compiled and checked once, here.
 ///
 /// # Errors
 /// Returns an error if Vulkan is unavailable, no GPU can present to the window,
-/// or a shader file is missing or does not compile ([`RenderError::Shader`]).
+/// or a shader does not compile or does not fit its pipeline ([`RenderError::Shader`],
+/// naming the shader by [`ShaderSource::name`]).
 pub fn create_renderer<W>(
     window: Arc<W>,
     width: u32,
     height: u32,
-    shader_dir: &Path,
+    shaders: &ShaderSources,
 ) -> Result<Box<dyn Renderer>, RenderError>
 where
     W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
 {
-    let renderer = vulkan::VulkanRenderer::new(window, width, height, shader_dir)?;
+    let renderer = vulkan::VulkanRenderer::new(window, width, height, shaders)?;
     Ok(Box::new(renderer))
 }

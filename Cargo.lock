@@ -1724,6 +1724,7 @@ dependencies = [
  "font8x8",
  "glam",
  "vox-render",
+ "vox-resources",
  "vox-world",
  "winit",
 ]

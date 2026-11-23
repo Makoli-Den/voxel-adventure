@@ -14,8 +14,8 @@ pub enum RenderError {
     NoSuitableGpu,
     /// The window surface lacks a capability the renderer requires.
     Unsupported(&'static str),
-    /// A shader could not be read or compiled. The text names the file and
-    /// carries the compiler's message.
+    /// A shader does not compile or does not fit its pipeline. The text names the shader
+    /// (its [`crate::ShaderSource::name`]) and carries the compiler's or the check's message.
     Shader(String),
     /// Mesh data from the caller is malformed, for example an index points past the
     /// last vertex. The text says what is wrong.

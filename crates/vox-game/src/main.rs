@@ -1,8 +1,9 @@
 //! Game entry point.
 //!
-//! This is where the layers are wired together: it opens the window, creates the
-//! renderer, streams terrain chunks in around the camera and runs the event loop, flying
-//! a camera over the terrain. Mods and networking will join later.
+//! This is where the layers are wired together: it stacks the resource packs, opens the
+//! window, creates the renderer with the shaders from the packs, streams terrain chunks in
+//! around the camera and runs the event loop, flying a camera over the terrain. Mods and
+//! networking will join later.
 
 mod camera;
 mod cli;
@@ -11,6 +12,7 @@ mod editing;
 mod hud;
 mod metrics;
 mod pacing;
+mod packs;
 mod physics;
 mod streaming;
 
@@ -18,13 +20,12 @@ use std::env;
 use std::error::Error;
 use std::fmt::Display;
 use std::io::{self, Write};
-use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use vox_render::{RenderError, RenderStats, Renderer, create_renderer};
+use vox_render::{RenderError, RenderStats, Renderer, ShaderSources, create_renderer};
 use vox_world::{ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -45,9 +46,6 @@ use streaming::{ChunkStreamer, area, remesh};
 const WINDOW_TITLE: &str = "Voxel Adventure";
 /// The exit code for a mistake on the command line.
 const EXIT_USAGE: u8 = 2;
-/// Where the shaders are read from, relative to this crate's directory. Temporary: the
-/// resource virtual file system will resolve them through the active packs instead.
-const SHADER_DIR: &str = "../../assets/shaders";
 /// Seed of the terrain that is generated at startup.
 const WORLD_SEED: u32 = 1;
 /// Where the camera starts: above the loaded area, back from the origin chunk (the terrain
@@ -121,6 +119,8 @@ impl FillReport {
 /// Application state driven by the window event loop.
 struct App {
     options: Options,
+    /// The GLSL of every pipeline, read from the packs before the window opens.
+    shaders: ShaderSources,
     /// When the app was created, for the `--fly` autopilot's duration.
     run_started: Instant,
     window: Option<Arc<Window>>,
@@ -171,9 +171,10 @@ struct App {
 }
 
 impl App {
-    fn new(options: Options) -> Self {
+    fn new(options: Options, shaders: ShaderSources) -> Self {
         Self {
             options,
+            shaders,
             run_started: Instant::now(),
             window: None,
             renderer: None,
@@ -209,9 +210,8 @@ impl App {
             .with_active(!self.options.background);
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
-        let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(SHADER_DIR);
         let mut renderer =
-            create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
+            create_renderer(Arc::clone(&window), size.width, size.height, &self.shaders)?;
         println!("Rendering on: {}", renderer.device_name());
         renderer.set_camera(self.camera.view_projection(size.width, size.height));
 
@@ -587,6 +587,30 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Stacks the built-in pack and the `--pack` directories, warns about any `--pack` that is not
+/// a directory, and reads the shaders through the stack.
+///
+/// # Errors
+/// A message naming the built-in pack's path if it is missing (the game cannot run without
+/// it), or the shader that cannot be read.
+fn load_shaders(options: &Options) -> Result<ShaderSources, String> {
+    let built_in = packs::built_in_pack();
+    if !built_in.exists() {
+        return Err(format!(
+            "the built-in resource pack {} is not a directory",
+            packs::describe_root(built_in.root())
+        ));
+    }
+    let (stack, missing) = packs::pack_stack(built_in, &options.packs);
+    for root in missing {
+        eprintln!(
+            "warning: the pack {} is not a directory, so it provides nothing",
+            packs::describe_root(&root)
+        );
+    }
+    packs::load_shaders(&stack).map_err(|error| format!("cannot load the shaders: {error}"))
+}
+
 fn main() -> ExitCode {
     let options = match cli::parse(env::args().skip(1)) {
         Ok(Command::Run(options)) => options,
@@ -599,6 +623,14 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    // Read before the window opens, so a missing shader is reported without flashing one.
+    let shaders = match load_shaders(&options) {
+        Ok(shaders) => shaders,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
         Err(error) => {
@@ -608,7 +640,7 @@ fn main() -> ExitCode {
     };
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(options);
+    let mut app = App::new(options, shaders);
     let result = event_loop.run_app(&mut app);
     // The summary is printed however the loop ended. A closed standard output is not a
     // reason to fail (`println!` would panic), so a write error is ignored.
