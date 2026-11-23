@@ -66,6 +66,25 @@ impl Camera {
         Vec3::new(sin_yaw * cos_pitch, sin_pitch, -cos_yaw * cos_pitch)
     }
 
+    /// Puts the eye at `position`. A position that is not finite is ignored, for the reason
+    /// given at [`Self::look`].
+    pub fn set_position(&mut self, position: Vec3) {
+        if position.is_finite() {
+            self.position = position;
+        }
+    }
+
+    /// The level direction (world X and Z) the player walks in for `movement`: forward and
+    /// right follow the yaw but not the pitch, so looking down does not slow the walk.
+    /// Its length is at most 1 (diagonals are normalized); `up` is ignored.
+    pub fn walk_direction(&self, movement: Movement) -> [f32; 2] {
+        let forward = self.forward();
+        let level_forward = Vec3::new(forward.x, 0.0, forward.z).normalize_or_zero();
+        let direction = level_forward * movement.forward + self.right() * movement.right;
+        let clamped = direction.clamp_length_max(1.0);
+        [clamped.x, clamped.z]
+    }
+
     /// Unit vector to the camera's right, level with the ground.
     fn right(&self) -> Vec3 {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
@@ -234,6 +253,32 @@ mod tests {
             2.0,
         );
         assert!(close(camera.position, Vec3::new(1.0, 2.0, 1.0)));
+    }
+
+    #[test]
+    fn walking_ignores_the_pitch_and_is_not_faster_on_diagonals() {
+        let camera = Camera::new(Vec3::ZERO, FRAC_PI_2, -1.2);
+        let ahead = camera.walk_direction(Movement {
+            forward: 1.0,
+            ..Movement::default()
+        });
+        assert!((ahead[0] - 1.0).abs() < 1e-5 && ahead[1].abs() < 1e-5);
+        let diagonal = camera.walk_direction(Movement {
+            forward: 1.0,
+            right: 1.0,
+            up: 1.0,
+        });
+        assert!((Vec3::new(diagonal[0], 0.0, diagonal[1]).length() - 1.0).abs() < 1e-5);
+        assert_eq!(camera.walk_direction(Movement::default()), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn set_position_ignores_values_that_are_not_finite() {
+        let mut camera = Camera::new(Vec3::ONE, 0.0, 0.0);
+        camera.set_position(Vec3::new(f32::NAN, 0.0, 0.0));
+        assert!(close(camera.position, Vec3::ONE));
+        camera.set_position(Vec3::new(4.0, 5.0, 6.0));
+        assert!(close(camera.position, Vec3::new(4.0, 5.0, 6.0)));
     }
 
     #[test]

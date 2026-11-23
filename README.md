@@ -45,6 +45,7 @@ Fly over the generated terrain:
 | Right mouse button + mouse | look around |
 | Left mouse button | break the block under the crosshair (within a few blocks) |
 | F | place a stone block on the face under the crosshair |
+| G | switch between flying and walking (walking has gravity and collision; Space jumps, Shift does nothing) |
 | L | turn the frame limit on or off |
 | F3 | show or hide the metrics panel |
 | Esc | quit |

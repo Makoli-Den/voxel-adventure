@@ -7,6 +7,8 @@
 
 use vox_world::{BlockId, Chunk, ChunkPos, RayHit, STONE, World};
 
+use crate::physics::Body;
+
 /// How far the player reaches, in blocks, measured from the eye along the look direction.
 /// About the reach of Minecraft's creative mode plus a margin: far enough to build without
 /// walking up to every block, short enough that the block under the crosshair is clearly the
@@ -35,21 +37,15 @@ pub struct Edit {
     pub block: BlockId,
 }
 
-/// The block that contains `point`. Points are finite in the game; a NaN counts as 0 and
-/// huge values saturate (the behaviour of `as`), which only picks a harmless block.
-fn block_containing(point: [f32; 3]) -> [i32; 3] {
-    point.map(|coordinate| coordinate.floor() as i32)
-}
-
-/// Decides what `action` does when the eye at `eye` looks at `hit`, or `None` if nothing may
+/// Decides what `action` does when the player `body` looks at `hit`, or `None` if nothing may
 /// happen.
 ///
 /// - [`EditAction::Break`] writes air into the block that was hit.
 /// - [`EditAction::Place`] writes `block` into the cell in front of the hit face, unless that
-///   cell is the one the eye is in (the player would be stuck inside the block), or the ray
-///   started inside a solid block (`distance` is zero: there is no face in front of which to
-///   place anything).
-pub fn plan(action: EditAction, hit: &RayHit, eye: [f32; 3], block: BlockId) -> Option<Edit> {
+///   cell overlaps the player's box (the player would be stuck inside the block; this
+///   includes the cell of the eye), or the ray started inside a solid block (`distance` is
+///   zero: there is no face in front of which to place anything).
+pub fn plan(action: EditAction, hit: &RayHit, body: &Body, block: BlockId) -> Option<Edit> {
     match action {
         EditAction::Break => Some(Edit {
             position: hit.block,
@@ -58,8 +54,7 @@ pub fn plan(action: EditAction, hit: &RayHit, eye: [f32; 3], block: BlockId) -> 
         EditAction::Place => {
             let position = hit.adjacent();
             let inside_a_block = hit.distance <= 0.0;
-            (!inside_a_block && position != block_containing(eye))
-                .then_some(Edit { position, block })
+            (!inside_a_block && !body.overlaps_cell(position)).then_some(Edit { position, block })
         }
     }
 }
@@ -90,6 +85,10 @@ mod tests {
     /// The eye of the tests: in the middle of block (0, 1, 0).
     const EYE: [f32; 3] = [0.5, 1.5, 0.5];
 
+    fn body(eye: [f32; 3]) -> Body {
+        Body::from_eye(eye)
+    }
+
     fn hit(block: [i32; 3], face: Face, distance: f32) -> RayHit {
         RayHit {
             block,
@@ -104,7 +103,7 @@ mod tests {
         let edit = plan(
             EditAction::Break,
             &hit([3, 4, 5], Face::PosY, 2.0),
-            EYE,
+            &body(EYE),
             PLACE_BLOCK,
         );
         assert_eq!(
@@ -121,7 +120,7 @@ mod tests {
         let edit = plan(
             EditAction::Place,
             &hit([3, 4, 5], Face::PosY, 2.0),
-            EYE,
+            &body(EYE),
             PLACE_BLOCK,
         );
         assert_eq!(
@@ -134,31 +133,54 @@ mod tests {
     }
 
     #[test]
-    fn placing_into_the_block_of_the_eye_is_refused() {
+    fn placing_into_the_cell_of_the_eye_is_refused() {
         // The block at (0, 0, 0) is hit on its top face, and the eye is in the cell above it.
         let target = hit([0, 0, 0], Face::PosY, 0.5);
-        assert_eq!(plan(EditAction::Place, &target, EYE, PLACE_BLOCK), None);
+        assert_eq!(
+            plan(EditAction::Place, &target, &body(EYE), PLACE_BLOCK),
+            None
+        );
         // Breaking it is fine.
-        assert!(plan(EditAction::Break, &target, EYE, PLACE_BLOCK).is_some());
+        assert!(plan(EditAction::Break, &target, &body(EYE), PLACE_BLOCK).is_some());
     }
 
     #[test]
-    fn the_eye_block_is_found_with_floor_for_negative_coordinates() {
+    fn placing_into_any_cell_of_the_box_is_refused() {
+        // The box of the eye at EYE covers the cells y = -1 (feet), 0 and 1 above (0, _, 0).
+        let player = body(EYE);
+        for y in -1..=1 {
+            let target = hit([0, y - 1, 0], Face::PosY, 1.0);
+            assert_eq!(
+                plan(EditAction::Place, &target, &player, PLACE_BLOCK),
+                None,
+                "cell y = {y}"
+            );
+        }
+        // The cell above the head (the box ends at 1.7) and the cell beside the box are free.
+        let above = hit([0, 1, 0], Face::PosY, 1.0);
+        assert!(plan(EditAction::Place, &above, &player, PLACE_BLOCK).is_some());
+        let beside = hit([0, 0, 0], Face::PosX, 1.0);
+        assert!(plan(EditAction::Place, &beside, &player, PLACE_BLOCK).is_some());
+    }
+
+    #[test]
+    fn the_box_is_found_with_floor_for_negative_coordinates() {
         // Eye at (-0.5, -0.5, -0.5) is in block (-1, -1, -1), not (0, 0, 0).
+        let player = body([-0.5, -0.5, -0.5]);
         let target = hit([-1, -2, -1], Face::PosY, 0.5);
-        assert_eq!(
-            plan(EditAction::Place, &target, [-0.5, -0.5, -0.5], PLACE_BLOCK),
-            None
-        );
+        assert_eq!(plan(EditAction::Place, &target, &player, PLACE_BLOCK), None);
         let beside = hit([0, -2, 0], Face::PosY, 0.5);
-        assert!(plan(EditAction::Place, &beside, [-0.5, -0.5, -0.5], PLACE_BLOCK).is_some());
+        assert!(plan(EditAction::Place, &beside, &player, PLACE_BLOCK).is_some());
     }
 
     #[test]
     fn placing_when_the_ray_starts_inside_a_block_is_refused() {
         let target = hit([9, 9, 9], Face::NegX, 0.0);
-        assert_eq!(plan(EditAction::Place, &target, EYE, PLACE_BLOCK), None);
-        assert!(plan(EditAction::Break, &target, EYE, PLACE_BLOCK).is_some());
+        assert_eq!(
+            plan(EditAction::Place, &target, &body(EYE), PLACE_BLOCK),
+            None
+        );
+        assert!(plan(EditAction::Break, &target, &body(EYE), PLACE_BLOCK).is_some());
     }
 
     #[test]

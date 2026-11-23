@@ -11,6 +11,7 @@ mod editing;
 mod hud;
 mod metrics;
 mod pacing;
+mod physics;
 mod streaming;
 
 use std::env;
@@ -36,6 +37,8 @@ use cli::{Command, Options};
 use controls::Controls;
 use editing::{EditAction, PLACE_BLOCK, REACH};
 use metrics::FrameHistory;
+use pacing::MAX_FRAME_TIME;
+use physics::{Body, WalkInput};
 use streaming::{ChunkStreamer, area, remesh};
 
 /// The window title.
@@ -59,9 +62,6 @@ const CAMERA_START_PITCH: f32 = -0.35;
 const MOVE_SPEED: f32 = 40.0;
 /// How far the camera turns per pixel of mouse motion, in radians.
 const LOOK_SENSITIVITY: f32 = 0.0025;
-/// Longest frame time that is taken into account, in seconds. After a stall (a window
-/// drag, a breakpoint) the camera must not jump across the world.
-const MAX_FRAME_TIME: f32 = 0.1;
 
 /// Timing of the first fill of the area around the camera, for one log line: the time from
 /// the start until nothing is queued any more, and the time spent in uploads on the way.
@@ -136,6 +136,11 @@ struct App {
     /// Reused for the mesh of every chunk rebuilt after an edit.
     edit_scratch: ChunkMesh,
     camera: Camera,
+    /// The player's box. While flying it only follows the camera; while walking it moves the
+    /// camera.
+    body: Body,
+    /// Whether the player walks (collision and gravity) instead of flying; the G key toggles.
+    walking: bool,
     controls: Controls,
     /// Whether the frame rate is capped (twice the monitor's refresh rate, see `pacing`).
     /// Off by default, so the metrics show what the game can really do; the L key toggles it.
@@ -177,6 +182,8 @@ impl App {
             world: World::new(),
             edit_scratch: ChunkMesh::default(),
             camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
+            body: Body::from_eye(CAMERA_START.to_array()),
+            walking: false,
             controls: Controls::default(),
             frame_limit: false,
             hud_visible: true,
@@ -235,19 +242,34 @@ impl App {
 
     /// Moves the camera for the time since the last frame and hands it to the renderer.
     fn update_camera(&mut self, since_last_frame: Duration) {
-        let (movement, speed) = if self.options.fly_seconds.is_some() {
-            // The autopilot flies sideways, keeping the height, so the camera always meets
-            // terrain that has not been streamed in yet.
-            let sideways = Movement {
-                right: 1.0,
-                ..Movement::default()
+        let dt = since_last_frame.as_secs_f32().min(MAX_FRAME_TIME);
+        // The autopilot always flies, whatever mode the player toggled.
+        if self.walking && self.options.fly_seconds.is_none() {
+            // Walking: the body decides where the eye is (decision 0012).
+            let movement = self.controls.movement();
+            let input = WalkInput {
+                direction: self.camera.walk_direction(movement),
+                jump: movement.up > 0.0,
             };
-            (sideways, cli::FLY_SPEED)
+            self.body.step(&self.world, input, dt);
+            self.camera.set_position(Vec3::from(self.body.eye()));
         } else {
-            (self.controls.movement(), MOVE_SPEED)
-        };
-        let distance = speed * since_last_frame.as_secs_f32().min(MAX_FRAME_TIME);
-        self.camera.translate(movement, distance);
+            let (movement, speed) = if self.options.fly_seconds.is_some() {
+                // The autopilot flies sideways, keeping the height, so the camera always meets
+                // terrain that has not been streamed in yet.
+                let sideways = Movement {
+                    right: 1.0,
+                    ..Movement::default()
+                };
+                (sideways, cli::FLY_SPEED)
+            } else {
+                (self.controls.movement(), MOVE_SPEED)
+            };
+            self.camera.translate(movement, speed * dt);
+            // The body follows the flying eye, so placing a block still keeps clear of it and
+            // switching to walking continues from here.
+            self.body = Body::from_eye(self.camera.position().to_array());
+        }
 
         if let (Some(window), Some(renderer)) = (&self.window, self.renderer.as_mut()) {
             // The aspect ratio comes from the window. For a frame or so after a resize the
@@ -301,7 +323,7 @@ impl App {
         let Some(hit) = raycast(&self.world, eye, direction, REACH) else {
             return Ok(());
         };
-        let Some(edit) = editing::plan(action, &hit, eye, PLACE_BLOCK) else {
+        let Some(edit) = editing::plan(action, &hit, &self.body, PLACE_BLOCK) else {
             return Ok(());
         };
         // `None` when the chunk of the cell is not loaded, for example above the terrain layer.
@@ -436,11 +458,29 @@ impl App {
                 self.refresh_after_toggle(event_loop);
             }
             KeyCode::KeyF if pressed && !repeat => self.controls.request_edit(EditAction::Place),
+            KeyCode::KeyG if pressed && !repeat => {
+                self.toggle_walking();
+            }
             KeyCode::F3 if pressed && !repeat => {
                 self.hud_visible = !self.hud_visible;
                 self.refresh_after_toggle(event_loop);
             }
             _ => self.controls.set_key(code, pressed),
+        }
+    }
+
+    /// Switches between flying and walking. Walking continues from where the camera is, at
+    /// rest, and is refused while the box would be inside solid blocks (the player could not
+    /// get out by walking); flying is always allowed.
+    fn toggle_walking(&mut self) {
+        if self.walking {
+            self.walking = false;
+            return;
+        }
+        let body = Body::from_eye(self.camera.position().to_array());
+        if body.is_free(&self.world) {
+            self.body = body;
+            self.walking = true;
         }
     }
 
