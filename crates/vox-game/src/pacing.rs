@@ -8,6 +8,10 @@
 
 use std::time::Duration;
 
+/// Longest frame time that is taken into account for movement, in seconds. After a stall (a
+/// window drag, a breakpoint) the camera and the walking body must not jump across the world.
+pub const MAX_FRAME_TIME: f32 = 0.1;
+
 /// Frames drawn per monitor refresh.
 const FRAMES_PER_REFRESH: f64 = 2.0;
 
