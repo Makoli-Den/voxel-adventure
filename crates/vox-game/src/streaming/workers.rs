@@ -33,34 +33,35 @@ impl Error for StreamError {}
 
 /// A finished job.
 #[derive(Debug)]
-pub struct JobResult {
+pub struct JobResult<T> {
     /// The chunk the job was for.
     pub pos: ChunkPos,
-    /// The mesh the job built; empty when there is nothing to draw.
-    pub mesh: ChunkMesh,
+    /// What the job produced for it.
+    pub output: T,
     /// How long the job took on its worker.
     pub took: Duration,
 }
 
-/// A pool of threads that run one function on every position sent to it.
-pub struct Workers {
+/// A pool of threads that run one function on every position sent to it and return its
+/// output of type `T`.
+pub struct Workers<T> {
     /// Closed on drop, which ends the worker loops. `None` only while dropping.
     jobs: Option<Sender<ChunkPos>>,
-    results: Receiver<JobResult>,
+    results: Receiver<JobResult<T>>,
     /// Set on drop so workers skip the jobs still waiting in the channel.
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
 
-impl Workers {
+impl<T: Send + 'static> Workers<T> {
     /// Starts `count` threads (at least 1), each with its own scratch mesh, that run `work`
     /// on every position sent and report the result and how long it took.
     pub fn spawn(
         count: usize,
-        work: impl Fn(ChunkPos, &mut ChunkMesh) -> ChunkMesh + Send + Sync + 'static,
+        work: impl Fn(ChunkPos, &mut ChunkMesh) -> T + Send + Sync + 'static,
     ) -> Self {
         let (job_sender, job_receiver) = mpsc::channel::<ChunkPos>();
-        let (result_sender, results) = mpsc::channel::<JobResult>();
+        let (result_sender, results) = mpsc::channel::<JobResult<T>>();
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let work = Arc::new(work);
         let stop = Arc::new(AtomicBool::new(false));
@@ -95,7 +96,7 @@ impl Workers {
     ///
     /// # Errors
     /// [`StreamError::WorkerStopped`] when every worker is gone and nothing is left to read.
-    pub fn try_recv(&self) -> Result<Option<JobResult>, StreamError> {
+    pub fn try_recv(&self) -> Result<Option<JobResult<T>>, StreamError> {
         match self.results.try_recv() {
             Ok(result) => Ok(Some(result)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -117,7 +118,7 @@ impl Workers {
     }
 }
 
-impl Drop for Workers {
+impl<T> Drop for Workers<T> {
     /// Stops the workers and waits for them: each finishes the job it is running, at most.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -131,10 +132,10 @@ impl Drop for Workers {
 }
 
 /// The loop of one worker thread: take a job, run it, report it, until the pool shuts down.
-fn run_worker(
+fn run_worker<T>(
     jobs: &Mutex<Receiver<ChunkPos>>,
-    results: &Sender<JobResult>,
-    work: &(impl Fn(ChunkPos, &mut ChunkMesh) -> ChunkMesh + ?Sized),
+    results: &Sender<JobResult<T>>,
+    work: &(impl Fn(ChunkPos, &mut ChunkMesh) -> T + ?Sized),
     stop: &AtomicBool,
 ) {
     let mut scratch = ChunkMesh::default();
@@ -152,10 +153,10 @@ fn run_worker(
             return;
         }
         let started = Instant::now();
-        let mesh = work(pos, &mut scratch);
+        let output = work(pos, &mut scratch);
         let result = JobResult {
             pos,
-            mesh,
+            output,
             took: started.elapsed(),
         };
         if results.send(result).is_err() {
@@ -202,7 +203,7 @@ mod tests {
             assert!(started.elapsed() < TIMEOUT, "timed out");
             match workers.try_recv().expect("workers run") {
                 Some(result) => {
-                    assert_eq!(result.mesh.indices, vec![result.pos.x.unsigned_abs()]);
+                    assert_eq!(result.output.indices, vec![result.pos.x.unsigned_abs()]);
                     assert!(seen.insert(result.pos), "{:?} came back twice", result.pos);
                 }
                 None => thread::sleep(POLL),

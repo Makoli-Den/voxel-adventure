@@ -2,10 +2,14 @@
 //!
 //! W, A, S, D move, Space goes up, Shift goes down. Holding the right mouse button
 //! turns mouse motion into looking around, so the cursor never has to be captured.
+//! Clicking the left mouse button and pressing F ask for an edit (break or place a block);
+//! each press is remembered until the game takes it, so a quick click is never lost between
+//! two frames.
 
 use winit::keyboard::KeyCode;
 
 use crate::camera::Movement;
+use crate::editing::EditAction;
 
 /// Which movement keys are held, and whether the player is looking around.
 #[derive(Debug, Default)]
@@ -20,6 +24,12 @@ pub struct Controls {
     shift_left: bool,
     shift_right: bool,
     looking: bool,
+    /// Edit requests since the last [`Controls::take_edit`]: break first, then place.
+    break_requested: bool,
+    place_requested: bool,
+    /// Set when the window gained focus and cleared once the events of that moment are
+    /// handled: a click in it is the one that focused the window, not an edit.
+    just_focused: bool,
 }
 
 impl Controls {
@@ -40,6 +50,45 @@ impl Controls {
     /// Records that the look button (the right mouse button) was pressed or released.
     pub fn set_looking(&mut self, looking: bool) {
         self.looking = looking;
+    }
+
+    /// Records a press (not a release, not a key repeat) of an edit button.
+    pub fn request_edit(&mut self, action: EditAction) {
+        match action {
+            EditAction::Break => self.break_requested = true,
+            EditAction::Place => self.place_requested = true,
+        }
+    }
+
+    /// The window gained focus.
+    pub fn focus_gained(&mut self) {
+        self.just_focused = true;
+    }
+
+    /// Called when the current batch of window events is handled, which ends the moment in
+    /// which a click still counts as the one that focused the window.
+    pub fn end_of_events(&mut self) {
+        self.just_focused = false;
+    }
+
+    /// A press of the left mouse button: a request to break a block, unless the click is
+    /// the one that focused the window.
+    pub fn click(&mut self) {
+        if !self.just_focused {
+            self.request_edit(EditAction::Break);
+        }
+    }
+
+    /// The next requested edit, which is then forgotten. One per call, so two presses within
+    /// one frame are carried out in two frames, break before place.
+    pub fn take_edit(&mut self) -> Option<EditAction> {
+        if std::mem::take(&mut self.break_requested) {
+            Some(EditAction::Break)
+        } else if std::mem::take(&mut self.place_requested) {
+            Some(EditAction::Place)
+        } else {
+            None
+        }
     }
 
     /// Whether mouse motion should turn the camera right now.
@@ -125,6 +174,66 @@ mod tests {
     #[test]
     fn unrelated_keys_are_ignored() {
         assert_eq!(held(&[KeyCode::KeyQ, KeyCode::Enter]), Movement::default());
+    }
+
+    #[test]
+    fn an_edit_request_is_taken_once() {
+        let mut controls = Controls::default();
+        assert_eq!(controls.take_edit(), None);
+        controls.request_edit(EditAction::Place);
+        assert_eq!(controls.take_edit(), Some(EditAction::Place));
+        assert_eq!(controls.take_edit(), None);
+    }
+
+    #[test]
+    fn repeated_requests_before_a_frame_count_once() {
+        let mut controls = Controls::default();
+        controls.request_edit(EditAction::Break);
+        controls.request_edit(EditAction::Break);
+        assert_eq!(controls.take_edit(), Some(EditAction::Break));
+        assert_eq!(controls.take_edit(), None);
+    }
+
+    #[test]
+    fn break_is_taken_before_place_and_neither_is_lost() {
+        let mut controls = Controls::default();
+        controls.request_edit(EditAction::Place);
+        controls.request_edit(EditAction::Break);
+        assert_eq!(controls.take_edit(), Some(EditAction::Break));
+        assert_eq!(controls.take_edit(), Some(EditAction::Place));
+        assert_eq!(controls.take_edit(), None);
+    }
+
+    #[test]
+    fn the_click_that_focuses_the_window_does_not_break() {
+        let mut controls = Controls::default();
+        controls.focus_gained();
+        controls.click();
+        assert_eq!(controls.take_edit(), None);
+        // Once the events of that moment are handled, clicks count again.
+        controls.end_of_events();
+        controls.click();
+        assert_eq!(controls.take_edit(), Some(EditAction::Break));
+    }
+
+    #[test]
+    fn a_click_in_a_focused_window_breaks() {
+        let mut controls = Controls::default();
+        controls.click();
+        assert_eq!(controls.take_edit(), Some(EditAction::Break));
+    }
+
+    #[test]
+    fn the_edit_key_is_not_a_movement_key() {
+        assert_eq!(held(&[KeyCode::KeyF]), Movement::default());
+    }
+
+    #[test]
+    fn release_all_forgets_edit_requests() {
+        let mut controls = Controls::default();
+        controls.request_edit(EditAction::Break);
+        controls.release_all();
+        assert_eq!(controls.take_edit(), None);
     }
 
     #[test]

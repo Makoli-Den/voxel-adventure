@@ -122,6 +122,41 @@ pub fn panel(lines: &[String]) -> Vec<OverlayRect> {
     rects
 }
 
+/// Length of each arm of the crosshair, from its centre to its tip, in window pixels.
+const CROSSHAIR_ARM: f32 = 10.0;
+/// Thickness of the crosshair's bars, in window pixels. Even, so the bars sit centred on a
+/// pixel border and look the same on both sides.
+const CROSSHAIR_THICKNESS: f32 = 2.0;
+/// Bars in one layer of the crosshair: one horizontal and one vertical.
+const CROSSHAIR_BARS_PER_LAYER: usize = 2;
+/// Layers of the crosshair: the dark outline, then the white bars over it.
+const CROSSHAIR_LAYERS: usize = 2;
+/// Extra pixels of dark backing around the white bars, so the crosshair stays visible against
+/// bright sky and snow as well as against dark terrain.
+const CROSSHAIR_OUTLINE: f32 = 1.0;
+
+/// The crosshair for a window of `width` by `height` pixels: a white plus sign with a dark
+/// outline, centred in the window. It marks where the player's reach starts, the block that
+/// breaking and placing act on.
+pub fn crosshair(width: u32, height: u32) -> Vec<OverlayRect> {
+    let centre_x = width as f32 / 2.0;
+    let centre_y = height as f32 / 2.0;
+    // A bar of `length` by `thickness` centred on the window centre, grown by `grow` all round.
+    let bar = |length: f32, thickness: f32, grow: f32, color: [f32; 4]| {
+        let (w, h) = (length + 2.0 * grow, thickness + 2.0 * grow);
+        rect(centre_x - w / 2.0, centre_y - h / 2.0, w, h, color)
+    };
+    let length = 2.0 * CROSSHAIR_ARM;
+    let layers: [([f32; 4], f32); CROSSHAIR_LAYERS] =
+        [(PANEL_COLOR, CROSSHAIR_OUTLINE), (TEXT_COLOR, 0.0)];
+    let mut rects = Vec::with_capacity(CROSSHAIR_LAYERS * CROSSHAIR_BARS_PER_LAYER);
+    for (color, grow) in layers {
+        rects.push(bar(length, CROSSHAIR_THICKNESS, grow, color));
+        rects.push(bar(CROSSHAIR_THICKNESS, length, grow, color));
+    }
+    rects
+}
+
 /// One line of the panel: a label, padded to a fixed column, and its value.
 fn line(label: &str, value: impl std::fmt::Display) -> String {
     format!("{label:<LABEL_WIDTH$}{value}")
@@ -190,6 +225,7 @@ pub fn lines(
     ));
     lines.push(line("Limit", if frame_limit { "on" } else { "off" }));
     lines.push(line("Keys", "L limit, F3 panel"));
+    lines.push(line("Edit", "click break, F place"));
     lines
 }
 
@@ -198,6 +234,38 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn the_crosshair_is_centred_and_symmetric() {
+        for (width, height) in [(1280_u32, 720_u32), (801, 601)] {
+            let rects = crosshair(width, height);
+            assert_eq!(rects.len(), 4);
+            for r in &rects {
+                assert_eq!(r.x + r.width / 2.0, width as f32 / 2.0);
+                assert_eq!(r.y + r.height / 2.0, height as f32 / 2.0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_crosshair_has_a_dark_outline_below_white_bars() {
+        let rects = crosshair(1000, 1000);
+        // The outline bars come first, so the white ones are drawn over them, and are bigger.
+        assert_eq!(rects[0].color, PANEL_COLOR);
+        assert_eq!(rects[2].color, TEXT_COLOR);
+        assert!(rects[0].width > rects[2].width);
+        assert_eq!(rects[2].width, 2.0 * CROSSHAIR_ARM);
+        assert_eq!(rects[2].height, CROSSHAIR_THICKNESS);
+        assert_eq!(rects[3].width, CROSSHAIR_THICKNESS);
+        assert_eq!(rects[3].height, 2.0 * CROSSHAIR_ARM);
+    }
+
+    #[test]
+    fn a_zero_size_window_gives_finite_rectangles() {
+        for r in crosshair(0, 0) {
+            assert!([r.x, r.y, r.width, r.height].iter().all(|v| v.is_finite()));
+        }
+    }
 
     const MS: Duration = Duration::from_millis(1);
 

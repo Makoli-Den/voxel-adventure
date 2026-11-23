@@ -7,9 +7,10 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use vox_world::{ChunkMesh, ChunkPos};
+use vox_world::ChunkPos;
 
 use super::area;
+use super::job::Built;
 
 /// What the tracker knows about the progress, for the HUD and the fill log line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -35,15 +36,15 @@ pub struct ChunkTracker {
     /// keep range and came back while its first job still ran is sent again, so the real
     /// number of running jobs can briefly exceed this count; the second result is dropped.
     in_flight: HashSet<ChunkPos>,
-    /// Finished meshes waiting for their upload.
-    ready: VecDeque<(ChunkPos, ChunkMesh)>,
-    /// Positions whose mesh was handed out, or that have nothing to draw.
+    /// Finished chunks waiting to be handed out.
+    ready: VecDeque<(ChunkPos, Built)>,
+    /// Positions that were handed out, including those with nothing to draw.
     loaded: HashSet<ChunkPos>,
 }
 
-/// Whether a mesh has nothing to draw.
-fn has_nothing_to_draw(mesh: &ChunkMesh) -> bool {
-    mesh.indices.is_empty()
+/// Whether a built chunk has nothing to draw.
+fn has_nothing_to_draw(built: &Built) -> bool {
+    built.mesh.indices.is_empty()
 }
 
 impl ChunkTracker {
@@ -110,28 +111,30 @@ impl ChunkTracker {
 
     /// A worker finished `pos`. The result is dropped if `pos` is not in flight (it left the
     /// keep range meanwhile, or an earlier job of the same position already delivered).
-    pub fn finish(&mut self, pos: ChunkPos, mesh: ChunkMesh) {
+    pub fn finish(&mut self, pos: ChunkPos, built: Built) {
         if self.in_flight.remove(&pos) {
-            self.ready.push_back((pos, mesh));
+            self.ready.push_back((pos, built));
         }
     }
 
-    /// Up to `budget` non-empty meshes to upload, marked loaded. Empty ones are marked loaded
-    /// on the way and do not count against the budget.
-    pub fn take_uploads(&mut self, budget: usize) -> Vec<(ChunkPos, ChunkMesh)> {
-        let mut uploads = Vec::new();
-        while let Some((pos, mesh)) = self.ready.pop_front() {
-            if has_nothing_to_draw(&mesh) {
-                self.loaded.insert(pos);
-            } else if uploads.len() < budget {
-                self.loaded.insert(pos);
-                uploads.push((pos, mesh));
-            } else {
-                self.ready.push_front((pos, mesh));
-                break;
+    /// The chunks that are ready, marked loaded: at most `budget` with a mesh to upload.
+    /// Chunks with nothing to draw cost no upload, so they do not count against the budget,
+    /// but they are returned too, because the game's world needs their blocks.
+    pub fn take_loaded(&mut self, budget: usize) -> Vec<(ChunkPos, Built)> {
+        let mut taken = Vec::new();
+        let mut uploads = 0;
+        while let Some((pos, built)) = self.ready.pop_front() {
+            if !has_nothing_to_draw(&built) {
+                if uploads == budget {
+                    self.ready.push_front((pos, built));
+                    break;
+                }
+                uploads += 1;
             }
+            self.loaded.insert(pos);
+            taken.push((pos, built));
         }
-        uploads
+        taken
     }
 
     /// Progress figures.
@@ -145,6 +148,8 @@ impl ChunkTracker {
 
 #[cfg(test)]
 mod tests {
+    use vox_world::{Chunk, ChunkMesh};
+
     use super::*;
 
     /// A small radius keeps the tests readable: 13 columns.
@@ -157,11 +162,22 @@ mod tests {
     /// A bigger cap, for runs that should not be limited by it.
     const BIG_CAP: usize = 1000;
 
-    /// A mesh with something to draw.
-    fn solid() -> ChunkMesh {
-        ChunkMesh {
-            vertices: Vec::new(),
-            indices: vec![0],
+    /// A chunk with something to draw.
+    fn solid() -> Built {
+        Built {
+            chunk: Chunk::new(),
+            mesh: ChunkMesh {
+                vertices: Vec::new(),
+                indices: vec![0],
+            },
+        }
+    }
+
+    /// A chunk with nothing to draw.
+    fn invisible() -> Built {
+        Built {
+            chunk: Chunk::new(),
+            mesh: ChunkMesh::default(),
         }
     }
 
@@ -183,7 +199,7 @@ mod tests {
         while tracker.stats().queued > 0 {
             let jobs = tracker.next_jobs();
             finish_all(tracker, &jobs);
-            uploaded.extend(tracker.take_uploads(usize::MAX).into_iter().map(|u| u.0));
+            uploaded.extend(tracker.take_loaded(usize::MAX).into_iter().map(|u| u.0));
         }
         uploaded
     }
@@ -207,7 +223,7 @@ mod tests {
         // One finished job still counts until it is uploaded.
         tracker.finish(first[0], solid());
         assert!(tracker.next_jobs().is_empty());
-        tracker.take_uploads(usize::MAX);
+        tracker.take_loaded(usize::MAX);
         assert_eq!(tracker.next_jobs().len(), 1);
     }
 
@@ -225,7 +241,7 @@ mod tests {
             .copied()
             .expect("some job is far from the new centre");
         tracker.finish(stale, solid());
-        assert!(tracker.take_uploads(usize::MAX).is_empty());
+        assert!(tracker.take_loaded(usize::MAX).is_empty());
         assert_eq!(tracker.stats().loaded, 0);
     }
 
@@ -245,7 +261,7 @@ mod tests {
 
         tracker.finish(target, solid());
         tracker.finish(target, solid());
-        let uploads = tracker.take_uploads(usize::MAX);
+        let uploads = tracker.take_loaded(usize::MAX);
         assert_eq!(uploads.iter().filter(|u| u.0 == target).count(), 1);
     }
 
@@ -290,39 +306,55 @@ mod tests {
                 assert!(seen.insert(*pos), "{pos:?} was sent twice");
             }
             finish_all(&mut tracker, &jobs);
-            tracker.take_uploads(usize::MAX);
+            tracker.take_loaded(usize::MAX);
         }
     }
 
+    /// How many of the taken chunks have a mesh to upload.
+    fn drawable(taken: &[(ChunkPos, Built)]) -> usize {
+        taken
+            .iter()
+            .filter(|(_, built)| !built.mesh.indices.is_empty())
+            .count()
+    }
+
     #[test]
-    fn uploads_respect_the_budget_and_skip_empty_meshes() {
+    fn only_meshes_count_against_the_budget_and_empty_chunks_are_still_handed_out() {
         let mut tracker = ChunkTracker::new(RADIUS, BIG_CAP);
         tracker.set_centre(at(0, 0));
         let jobs = tracker.next_jobs();
         // Every second chunk has nothing to draw.
         for (index, pos) in jobs.iter().enumerate() {
-            let mesh = if index % 2 == 0 {
-                solid()
-            } else {
-                ChunkMesh::default()
-            };
-            tracker.finish(*pos, mesh);
+            let built = if index % 2 == 0 { solid() } else { invisible() };
+            tracker.finish(*pos, built);
         }
         let budget = 3;
-        let first = tracker.take_uploads(budget);
-        assert_eq!(first.len(), budget);
-        assert!(first.iter().all(|(_, mesh)| !mesh.indices.is_empty()));
-        // Three uploads, and the three empty chunks that lie before the fourth solid one.
+        let first = tracker.take_loaded(budget);
+        assert_eq!(drawable(&first), budget);
+        // Three meshes, and the three empty chunks that lie before the fourth solid one.
+        assert_eq!(first.len(), 6);
         assert_eq!(tracker.stats().loaded, 6);
 
-        let mut uploaded = first.len();
-        while uploaded < jobs.len().div_ceil(2) {
-            let batch = tracker.take_uploads(budget);
-            assert!(!batch.is_empty() && batch.len() <= budget);
-            uploaded += batch.len();
+        let mut handed_out = first.len();
+        while handed_out < jobs.len() {
+            let batch = tracker.take_loaded(budget);
+            assert!(!batch.is_empty() && drawable(&batch) <= budget);
+            handed_out += batch.len();
         }
+        assert_eq!(handed_out, jobs.len());
         assert_eq!(tracker.stats().loaded, jobs.len());
         assert_eq!(tracker.stats().queued, 0);
+    }
+
+    #[test]
+    fn an_empty_chunk_is_handed_out_even_with_a_zero_budget() {
+        let mut tracker = ChunkTracker::new(RADIUS, CAP);
+        tracker.set_centre(at(0, 0));
+        let pos = tracker.next_jobs()[0];
+        tracker.finish(pos, invisible());
+        let taken = tracker.take_loaded(0);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].0, pos);
     }
 
     #[test]
@@ -331,8 +363,8 @@ mod tests {
         tracker.set_centre(at(0, 0));
         let jobs = tracker.next_jobs();
         finish_all(&mut tracker, &jobs);
-        assert!(tracker.take_uploads(0).is_empty());
-        assert_eq!(tracker.take_uploads(usize::MAX).len(), jobs.len());
+        assert!(tracker.take_loaded(0).is_empty());
+        assert_eq!(tracker.take_loaded(usize::MAX).len(), jobs.len());
     }
 
     #[test]
@@ -346,7 +378,7 @@ mod tests {
         assert_eq!(total(&tracker), wanted);
         finish_all(&mut tracker, &jobs);
         assert_eq!(total(&tracker), wanted);
-        tracker.take_uploads(2);
+        tracker.take_loaded(2);
         assert_eq!(total(&tracker), wanted);
     }
 

@@ -7,6 +7,7 @@
 mod camera;
 mod cli;
 mod controls;
+mod editing;
 mod hud;
 mod metrics;
 mod pacing;
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use glam::Vec3;
 use vox_render::{RenderError, RenderStats, Renderer, create_renderer};
+use vox_world::{ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -32,8 +34,9 @@ use winit::window::{Window, WindowId};
 use camera::{Camera, Movement};
 use cli::{Command, Options};
 use controls::Controls;
+use editing::{EditAction, PLACE_BLOCK, REACH};
 use metrics::FrameHistory;
-use streaming::{ChunkStreamer, area};
+use streaming::{ChunkStreamer, area, remesh};
 
 /// The window title.
 const WINDOW_TITLE: &str = "Voxel Adventure";
@@ -126,6 +129,12 @@ struct App {
     streamer: Option<ChunkStreamer>,
     /// Progress of the first fill, for the log line.
     fill: FillReport,
+    /// The chunks that are loaded around the camera: what the player's ray hits and edits.
+    /// Chunks are added and dropped as streaming loads and unloads them, so it stays as big
+    /// as the view area.
+    world: World,
+    /// Reused for the mesh of every chunk rebuilt after an edit.
+    edit_scratch: ChunkMesh,
     camera: Camera,
     controls: Controls,
     /// Whether the frame rate is capped (twice the monitor's refresh rate, see `pacing`).
@@ -165,6 +174,8 @@ impl App {
             renderer: None,
             streamer: None,
             fill: FillReport::new(),
+            world: World::new(),
+            edit_scratch: ChunkMesh::default(),
             camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
             controls: Controls::default(),
             frame_limit: false,
@@ -258,18 +269,53 @@ impl App {
         for pos in &changes.removed {
             renderer.remove_chunk_mesh(*pos);
         }
+        editing::apply_streamed(&mut self.world, &changes.removed, changes.loaded);
         let uploading = Instant::now();
+        let mut uploaded = 0;
         // An upload error is fatal (the caller exits the game), so the streamer's record of
         // what is loaded need not be corrected when one fails halfway.
         for (pos, mesh) in &changes.uploads {
             renderer.set_chunk_mesh(*pos, mesh)?;
+            uploaded += 1;
         }
-        if !changes.uploads.is_empty() {
-            self.fill
-                .add_uploads(changes.uploads.len(), uploading.elapsed());
+        if uploaded > 0 {
+            self.fill.add_uploads(uploaded, uploading.elapsed());
         }
         if let Some(line) = self.fill.line_once(streamer) {
             println!("{line}");
+        }
+        Ok(())
+    }
+
+    /// Carries out the edit the player asked for since the last frame, if any: casts a ray
+    /// from the eye along the look direction, writes the block the ray picks and rebuilds the
+    /// mesh of every chunk the write made out of date.
+    ///
+    /// The ray is only cast when an edit was asked for, since nothing shows the targeted block.
+    fn edit(&mut self) -> Result<(), RenderError> {
+        let Some(action) = self.controls.take_edit() else {
+            return Ok(());
+        };
+        let eye = self.camera.position().to_array();
+        let direction = self.camera.forward().to_array();
+        let Some(hit) = raycast(&self.world, eye, direction, REACH) else {
+            return Ok(());
+        };
+        let Some(edit) = editing::plan(action, &hit, eye, PLACE_BLOCK) else {
+            return Ok(());
+        };
+        // `None` when the chunk of the cell is not loaded, for example above the terrain layer.
+        let Some(changed) = self.world.set_block(edit.position, edit.block) else {
+            return Ok(());
+        };
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        for pos in changed.as_slice() {
+            if remesh(WORLD_SEED, &self.world, *pos, &mut self.edit_scratch) {
+                // An empty mesh removes the chunk's entry, so a chunk that was dug empty vanishes.
+                renderer.set_chunk_mesh(*pos, &self.edit_scratch)?;
+            }
         }
         Ok(())
     }
@@ -292,6 +338,11 @@ impl App {
             }
         }
         if let Err(error) = self.stream() {
+            self.fail(event_loop, error);
+            return;
+        }
+        // After streaming, so the world holds the chunks that were just loaded.
+        if let Err(error) = self.edit() {
             self.fail(event_loop, error);
             return;
         }
@@ -333,7 +384,7 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        let rects = if self.hud_visible {
+        let mut rects = if self.hud_visible {
             let summary = self.live_frames.summary();
             let stream_stats = self
                 .streamer
@@ -349,6 +400,11 @@ impl App {
         } else {
             Vec::new()
         };
+        // The crosshair is always visible, also while the metrics panel is hidden.
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            rects.extend(hud::crosshair(size.width, size.height));
+        }
         renderer.set_overlay(&rects)
     }
 
@@ -379,6 +435,7 @@ impl App {
                 self.next_frame = Instant::now();
                 self.refresh_after_toggle(event_loop);
             }
+            KeyCode::KeyF if pressed && !repeat => self.controls.request_edit(EditAction::Place),
             KeyCode::F3 if pressed && !repeat => {
                 self.hud_visible = !self.hud_visible;
                 self.refresh_after_toggle(event_loop);
@@ -423,8 +480,14 @@ impl ApplicationHandler for App {
                 button: MouseButton::Right,
                 ..
             } => self.controls.set_looking(state == ElementState::Pressed),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => self.controls.click(),
             // Held keys would stay "held" forever, because their release goes to another window.
             WindowEvent::Focused(false) => self.controls.release_all(),
+            WindowEvent::Focused(true) => self.controls.focus_gained(),
             WindowEvent::Moved(_) => self.update_frame_interval(),
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -436,6 +499,9 @@ impl ApplicationHandler for App {
                 if self.minimized {
                     event_loop.set_control_flow(ControlFlow::Wait);
                     self.skip_next_sample = true;
+                } else {
+                    // The crosshair belongs in the middle of the new size.
+                    self.refresh_after_toggle(event_loop);
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
@@ -453,6 +519,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.controls.end_of_events();
         if self.minimized {
             return;
         }
