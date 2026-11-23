@@ -13,6 +13,12 @@
 //! guaranteed in Vulkan 1.0, while a four-byte one is. The fourth byte happens to be
 //! the face index, so nothing is wasted.
 //!
+//! # Shader contract
+//! The renderer skips chunks whose box (the chunk's 32-block cube at its origin) lies outside
+//! the view, so a vertex shader must place every vertex inside that box:
+//! `chunk_origin + position` with no displacement. A shader pack that moves vertices
+//! (waves, wind) must keep them within the box, or chunks will disappear at the screen edges.
+//!
 //! # Push constants
 //! One range for the vertex stage only, 80 bytes at offset 0, pushed once per chunk
 //! drawn. Floats are little-endian `f32`:

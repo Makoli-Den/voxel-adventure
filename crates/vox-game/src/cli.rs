@@ -3,8 +3,8 @@
 /// How many chunks around the start the world extends when `--view-radius` is not given.
 pub const DEFAULT_VIEW_RADIUS: i32 = 8;
 
-/// The largest accepted `--view-radius`: (2 * 30 + 1)^2 = 3721 chunk columns, enough to
-/// measure how the frame time grows with the chunk count without exhausting memory.
+/// The largest accepted `--view-radius`: (2 * 30 + 1)^2 = 3721 chunk columns (about 6 million
+/// quads), enough to measure how the frame time grows with the chunk count.
 pub const MAX_VIEW_RADIUS: i32 = 30;
 
 /// How the game was asked to run.
@@ -123,6 +123,12 @@ mod tests {
         assert!(run(&["--view-radius", "-1"]).is_err());
         assert!(run(&["--view-radius", "x"]).is_err());
         assert!(run(&["--view-radius"]).is_err());
+    }
+
+    #[test]
+    fn the_usage_states_the_radius_limits() {
+        assert!(USAGE.contains(&MAX_VIEW_RADIUS.to_string()));
+        assert!(USAGE.contains(&DEFAULT_VIEW_RADIUS.to_string()));
     }
 
     #[test]

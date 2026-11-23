@@ -41,7 +41,8 @@ impl Frustum {
 
     /// Whether the axis-aligned box from `min` to `max` may be visible. `false` means
     /// the box is entirely outside one plane and can be skipped; `true` can include
-    /// boxes near a corner that are in fact outside (a conservative answer).
+    /// boxes near a corner that are in fact outside (a conservative answer). A plane that
+    /// is not a finite number (a broken matrix) never culls: when in doubt, draw.
     // HOT PATH: runs for every chunk every frame; six planes, one comparison each, no
     // allocation. It tests only the box corner that lies farthest along the plane normal.
     pub(crate) fn may_see_box(&self, min: [f32; 3], max: [f32; 3]) -> bool {
@@ -54,7 +55,8 @@ impl Frustum {
                 }
             };
             let farthest = plane[0] * corner(0) + plane[1] * corner(1) + plane[2] * corner(2);
-            farthest + plane[3] >= 0.0
+            let distance = farthest + plane[3];
+            distance >= 0.0 || !distance.is_finite()
         })
     }
 }
@@ -125,5 +127,27 @@ mod tests {
             !frustum.may_see_box([-1.0, -1.0, -201.0], [1.0, 1.0, -200.0]),
             "beyond far"
         );
+        assert!(
+            !frustum.may_see_box([-1.0, -1.0, -0.5], [1.0, 1.0, -0.1]),
+            "before near"
+        );
+        assert!(
+            !frustum.may_see_box([-60.0, -1.0, -20.0], [-30.0, 1.0, -10.0]),
+            "left"
+        );
+        assert!(
+            !frustum.may_see_box([-1.0, 30.0, -20.0], [1.0, 40.0, -10.0]),
+            "above"
+        );
+        assert!(
+            !frustum.may_see_box([-1.0, -40.0, -20.0], [1.0, -30.0, -10.0]),
+            "below"
+        );
+    }
+
+    #[test]
+    fn a_broken_matrix_culls_nothing() {
+        let frustum = Frustum::from_view_projection(&[[f32::NAN; 4]; 4]);
+        assert!(frustum.may_see_box([0.0; 3], [1.0; 3]));
     }
 }

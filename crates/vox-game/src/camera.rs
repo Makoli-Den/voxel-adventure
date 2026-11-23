@@ -13,8 +13,7 @@ const FIELD_OF_VIEW_DEGREES: f32 = 70.0;
 /// Distance of the near clipping plane, in blocks.
 const NEAR: f32 = 0.1;
 /// Distance of the far clipping plane, in blocks. It must cover the loaded area from any point
-/// inside it (the largest `--view-radius`, 30: 61 chunks of 32 blocks across, a diagonal of about
-/// 2760 blocks), otherwise the far edge of the world is cut off when the camera flies.
+/// inside it (the largest `--view-radius`; a test checks it), otherwise the far edge of the world is cut off when the camera flies.
 const FAR: f32 = 3000.0;
 /// Largest pitch, one degree short of straight up or down, where "up" would become ambiguous.
 const MAX_PITCH: f32 = FRAC_PI_2 - PI / 180.0;
@@ -117,6 +116,15 @@ mod tests {
     use glam::Mat4;
 
     use super::*;
+
+    #[test]
+    fn the_far_plane_covers_the_largest_world_diagonal() {
+        let side = (2 * crate::cli::MAX_VIEW_RADIUS + 1) as f32 * vox_world::CHUNK_SIZE as f32;
+        assert!(
+            FAR >= side * std::f32::consts::SQRT_2,
+            "{FAR} < diagonal of {side}"
+        );
+    }
 
     fn close(a: Vec3, b: Vec3) -> bool {
         (a - b).length() < 1e-5

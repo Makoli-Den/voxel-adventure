@@ -38,7 +38,8 @@ pub struct VulkanRenderer {
     // ones it depends on: buffers, framebuffers (in the swapchain) and the pipelines
     // before the render pass, everything before the device. Do not reorder.
     frames: Frames,
-    /// The meshes drawn every frame, one per chunk that has something to draw.
+    /// The meshes that are candidates for drawing every frame (those outside the view are
+    /// skipped), one per chunk that has something to draw.
     meshes: HashMap<ChunkPos, GpuMesh>,
     /// The overlay drawn over every frame, `None` while there is none.
     overlay: Option<GpuOverlay>,
