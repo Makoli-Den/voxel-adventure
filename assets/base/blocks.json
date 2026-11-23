@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "blocks": [
+    {
+      "name": "grass",
+      "textures": {
+        "top": "base:textures/block/grass_top.png",
+        "bottom": "base:textures/block/dirt.png",
+        "side": "base:textures/block/grass_side.png"
+      }
+    },
+    { "name": "dirt", "textures": { "all": "base:textures/block/dirt.png" } },
+    { "name": "stone", "textures": { "all": "base:textures/block/stone.png" } }
+  ]
+}

@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 font8x8 = { version = "0.3.1", default-features = false }
 glam = "0.34.3"
+vox-content = { path = "../vox-content" }
 vox-render = { path = "../vox-render" }
 vox-resources = { path = "../vox-resources" }
 vox-world = { path = "../vox-world" }

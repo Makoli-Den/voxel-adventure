@@ -1,0 +1,17 @@
+[package]
+name = "vox-content"
+version = "0.1.0"
+description = "Content loaded from resource packs: block definitions today, textures later. Knows nothing about rendering."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+vox-resources = { path = "../vox-resources" }
+vox-world = { path = "../vox-world" }
+
+[lints]
+workspace = true
