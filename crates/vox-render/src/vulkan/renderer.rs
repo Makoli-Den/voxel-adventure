@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use vox_world::{ChunkMesh, ChunkPos};
+use vox_world::{CHUNK_SIZE, ChunkMesh, ChunkPos};
 
 use super::buffer::Buffer;
 use super::context::{Context, Surface};
@@ -22,6 +22,7 @@ use super::render_pass::RenderPass;
 use super::retired::{self, Retired};
 use super::swapchain::{self, Swapchain};
 use super::timestamps;
+use crate::frustum::Frustum;
 use crate::interface::chunk::{CHUNK_ORIGIN_OFFSET, PUSH_CONSTANT_SIZE};
 use crate::overlay::window_size_bytes;
 use crate::{OverlayRect, RenderError, RenderStats, Renderer};
@@ -37,7 +38,8 @@ pub struct VulkanRenderer {
     // ones it depends on: buffers, framebuffers (in the swapchain) and the pipelines
     // before the render pass, everything before the device. Do not reorder.
     frames: Frames,
-    /// The meshes drawn every frame, one per chunk that has something to draw.
+    /// The meshes that are candidates for drawing every frame (those outside the view are
+    /// skipped), one per chunk that has something to draw.
     meshes: HashMap<ChunkPos, GpuMesh>,
     /// The overlay drawn over every frame, `None` while there is none.
     overlay: Option<GpuOverlay>,
@@ -236,7 +238,11 @@ impl VulkanRenderer {
                     0,
                     &matrix_bytes(&self.camera),
                 );
+                let frustum = Frustum::from_view_projection(&self.camera);
                 for (&pos, mesh) in &self.meshes {
+                    if !chunk_may_be_visible(&frustum, pos) {
+                        continue;
+                    }
                     self.record_mesh(command_buffer, pos, mesh);
                     drawn.count_chunk_draw(mesh.index_count());
                 }
@@ -527,6 +533,13 @@ const IDENTITY: [[f32; 4]; 4] = [
 const MATRIX_BYTES: usize = CHUNK_ORIGIN_OFFSET as usize;
 /// Bytes of the origin part of the push constants: the rest of the block.
 const ORIGIN_BYTES: usize = (PUSH_CONSTANT_SIZE - CHUNK_ORIGIN_OFFSET) as usize;
+
+/// Whether any part of the chunk at `pos` may be inside the view, by its bounding box.
+fn chunk_may_be_visible(frustum: &Frustum, pos: ChunkPos) -> bool {
+    let size = CHUNK_SIZE as f32;
+    let [x, y, z] = pos.origin().map(|block| block as f32);
+    frustum.may_see_box([x, y, z], [x + size, y + size, z + size])
+}
 
 /// Packs the first part of the push constants, laid out as `crate::interface` describes:
 /// the column-major matrix, columns one after another, each float little-endian.

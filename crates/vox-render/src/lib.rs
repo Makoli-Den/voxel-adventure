@@ -5,6 +5,7 @@
 //! replaced (for example by a fallback for old devices) without touching other layers.
 
 mod error;
+mod frustum;
 mod interface;
 mod overlay;
 mod shader;
@@ -43,7 +44,8 @@ pub trait Renderer {
 
     /// Adds or replaces the mesh of the chunk at `pos`. An empty mesh (no indices) removes the entry.
     ///
-    /// Every chunk that has a mesh is drawn each frame. Mesh coordinates are chunk-local
+    /// Every chunk that has a mesh is drawn each frame unless its bounding box lies entirely
+    /// outside the camera's view (frustum culling). Mesh coordinates are chunk-local
     /// block units; the renderer places the chunk at `pos.origin()`. A replaced mesh's GPU
     /// memory is freed a few frames later, once no frame in flight can use it, so this
     /// never waits for the GPU.

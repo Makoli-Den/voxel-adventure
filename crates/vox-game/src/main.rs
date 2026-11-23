@@ -40,9 +40,6 @@ const WINDOW_TITLE: &str = "Voxel Adventure";
 const EXIT_USAGE: u8 = 2;
 /// Seed of the terrain that is generated at startup.
 const WORLD_SEED: u32 = 1;
-/// How far the loaded area reaches from the origin chunk along X and Z, in chunks. The
-/// camera's far plane (`FAR` in `camera.rs`) has to cover the area, so the two go together.
-const VIEW_RADIUS: i32 = 8;
 /// Where the camera starts: above the loaded area, back from the origin chunk (the terrain
 /// lies at heights 8 to 24), so a large part of the area is in view.
 const CAMERA_START: Vec3 = Vec3::new(16.0, 60.0, 90.0);
@@ -132,7 +129,7 @@ impl App {
         let mut renderer =
             create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
         println!("Rendering on: {}", renderer.device_name());
-        let loaded = world_loader::load_area(WORLD_SEED, VIEW_RADIUS);
+        let loaded = world_loader::load_area(WORLD_SEED, self.options.view_radius);
         let uploading = Instant::now();
         for (pos, mesh) in &loaded.meshes {
             renderer.set_chunk_mesh(*pos, mesh)?;
