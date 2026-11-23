@@ -38,6 +38,9 @@ use metrics::FrameHistory;
 const WINDOW_TITLE: &str = "Voxel Adventure";
 /// The exit code for a mistake on the command line.
 const EXIT_USAGE: u8 = 2;
+/// Where the shaders are read from, relative to this crate's directory. Temporary: the
+/// resource virtual file system will resolve them through the active packs instead.
+const SHADER_DIR: &str = "../../assets/shaders";
 /// Seed of the terrain that is generated at startup.
 const WORLD_SEED: u32 = 1;
 /// Where the camera starts: above the loaded area, back from the origin chunk (the terrain
@@ -123,9 +126,7 @@ impl App {
             .with_active(!self.options.background);
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
-        // Temporary: shaders are read straight from the source tree until the resource
-        // virtual file system exists and resolves them through the active packs.
-        let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/shaders");
+        let shader_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(SHADER_DIR);
         let mut renderer =
             create_renderer(Arc::clone(&window), size.width, size.height, &shader_dir)?;
         println!("Rendering on: {}", renderer.device_name());
@@ -370,11 +371,11 @@ fn main() -> ExitCode {
     let options = match cli::parse(env::args().skip(1)) {
         Ok(Command::Run(options)) => options,
         Ok(Command::Help) => {
-            println!("{}", cli::USAGE);
+            println!("{}", cli::usage());
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("{message}\n\n{}", cli::USAGE);
+            eprintln!("{message}\n\n{}", cli::usage());
             return ExitCode::from(EXIT_USAGE);
         }
     };

@@ -10,6 +10,7 @@ use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use vox_world::{CHUNK_SIZE, ChunkMesh, ChunkPos};
 
+use super::NO_TIMEOUT;
 use super::buffer::Buffer;
 use super::context::{Context, Surface};
 use super::depth;
@@ -29,6 +30,10 @@ use crate::{OverlayRect, RenderError, RenderStats, Renderer};
 
 /// The sky: everything the meshes do not cover is cleared to this color.
 const SKY_COLOR: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
+
+/// The farthest depth: the depth buffer is cleared to it and the viewport's depth range
+/// ends at it, so the chunk pipeline's LESS test passes for anything drawn.
+const FAR_DEPTH: f32 = 1.0;
 
 /// Draws into a window with Vulkan.
 ///
@@ -191,7 +196,7 @@ impl VulkanRenderer {
             },
             vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
+                    depth: FAR_DEPTH,
                     stencil: 0,
                 },
             },
@@ -431,7 +436,7 @@ impl Renderer for VulkanRenderer {
         unsafe {
             self.gpu
                 .device()
-                .wait_for_fences(&[slot.in_flight], true, u64::MAX)?;
+                .wait_for_fences(&[slot.in_flight], true, NO_TIMEOUT)?;
         }
         // The wait proved the slot's previous frame finished, so its timing can be read.
         if let Some(gpu_time) = self.frames.take_gpu_time()? {
@@ -564,7 +569,7 @@ fn origin_bytes(origin: [i32; 3]) -> [u8; ORIGIN_BYTES] {
 
 /// Writes `floats` little-endian into `bytes`, four bytes each, as far as both reach.
 fn write_floats(bytes: &mut [u8], floats: impl IntoIterator<Item = f32>) {
-    for (chunk, value) in bytes.chunks_exact_mut(4).zip(floats) {
+    for (chunk, value) in bytes.chunks_exact_mut(size_of::<f32>()).zip(floats) {
         chunk.copy_from_slice(&value.to_le_bytes());
     }
 }
@@ -578,7 +583,7 @@ fn full_viewport(extent: vk::Extent2D) -> vk::Viewport {
         width: extent.width as f32,
         height: extent.height as f32,
         min_depth: 0.0,
-        max_depth: 1.0,
+        max_depth: FAR_DEPTH,
     }
 }
 

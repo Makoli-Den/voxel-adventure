@@ -3,7 +3,7 @@
 //! The world is right-handed with Y up. At yaw 0 and pitch 0 the camera looks along
 //! -Z; a positive yaw turns it towards +X (a right turn seen from above).
 
-use std::f32::consts::{FRAC_PI_2, PI, TAU};
+use std::f32::consts::{FRAC_PI_2, TAU};
 
 use glam::Vec3;
 use glam::camera::rh::{proj::vulkan, view};
@@ -15,8 +15,11 @@ const NEAR: f32 = 0.1;
 /// Distance of the far clipping plane, in blocks. It must cover the loaded area from any point
 /// inside it (the largest `--view-radius`; a test checks it), otherwise the far edge of the world is cut off when the camera flies.
 const FAR: f32 = 3000.0;
+/// How far short of straight up or down the pitch may go, in degrees. At exactly 90 degrees
+/// the look direction is parallel to the world's up axis and the view matrix degenerates.
+const PITCH_MARGIN_DEGREES: f32 = 1.0;
 /// Largest pitch, one degree short of straight up or down, where "up" would become ambiguous.
-const MAX_PITCH: f32 = FRAC_PI_2 - PI / 180.0;
+const MAX_PITCH: f32 = FRAC_PI_2 - PITCH_MARGIN_DEGREES.to_radians();
 
 /// Which way the player wants to move, each axis from -1 to 1, relative to the camera.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

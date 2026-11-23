@@ -3,11 +3,16 @@
 
 use ash::{khr, vk};
 
+use super::NO_TIMEOUT;
 use super::context::{Context, Surface};
 use super::depth::DepthImage;
 use super::gpu::Gpu;
 use super::render_pass::RenderPass;
 use crate::RenderError;
+
+/// The `current_extent` width a surface reports when it has no fixed size and the
+/// swapchain's extent decides the window size instead (the Vulkan spec's special value).
+const EXTENT_CHOSEN_BY_SWAPCHAIN: u32 = u32::MAX;
 
 /// Usage we need from swapchain images: drawing into them as color attachments.
 fn image_usage() -> vk::ImageUsageFlags {
@@ -173,7 +178,7 @@ impl Swapchain {
         // SAFETY: the swapchain is alive; the semaphore's state is the caller's contract.
         unsafe {
             self.loader
-                .acquire_next_image(self.handle, u64::MAX, semaphore, vk::Fence::null())
+                .acquire_next_image(self.handle, NO_TIMEOUT, semaphore, vk::Fence::null())
         }
     }
 
@@ -312,7 +317,7 @@ fn is_listed(formats: &[vk::SurfaceFormatKHR], wanted: vk::SurfaceFormatKHR) -> 
 
 /// Uses the size the surface dictates, or the window size clamped to the allowed range.
 fn choose_extent(capabilities: &vk::SurfaceCapabilitiesKHR, size: (u32, u32)) -> vk::Extent2D {
-    if capabilities.current_extent.width != u32::MAX {
+    if capabilities.current_extent.width != EXTENT_CHOSEN_BY_SWAPCHAIN {
         return capabilities.current_extent;
     }
     vk::Extent2D {

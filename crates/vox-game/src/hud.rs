@@ -8,7 +8,7 @@
 use font8x8::legacy::BASIC_LEGACY;
 use vox_render::{OverlayRect, RenderStats};
 
-use crate::metrics::{Summary, millis};
+use crate::metrics::{LOW_0_1_PERCENT_LABEL, LOW_1_PERCENT_LABEL, Summary, millis};
 
 /// Pixels along each side of a font cell.
 const GLYPH_PIXELS: usize = 8;
@@ -26,9 +26,11 @@ const PANEL_PADDING: f32 = 8.0;
 const PANEL_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
 /// The text: opaque white.
 const TEXT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+/// Spaces between the label column and the values.
+const LABEL_GAP: usize = 1;
 /// Width of the label column, so the values of all lines start at the same place: the longest
-/// label ("0.1% low" is 8 characters) plus one space.
-const LABEL_WIDTH: usize = 9;
+/// label (the 0.1% low, which is the longest of the labels in the panel) plus [`LABEL_GAP`].
+const LABEL_WIDTH: usize = LOW_0_1_PERCENT_LABEL.len() + LABEL_GAP;
 
 /// The font cell of `character`. Printable basic Latin has its own glyph; control characters
 /// and everything outside basic Latin show as [`MISSING_GLYPH`], so a stray character is
@@ -132,8 +134,14 @@ pub fn lines(summary: Option<&Summary>, stats: &RenderStats, frame_limit: bool) 
         Some(summary) => {
             let average_frame = millis(summary.covered) / summary.frames as f64;
             lines.push(line("FPS", format!("{:.0}", summary.average_fps)));
-            lines.push(line("1% low", format!("{:.0}", summary.low_1_percent)));
-            lines.push(line("0.1% low", format!("{:.0}", summary.low_0_1_percent)));
+            lines.push(line(
+                LOW_1_PERCENT_LABEL,
+                format!("{:.0}", summary.low_1_percent),
+            ));
+            lines.push(line(
+                LOW_0_1_PERCENT_LABEL,
+                format!("{:.0}", summary.low_0_1_percent),
+            ));
             lines.push(line(
                 "Frame",
                 format!(

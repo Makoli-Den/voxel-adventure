@@ -35,13 +35,18 @@ pub enum Command {
     Help,
 }
 
-/// The text printed for `--help` and after a mistake.
-pub const USAGE: &str = "Usage: vox-game [--background] [--view-radius N]
+/// The text printed for `--help` and after a mistake. The radius limits are written from the
+/// constants, so the text cannot disagree with what the parser accepts.
+pub fn usage() -> String {
+    format!(
+        "Usage: vox-game [--background] [--view-radius N]
 
 Options:
   --background     open the window without taking the keyboard focus
-  --view-radius N  chunks to generate around the start, 0 to 30 (default 8)
-  -h, --help       print this text";
+  --view-radius N  chunks to generate around the start, 0 to {MAX_VIEW_RADIUS} (default {DEFAULT_VIEW_RADIUS})
+  -h, --help       print this text"
+    )
+}
 
 /// Reads the arguments that follow the program name.
 ///
@@ -127,14 +132,16 @@ mod tests {
 
     #[test]
     fn the_usage_states_the_radius_limits() {
-        assert!(USAGE.contains(&MAX_VIEW_RADIUS.to_string()));
-        assert!(USAGE.contains(&DEFAULT_VIEW_RADIUS.to_string()));
+        let text = usage();
+        assert!(text.contains(&MAX_VIEW_RADIUS.to_string()));
+        assert!(text.contains(&DEFAULT_VIEW_RADIUS.to_string()));
     }
 
     #[test]
     fn the_usage_mentions_every_option() {
-        assert!(USAGE.contains("--background"));
-        assert!(USAGE.contains("--view-radius"));
-        assert!(USAGE.contains("--help"));
+        let text = usage();
+        assert!(text.contains("--background"));
+        assert!(text.contains("--view-radius"));
+        assert!(text.contains("--help"));
     }
 }
