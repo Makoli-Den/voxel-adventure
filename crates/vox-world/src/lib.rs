@@ -4,6 +4,7 @@
 //! depend on it, but it depends on none of them (see `CLAUDE.md`, "Architecture").
 
 mod block;
+mod bounds;
 mod chunk;
 mod chunk_pos;
 mod mesh;
@@ -13,6 +14,10 @@ mod terrain;
 mod world;
 
 pub use block::BlockId;
+pub use bounds::{
+    HIGHEST_CHUNK_LAYER, LOWEST_CHUNK_LAYER, WORLD_CEILING_Y, WORLD_FLOOR_Y, contains_block_y,
+    contains_chunk_layer,
+};
 pub use chunk::{CHUNK_SIZE, CHUNK_VOLUME, Chunk, LocalPos};
 pub use chunk_pos::ChunkPos;
 pub use mesh::{
@@ -21,5 +26,7 @@ pub use mesh::{
 };
 pub use raycast::{RayHit, raycast};
 pub use registry::{AIR_NAME, BlockRegistry, FaceTextures, RegistryError, TextureLayer};
-pub use terrain::{MAX_SURFACE, MIN_SURFACE, TerrainBlocks, generate_chunk, generate_terrain};
+pub use terrain::{
+    MAX_SURFACE, MIN_SURFACE, TerrainBlocks, column_span, generate_chunk, generate_terrain,
+};
 pub use world::{ChangedChunks, MAX_CHANGED_CHUNKS, Neighbours, World};

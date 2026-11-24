@@ -164,6 +164,11 @@ Caves and cave culling; uniform or palette chunk storage; the two-stage generati
 - **Measured** (`docs/benchmarks.md`, "Fog and camera-relative drawing"): the fog shader costs nothing measurable (at most 0.01 ms at radius 12); the closer far plane draws 59 instead of 67 chunks at the default view of radius 8. Radius 16 stands at about 1740 FPS, so **`DEFAULT_VIEW_RADIUS` is 12** (about 2490 FPS standing, 2440 flying); the default column of the budget table (e) was written for radius 8 and is re-checked in S7.
 - **Window check:** screenshots at the start view and from height 200 looking down towards the edge (a temporary camera pose, reverted): at radius 8 from that height everything beyond the fog end is sky, at radius 16 the terrain fades into the sky with no edge, where `main` shows the cut-off slab against the sky.
 
+## S3b must (found in the S3a review)
+- Exclude `base:bedrock` from the placeable list (`placeable_blocks` in `vox-game/src/content.rs`; the wheel currently offers every block but air) and fix the README line about the base blocks.
+- Filter chunk creation before an edit with `contains_chunk_layer`: `set_block` refuses out-of-bounds writes, but creating chunks outside the world first would store them for nothing.
+- Make bedrock unbreakable (engine rule at `y == WORLD_FLOOR_Y`), as in (a).
+
 ## Answers to the open questions
 - The world bounds are -512 and 512 (named parameters, easy to change).
 - The floor is a visible `base:bedrock` block (data plus a texture) that the engine refuses to break.

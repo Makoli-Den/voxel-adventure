@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use crate::block::BlockId;
-use crate::chunk::{AXIS_COUNT, CHUNK_SIZE, Chunk, LocalPos};
+use crate::bounds::contains_block_y;
+use crate::chunk::{AXIS_COUNT, AXIS_Y, CHUNK_SIZE, Chunk, LocalPos};
 use crate::chunk_pos::ChunkPos;
 use crate::mesh::Face;
 
@@ -118,13 +119,17 @@ impl World {
 
     /// Sets the block at world block position `pos`.
     ///
-    /// Returns `None` if the chunk of `pos` is not loaded (nothing is written). Otherwise
+    /// Returns `None` if `pos` is outside the world's height bounds
+    /// ([`contains_block_y`]) or the chunk of `pos` is not loaded (nothing is written). Otherwise
     /// returns the loaded chunks whose mesh is now out of date: the chunk of the block,
     /// and, when the block lies on a chunk border, the loaded chunk behind that border,
     /// because its mesh hides or shows faces depending on this block. Neighbours that are
     /// not loaded have no mesh and are left out. Writing the value the block already has
     /// changes nothing and returns an empty set.
     pub fn set_block(&mut self, pos: [i32; 3], block: BlockId) -> Option<ChangedChunks> {
+        if !contains_block_y(pos[AXIS_Y]) {
+            return None;
+        }
         let (chunk_pos, local) = ChunkPos::containing(pos);
         let chunk = self.chunks.get_mut(&chunk_pos)?;
         let mut changed = ChangedChunks::empty();
@@ -310,6 +315,45 @@ mod tests {
         let chunk = world.get(ChunkPos::new(-1, 0, 0));
         let local = LocalPos::new(31, 5, 0).unwrap();
         assert_eq!(chunk.map(|c| c.get(local)), Some(BlockId(9)));
+    }
+
+    #[test]
+    fn set_block_outside_the_height_bounds_writes_nothing() {
+        use crate::bounds::{WORLD_CEILING_Y, WORLD_FLOOR_Y};
+        // Chunks exist on both sides of both limits, so only the bounds can refuse.
+        let layers = [-17, -16, 15, 16].map(|y| ChunkPos::new(0, y, 0));
+        let mut world = world_with_empty_chunks(&layers);
+        assert!(
+            world
+                .set_block([0, WORLD_FLOOR_Y - 1, 0], BlockId(1))
+                .is_none()
+        );
+        assert!(
+            world
+                .set_block([0, WORLD_CEILING_Y, 0], BlockId(1))
+                .is_none()
+        );
+        assert!(world.set_block([0, i32::MAX, 0], BlockId(1)).is_none());
+        assert_eq!(
+            world.block_at([0, WORLD_FLOOR_Y - 1, 0]),
+            Some(BlockId::AIR)
+        );
+        assert_eq!(world.block_at([0, WORLD_CEILING_Y, 0]), Some(BlockId::AIR));
+        // The first and last rows inside accept writes.
+        assert!(world.set_block([0, WORLD_FLOOR_Y, 0], BlockId(1)).is_some());
+        assert!(
+            world
+                .set_block([0, WORLD_CEILING_Y - 1, 0], BlockId(1))
+                .is_some()
+        );
+        assert_eq!(world.block_at([0, WORLD_FLOOR_Y, 0]), Some(BlockId(1)));
+    }
+
+    #[test]
+    fn block_at_stays_total_outside_the_bounds() {
+        let world = World::new();
+        assert_eq!(world.block_at([0, i32::MIN, 0]), None);
+        assert_eq!(world.block_at([0, i32::MAX, 0]), None);
     }
 
     #[test]

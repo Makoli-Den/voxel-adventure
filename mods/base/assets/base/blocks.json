@@ -21,6 +21,7 @@
         "top": "base:textures/block/log_top.png",
         "bottom": "base:textures/block/log_top.png"
       }
-    }
+    },
+    { "name": "bedrock", "textures": { "all": "base:textures/block/bedrock.png" } }
   ]
 }

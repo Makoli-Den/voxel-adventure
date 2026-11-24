@@ -22,6 +22,8 @@ pub const GRASS_NAME: &str = "base:grass";
 pub const DIRT_NAME: &str = "base:dirt";
 /// Registry name of the stone block.
 pub const STONE_NAME: &str = "base:stone";
+/// Registry name of the bedrock block, the row at the bottom of the world.
+pub const BEDROCK_NAME: &str = "base:bedrock";
 
 /// Name of the block that is selected at startup, before the player picks another.
 pub const PLACE_BLOCK_NAME: &str = STONE_NAME;
@@ -114,6 +116,7 @@ impl Content {
             grass: find(GRASS_NAME)?,
             dirt: find(DIRT_NAME)?,
             stone: find(STONE_NAME)?,
+            bedrock: find(BEDROCK_NAME)?,
         };
         let start = find(PLACE_BLOCK_NAME)?;
         let selection = Selection::new(placeable_blocks(&registry), start)
@@ -163,7 +166,8 @@ mod tests {
         let json = r#"{ "format": 1, "blocks": [
             { "name": "dirt", "textures": { "all": "base:d.png" } },
             { "name": "grass", "textures": { "all": "base:g.png" } },
-            { "name": "stone", "textures": { "all": "base:s.png" } } ] }"#;
+            { "name": "stone", "textures": { "all": "base:s.png" } },
+            { "name": "bedrock", "textures": { "all": "base:b.png" } } ] }"#;
         let (startup, dir) = stack_with_blocks("reorder", json);
         let result = Content::new(&startup.stack, &startup.blocks_files);
         let _ = std::fs::remove_dir_all(dir);
@@ -252,6 +256,16 @@ mod tests {
         assert_eq!(seen.len(), content.registry.len() - 1);
         // The wheel is back where it started.
         assert_eq!(selection.selected(), content.terrain.stone);
+    }
+
+    #[test]
+    fn bedrock_is_resolved_and_comes_after_the_blocks_that_were_there_before() {
+        let content = content();
+        let bedrock = content.terrain.bedrock;
+        assert_eq!(content.registry.name(bedrock), Some(BEDROCK_NAME));
+        // Appended, so the ids of every earlier block stayed as they were.
+        assert!(bedrock.0 > content.terrain.stone.0);
+        assert_eq!(usize::from(bedrock.0), content.registry.len() - 1);
     }
 
     #[test]
