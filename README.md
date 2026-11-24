@@ -49,7 +49,7 @@ Fly over the generated terrain:
 |---|---|
 | W, A, S, D | move forward, left, back, right |
 | Space / Shift | go up / go down |
-| Right mouse button + mouse | look around |
+| Mouse | look around (the cursor is hidden and captured while you play; no button needed) |
 | Left mouse button | break the block under the crosshair (within a few blocks) |
 | F | place the selected block on the face under the crosshair (stone at the start) |
 | 1 to 9 (also on the numpad) | select the 1st to 9th placeable block (every block except air, in the order of `blocks.json`; with fewer blocks the extra keys do nothing; ignored while Ctrl, Alt, Shift or Super is held) |
@@ -57,11 +57,13 @@ Fly over the generated terrain:
 | G | switch between flying and walking (walking has gravity and collision; Space jumps, Shift does nothing) |
 | L | turn the frame limit on or off |
 | F3 | show or hide the metrics panel |
-| Esc | quit |
+| Esc | open the pause menu, or close it again |
+
+The pause menu (Resume, Quit) frees the cursor and stops the game's input and the walking body (the world keeps drawing); choose with Up/Down or W/S and Enter, or click. The window closing also quits. Losing the window focus opens the menu, and gaining it back does not close it, so the click that focuses the window never breaks a block: click Resume or press Esc or Enter. A movement key held while the menu opens is forgotten, so press it again after Resume. The right mouse button is unused for now.
 
 Edits are not saved: a chunk that streams out of range and back in is generated again (decision 0011). Blocks can only be placed in the loaded terrain layer.
 
-Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--pack DIR` layers a resource pack laid out like `assets/` over the built-in one (repeatable, a later pack wins; for example `DIR/base/textures/block/stone.png` replaces the stone texture and `DIR/core/shaders/chunk.frag` the terrain fragment shader; a texture that is missing or cannot be used shows a magenta and black checker and prints a warning), `--mods DIR` loads the mods found in `DIR` instead of the built-in `mods/` folder (repeatable; it replaces the built-in folder, so leave out the `base` mod and the game stops; a mod id may appear in only one folder; the mods load in dependency order and their assets sit between the engine's `assets/` and the `--pack` directories; the load order is printed at startup, and a missing dependency, a cycle or a broken manifest stops the game with every problem listed), `--help` lists the options.
+Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks; the cursor is not captured and no menu is shown until the window is focused for the first time), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--pack DIR` layers a resource pack laid out like `assets/` over the built-in one (repeatable, a later pack wins; for example `DIR/base/textures/block/stone.png` replaces the stone texture and `DIR/core/shaders/chunk.frag` the terrain fragment shader; a texture that is missing or cannot be used shows a magenta and black checker and prints a warning), `--mods DIR` loads the mods found in `DIR` instead of the built-in `mods/` folder (repeatable; it replaces the built-in folder, so leave out the `base` mod and the game stops; a mod id may appear in only one folder; the mods load in dependency order and their assets sit between the engine's `assets/` and the `--pack` directories; the load order is printed at startup, and a missing dependency, a cycle or a broken manifest stops the game with every problem listed), `--help` lists the options.
 
 ## Frame metrics
 A translucent panel in the top-left corner of the window shows live figures over the last ten seconds, refreshed twice a second: average FPS, the 1% and 0.1% lows (the average FPS of the slowest 1% and 0.1% of the frames, so they show stutter), the frame time, the time the game spent producing a frame, the GPU time (an upper bound, measured with timestamp queries) and how many chunks and triangles are drawn, plus a `Place` line with the selected block. F3 hides it, and with it the selected block: there is no other display of it yet. A summary of the whole run is printed when the game exits. The definitions are in `crates/vox-game/src/metrics.rs` and decision 0008.

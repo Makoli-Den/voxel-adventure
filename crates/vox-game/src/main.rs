@@ -4,6 +4,10 @@
 //! window, creates the renderer with the shaders from the packs, streams terrain chunks in
 //! around the camera and runs the event loop, flying a camera over the terrain. Mods and
 //! networking will join later.
+//!
+//! The mouse is captured while the player plays; Esc, losing the window focus or the menu's
+//! buttons switch the input mode (the rules live in `input_mode`, this file only applies them
+//! to the window).
 
 mod camera;
 mod cli;
@@ -11,6 +15,7 @@ mod content;
 mod controls;
 mod editing;
 mod hud;
+mod input_mode;
 mod metrics;
 mod pacing;
 mod packs;
@@ -39,13 +44,14 @@ use winit::event::{
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use camera::{Camera, Movement};
 use cli::{Command, Options};
 use content::Content;
 use controls::Controls;
 use editing::{EditAction, REACH};
+use input_mode::{InputMode, MenuButton, Outcome};
 use metrics::FrameHistory;
 use pacing::MAX_FRAME_TIME;
 use physics::{Body, WalkInput};
@@ -159,6 +165,10 @@ struct App {
     /// Whether the player walks (collision and gravity) instead of flying; the G key toggles.
     walking: bool,
     controls: Controls,
+    /// Whether the game or the pause menu has the input, and the menu's selection.
+    input_mode: InputMode,
+    /// The last position of the mouse cursor in window pixels, for clicks on the menu.
+    cursor: (f32, f32),
     /// Whether the frame rate is capped (twice the monitor's refresh rate, see `pacing`).
     /// Off by default, so the metrics show what the game can really do; the L key toggles it.
     frame_limit: bool,
@@ -189,6 +199,7 @@ struct App {
 
 impl App {
     fn new(options: Options, shaders: ShaderSources, content: Content) -> Self {
+        let input_mode = InputMode::new(input_mode::starts_awaiting(&options));
         Self {
             terrain: Arc::new(Terrain::new(
                 WORLD_SEED,
@@ -210,6 +221,8 @@ impl App {
             body: Body::from_eye(CAMERA_START.to_array()),
             walking: false,
             controls: Controls::default(),
+            input_mode,
+            cursor: (0.0, 0.0),
             frame_limit: false,
             hud_visible: true,
             last_frame: Instant::now(),
@@ -256,6 +269,7 @@ impl App {
         ));
         self.window = Some(window);
         self.renderer = Some(renderer);
+        self.apply_cursor();
         self.update_frame_interval();
         self.refresh_hud()?;
         self.last_frame = Instant::now();
@@ -281,14 +295,18 @@ impl App {
         let dt = since_last_frame.as_secs_f32().min(MAX_FRAME_TIME);
         // The autopilot always flies, whatever mode the player toggled.
         if self.walking && self.options.fly_seconds.is_none() {
-            // Walking: the body decides where the eye is (decision 0012).
-            let movement = self.controls.movement();
-            let input = WalkInput {
-                direction: self.camera.walk_direction(movement),
-                jump: movement.up > 0.0,
-            };
-            self.body.step(&self.world, input, dt);
-            self.camera.set_position(Vec3::from(self.body.eye()));
+            // Walking: the body decides where the eye is (decision 0012). While the menu is
+            // open the body stands still, so the player does not fall (or keep walking)
+            // while paused.
+            if !self.input_mode.is_paused() {
+                let movement = self.controls.movement();
+                let input = WalkInput {
+                    direction: self.camera.walk_direction(movement),
+                    jump: movement.up > 0.0,
+                };
+                self.body.step(&self.world, input, dt);
+                self.camera.set_position(Vec3::from(self.body.eye()));
+            }
         } else {
             let (movement, speed) = if self.options.fly_seconds.is_some() {
                 // The autopilot flies sideways, keeping the height, so the camera always meets
@@ -481,12 +499,100 @@ impl App {
         } else {
             Vec::new()
         };
-        // The crosshair is always visible, also while the metrics panel is hidden.
         if let Some(window) = &self.window {
             let size = window.inner_size();
-            rects.extend(hud::crosshair(size.width, size.height));
+            if self.input_mode.is_paused() {
+                // The menu covers the crosshair, which means nothing while nothing can be edited.
+                rects.extend(hud::menu(
+                    size.width,
+                    size.height,
+                    self.input_mode.selected(),
+                ));
+            } else {
+                // The crosshair is always visible, also while the metrics panel is hidden.
+                rects.extend(hud::crosshair(size.width, size.height));
+            }
         }
         renderer.set_overlay(&rects)
+    }
+
+    /// The menu button under the mouse cursor, if the menu is open and the cursor is on one.
+    fn button_under_cursor(&self) -> Option<MenuButton> {
+        let window = self.window.as_ref()?;
+        if !self.input_mode.is_paused() {
+            return None;
+        }
+        let size = window.inner_size();
+        hud::button_at(
+            &hud::menu_buttons(size.width, size.height),
+            self.cursor.0,
+            self.cursor.1,
+        )
+    }
+
+    /// Hides and captures the cursor while playing, and frees and shows it otherwise.
+    ///
+    /// Capturing is tried as `Locked` first: on Windows winit implements it by clipping the
+    /// cursor to a one-pixel rectangle, and it succeeds there. `Confined` (the cursor stays
+    /// inside the window) is the fallback for platforms that refuse `Locked`. Failures are
+    /// logged, since a failed capture costs only the capture. Idempotent, so it is safe to
+    /// call again whenever the state may have drifted.
+    fn apply_cursor(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        if self.input_mode.is_playing() {
+            if let Err(locked) = window.set_cursor_grab(CursorGrabMode::Locked) {
+                if let Err(confined) = window.set_cursor_grab(CursorGrabMode::Confined) {
+                    eprintln!(
+                        "warning: cannot capture the mouse cursor (locking: {locked}; confining: {confined})"
+                    );
+                }
+            }
+            window.set_cursor_visible(false);
+        } else {
+            if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+                eprintln!("warning: cannot release the mouse cursor: {error}");
+            }
+            window.set_cursor_visible(true);
+        }
+    }
+
+    /// Runs `change` on the input mode and, if the mode or the menu selection changed, brings
+    /// the window in line: the cursor, the held keys (forgotten when the menu opens, since
+    /// their releases go to the menu) and the overlay.
+    fn change_input_mode(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        change: impl FnOnce(&mut InputMode),
+    ) {
+        let before = self.input_mode;
+        change(&mut self.input_mode);
+        if self.input_mode == before {
+            return;
+        }
+        let effects = input_mode::effects(before.mode(), self.input_mode.mode());
+        if effects.release_controls {
+            self.controls.release_all();
+        }
+        if effects.apply_cursor {
+            self.apply_cursor();
+        }
+        self.refresh_after_toggle(event_loop);
+    }
+
+    /// Uses a menu button: the mode change it asks for, or ending the game.
+    fn use_menu_button(&mut self, event_loop: &ActiveEventLoop, button: Option<MenuButton>) {
+        let mut outcome = Outcome::Continue;
+        self.change_input_mode(event_loop, |input| {
+            outcome = match button {
+                Some(button) => input.activate(button),
+                None => input.activate_selected(),
+            };
+        });
+        if outcome == Outcome::Quit {
+            event_loop.exit();
+        }
     }
 
     /// The figures of the whole run, for the line printed when the game ends.
@@ -498,9 +604,29 @@ impl App {
         ))
     }
 
-    /// Handles a keyboard event: Escape quits, L toggles the frame limit, F3 shows or hides
-    /// the metrics panel, and the movement keys go to the controls. The toggles act on the
-    /// press only, not on the repeats of a held key.
+    /// Handles a key while the menu is open: Escape closes it, Up/W and Down/S move the
+    /// selection, Enter uses the selected button. Everything else is ignored.
+    /// The selection keys repeat when held; Escape and Enter act on the press only.
+    fn handle_menu_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, repeat: bool) {
+        match code {
+            KeyCode::Escape if !repeat => self.change_input_mode(event_loop, InputMode::escape),
+            KeyCode::ArrowUp | KeyCode::KeyW => {
+                self.change_input_mode(event_loop, InputMode::select_previous);
+            }
+            KeyCode::ArrowDown | KeyCode::KeyS => {
+                self.change_input_mode(event_loop, InputMode::select_next);
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter if !repeat => {
+                self.use_menu_button(event_loop, None);
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles a keyboard event: Escape opens the menu, L toggles the frame limit, F3 shows or
+    /// hides the metrics panel, and the movement keys go to the controls. The toggles act on
+    /// the press only, not on the repeats of a held key. While the menu is open the menu gets
+    /// the presses and releases are ignored (the controls were cleared when it opened).
     fn handle_key(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -509,8 +635,16 @@ impl App {
         repeat: bool,
     ) {
         let pressed = state == ElementState::Pressed;
+        if self.input_mode.is_paused() {
+            if pressed {
+                self.handle_menu_key(event_loop, code, repeat);
+            }
+            return;
+        }
         match code {
-            KeyCode::Escape if pressed => event_loop.exit(),
+            KeyCode::Escape if pressed && !repeat => {
+                self.change_input_mode(event_loop, InputMode::escape);
+            }
             KeyCode::KeyL if pressed && !repeat => {
                 self.frame_limit = !self.frame_limit;
                 self.next_frame = Instant::now();
@@ -580,23 +714,50 @@ impl ApplicationHandler for App {
                     self.handle_key(event_loop, code, event.state, event.repeat);
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Right,
-                ..
-            } => self.controls.set_looking(state == ElementState::Pressed),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+                // The mouse selects the button it is over, so Enter then uses that one too.
+                if let Some(button) = self.button_under_cursor() {
+                    self.change_input_mode(event_loop, |input| input.select(button));
+                }
+            }
+            // The right button has no use yet.
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => self.controls.click(),
+            } => {
+                if self.input_mode.is_paused() {
+                    // A click outside the buttons does nothing, and neither does the one that
+                    // focused the window.
+                    if input_mode::click_activates(self.controls.just_focused()) {
+                        if let Some(button) = self.button_under_cursor() {
+                            self.use_menu_button(event_loop, Some(button));
+                        }
+                    }
+                } else {
+                    self.controls.click();
+                }
+            }
+            WindowEvent::MouseWheel { .. } if self.input_mode.is_paused() => {}
             WindowEvent::MouseWheel { delta, .. } => match delta {
                 MouseScrollDelta::LineDelta(_, lines) => self.controls.scroll(lines),
                 MouseScrollDelta::PixelDelta(pixels) => self.controls.scroll_pixels(pixels.y),
             },
             // Held keys would stay "held" forever, because their release goes to another window.
-            WindowEvent::Focused(false) => self.controls.release_all(),
-            WindowEvent::Focused(true) => self.controls.focus_gained(),
+            // The menu opens too, which frees the cursor.
+            WindowEvent::Focused(false) => {
+                self.controls.release_all();
+                self.change_input_mode(event_loop, InputMode::focus_lost);
+            }
+            WindowEvent::Focused(true) => {
+                self.controls.focus_gained();
+                self.change_input_mode(event_loop, InputMode::focus_gained);
+                // Whatever the mode, the grab is set again: winit does not release it when
+                // the focus is lost and only refreshes it while focused, so a paused window
+                // must free the cursor the moment it is active again.
+                self.apply_cursor();
+            }
             WindowEvent::Moved(_) => self.update_frame_interval(),
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -620,7 +781,7 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.controls.is_looking() {
+            if self.input_mode.is_playing() {
                 self.camera
                     .look(dx as f32 * LOOK_SENSITIVITY, dy as f32 * LOOK_SENSITIVITY);
             }
