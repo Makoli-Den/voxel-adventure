@@ -23,6 +23,10 @@ pub enum RenderError {
     /// Overlay data from the caller is malformed, for example a rectangle coordinate is
     /// NaN or infinite. The text says what is wrong.
     InvalidOverlay(&'static str),
+    /// Texture data from the caller is malformed or exceeds a limit, for example the tile
+    /// size is not a power of two or there are more layers than the device supports. The
+    /// text says what is wrong, with the numbers involved.
+    InvalidTextures(String),
 }
 
 impl fmt::Display for RenderError {
@@ -34,6 +38,7 @@ impl fmt::Display for RenderError {
             Self::Shader(details) => write!(f, "shader error in {details}"),
             Self::InvalidMesh(what) => write!(f, "invalid mesh: {what}"),
             Self::InvalidOverlay(what) => write!(f, "invalid overlay: {what}"),
+            Self::InvalidTextures(what) => write!(f, "invalid textures: {what}"),
         }
     }
 }
@@ -46,7 +51,8 @@ impl Error for RenderError {
             | Self::Unsupported(_)
             | Self::Shader(_)
             | Self::InvalidMesh(_)
-            | Self::InvalidOverlay(_) => None,
+            | Self::InvalidOverlay(_)
+            | Self::InvalidTextures(_) => None,
         }
     }
 }
@@ -65,5 +71,11 @@ mod tests {
     fn invalid_overlay_names_the_problem() {
         let text = RenderError::InvalidOverlay("a size is NaN").to_string();
         assert_eq!(text, "invalid overlay: a size is NaN");
+    }
+
+    #[test]
+    fn invalid_textures_names_the_problem() {
+        let text = RenderError::InvalidTextures(String::from("there are no layers")).to_string();
+        assert_eq!(text, "invalid textures: there are no layers");
     }
 }

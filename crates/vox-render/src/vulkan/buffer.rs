@@ -83,7 +83,10 @@ impl Drop for Buffer {
         // SAFETY: the renderer drops a buffer only when no submitted work can still read
         // it: either after waiting for the device to go idle, or, for replaced meshes and
         // overlays, once the fences show that every frame that could use it has finished
-        // (see `retired.rs`). The buffer goes before its memory. Null handles are ignored.
+        // (see `retired.rs`), or, for a texture staging buffer, after the fence of its
+        // one-time upload or a device wait proved the copy finished (if neither did, the
+        // buffer is leaked, never dropped).
+        // The buffer goes before its memory. Null handles are ignored.
         unsafe {
             self.device.destroy_buffer(self.handle, None);
             self.device.free_memory(self.memory, None);

@@ -61,6 +61,8 @@ pub(crate) const INTERFACE: PipelineInterface = PipelineInterface {
         stage: Stage::Vertex,
         size: PUSH_CONSTANT_SIZE,
     },
+    // No descriptor set: the overlay's shaders may declare no resource at all.
+    resources: &[],
 };
 
 #[cfg(test)]

@@ -123,8 +123,10 @@ fn spirv_options() -> spv::Options<'static> {
         .flags
         .remove(spv::WriterFlags::ADJUST_COORDINATE_SPACE);
     // The default does no bounds checking, and the device has no `robustBufferAccess`.
-    // A shader from a pack that indexes past the end of an array would then read or
-    // write outside its data on the GPU. `Restrict` clamps every index into range.
+    // A shader from a pack that indexes past the end of an array, or loads a texel
+    // (`texelFetch`) outside an image such as the block textures, would then read or
+    // write outside its data on the GPU. `Restrict` clamps every index and coordinate
+    // into range.
     options.bounds_check_policies = BoundsCheckPolicies {
         index: BoundsCheckPolicy::Restrict,
         buffer: BoundsCheckPolicy::Restrict,
@@ -228,10 +230,11 @@ mod tests {
     }
 
     #[test]
-    fn array_indices_and_buffers_are_bounds_checked() {
+    fn array_indices_buffers_and_image_loads_are_bounds_checked() {
         let policies = spirv_options().bounds_check_policies;
         assert_eq!(policies.index, BoundsCheckPolicy::Restrict);
         assert_eq!(policies.buffer, BoundsCheckPolicy::Restrict);
+        assert_eq!(policies.image_load, BoundsCheckPolicy::Restrict);
     }
 
     #[test]
@@ -325,14 +328,158 @@ void main() { broken }
         );
     }
 
+    /// A chunk fragment shader sampling the block textures, with `declarations` replacing
+    /// the two resource declarations of the documented interface.
+    fn textured_fragment(declarations: &str) -> String {
+        format!(
+            "#version 450
+            {declarations}
+            layout(location = 0) out vec4 out_color;
+            void main() {{
+                out_color = texture(sampler2DArray(block_textures, block_sampler), vec3(0.5, 0.5, 1.0));
+            }}"
+        )
+    }
+
+    /// The declarations `crate::interface::chunk` documents.
+    const BLOCK_TEXTURE_DECLARATIONS: &str = "
+        layout(set = 0, binding = 0) uniform texture2DArray block_textures;
+        layout(set = 0, binding = 1) uniform sampler block_sampler;";
+
     #[test]
-    fn descriptor_resources_are_rejected() {
+    fn naga_accepts_a_separate_texture_array_and_sampler() {
+        // Decision 0013 relies on this: naga parses, validates and writes SPIR-V for it.
+        let source = textured_fragment(BLOCK_TEXTURE_DECLARATIONS);
+        let compiled = compile_glsl(&source, ShaderStage::Fragment, &CHUNK, "pack.frag").unwrap();
+        assert_is_spirv(&compiled.to_spirv().unwrap());
+    }
+
+    #[test]
+    fn naga_rejects_a_combined_sampler2d_array_uniform() {
+        // Pins the naga limitation behind the separate image and sampler (decision 0013).
+        // If a naga upgrade starts accepting it, the interface may offer it too.
+        let source = "#version 450
+            layout(set = 0, binding = 0) uniform sampler2DArray block_textures;
+            layout(location = 0) out vec4 out_color;
+            void main() { out_color = texture(block_textures, vec3(0.5, 0.5, 1.0)); }";
+        let options = glsl::Options::from(ShaderStage::Fragment);
+        assert!(glsl::Frontend::default().parse(&options, source).is_err());
+    }
+
+    #[test]
+    fn a_fragment_shader_may_declare_only_the_image() {
+        let source = "#version 450
+            layout(set = 0, binding = 0) uniform texture2DArray block_textures;
+            layout(location = 0) out vec4 out_color;
+            void main() { out_color = vec4(float(textureSize(block_textures, 0).z)); }";
+        assert!(compiles_for(source, ShaderStage::Fragment, &CHUNK));
+    }
+
+    #[test]
+    fn a_resource_at_an_unknown_binding_is_rejected() {
+        let source = textured_fragment(
+            "layout(set = 0, binding = 0) uniform texture2DArray block_textures;
+             layout(set = 0, binding = 2) uniform sampler block_sampler;",
+        );
+        let text = compile_error(&source, ShaderStage::Fragment);
+        assert!(
+            text.contains("block_sampler") && text.contains("binding 2"),
+            "{text}"
+        );
+        assert!(text.contains("set 0, binding 1 (`sampler`"), "{text}");
+    }
+
+    #[test]
+    fn a_resource_in_another_set_is_rejected() {
+        let source = textured_fragment(
+            "layout(set = 1, binding = 0) uniform texture2DArray block_textures;
+             layout(set = 0, binding = 1) uniform sampler block_sampler;",
+        );
+        let text = compile_error(&source, ShaderStage::Fragment);
+        assert!(text.contains("set 1, binding 0"), "{text}");
+    }
+
+    #[test]
+    fn swapped_image_and_sampler_bindings_are_rejected() {
+        let source = textured_fragment(
+            "layout(set = 0, binding = 1) uniform texture2DArray block_textures;
+             layout(set = 0, binding = 0) uniform sampler block_sampler;",
+        );
+        let text = compile_error(&source, ShaderStage::Fragment);
+        assert!(text.contains("must be declared as `"), "{text}");
+    }
+
+    #[test]
+    fn a_texture_of_the_wrong_type_is_rejected() {
+        // A plain 2D texture where the array is bound.
+        let source = "#version 450
+            layout(set = 0, binding = 0) uniform texture2D block_textures;
+            layout(set = 0, binding = 1) uniform sampler block_sampler;
+            layout(location = 0) out vec4 out_color;
+            void main() { out_color = texture(sampler2D(block_textures, block_sampler), vec2(0.5)); }";
+        let text = compile_error(source, ShaderStage::Fragment);
+        assert!(text.contains("`texture2DArray`"), "{text}");
+    }
+
+    #[test]
+    fn an_integer_texture_array_is_rejected() {
+        // The image is UNORM: an integer view of it would be invalid.
+        let source = "#version 450
+            layout(set = 0, binding = 0) uniform utexture2DArray block_textures;
+            layout(location = 0) out vec4 out_color;
+            void main() { out_color = vec4(vec3(textureSize(block_textures, 0)), 1.0); }";
+        let text = compile_error(source, ShaderStage::Fragment);
+        assert!(text.contains("`texture2DArray`"), "{text}");
+    }
+
+    #[test]
+    fn a_storage_buffer_is_rejected() {
+        let source = "#version 450
+            layout(set = 0, binding = 0) buffer Data { vec4 colors[]; } data;
+            layout(location = 0) out vec4 out_color;
+            void main() { out_color = data.colors[0]; }";
+        let text = compile_error(source, ShaderStage::Fragment);
+        assert!(
+            text.contains("descriptor") && text.contains("`data`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_uniform_buffer_is_rejected() {
         let source = "#version 450
             layout(set = 0, binding = 0) uniform Data { vec4 color; } data;
             layout(location = 0) out vec4 out_color;
             void main() { out_color = data.color; }";
         let text = compile_error(source, ShaderStage::Fragment);
         assert!(text.contains("descriptor"), "{text}");
+    }
+
+    #[test]
+    fn textures_in_the_chunk_vertex_shader_are_rejected() {
+        let source = "#version 450
+            layout(set = 0, binding = 0) uniform texture2DArray block_textures;
+            layout(set = 0, binding = 1) uniform sampler block_sampler;
+            void main() {
+                gl_Position = textureLod(sampler2DArray(block_textures, block_sampler), vec3(0.0), 0.0);
+            }";
+        let text = compile_error(source, ShaderStage::Vertex);
+        assert!(
+            text.contains("only available in the fragment stage"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn textures_in_the_overlay_shaders_are_rejected() {
+        let fragment = textured_fragment(BLOCK_TEXTURE_DECLARATIONS);
+        let text = compile_error_for(&fragment, ShaderStage::Fragment, &OVERLAY);
+        assert!(text.contains("no descriptor resources"), "{text}");
+        let vertex = "#version 450
+            layout(set = 0, binding = 1) uniform sampler block_sampler;
+            void main() { gl_Position = vec4(0.0); }";
+        let text = compile_error_for(vertex, ShaderStage::Vertex, &OVERLAY);
+        assert!(text.contains("no descriptor resources"), "{text}");
     }
 
     #[test]

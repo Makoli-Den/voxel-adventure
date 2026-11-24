@@ -14,7 +14,8 @@ use crate::shader::{self, ShaderSource, ShaderSources};
 /// Entry point name of every shader stage; GLSL always calls it `main`.
 const ENTRY_POINT: &std::ffi::CStr = c"main";
 
-/// A graphics pipeline and its layout (no descriptor sets, one push-constant range).
+/// A graphics pipeline and its layout (one push-constant range, and the descriptor set
+/// layout its interface asks for, if any).
 ///
 /// Viewport and scissor are dynamic, so a window resize never rebuilds the pipeline.
 pub struct Pipeline {
@@ -33,6 +34,9 @@ struct Spec<'a> {
     /// What the pipeline provides to its shaders; checked against them and turned into
     /// the vertex input state and the push-constant range.
     interface: &'static PipelineInterface,
+    /// The descriptor set layouts of the pipeline layout: one built from
+    /// `interface.resources` if it lists any, none otherwise.
+    set_layouts: &'a [vk::DescriptorSetLayout],
     cull_mode: vk::CullModeFlags,
     depth: vk::PipelineDepthStencilStateCreateInfo<'static>,
     blend: vk::PipelineColorBlendAttachmentState,
@@ -40,16 +44,19 @@ struct Spec<'a> {
 
 impl Pipeline {
     /// Compiles the chunk shaders of `shaders` and builds the opaque, depth-tested chunk
-    /// pipeline for `render_pass`.
+    /// pipeline for `render_pass`. `texture_set_layout` must be the layout built from
+    /// `chunk::INTERFACE` (see `texture::BlockTextureSet`); it becomes set 0.
     pub fn chunk(
         device: &ash::Device,
         render_pass: &RenderPass,
         shaders: &ShaderSources,
+        texture_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RenderError> {
         let spec = Spec {
             vertex: &shaders.chunk_vertex,
             fragment: &shaders.chunk_fragment,
             interface: &chunk::INTERFACE,
+            set_layouts: &[texture_set_layout],
             cull_mode: vk::CullModeFlags::BACK,
             depth: depth_tested(),
             blend: opaque(),
@@ -70,6 +77,7 @@ impl Pipeline {
             vertex: &shaders.overlay_vertex,
             fragment: &shaders.overlay_fragment,
             interface: &overlay::INTERFACE,
+            set_layouts: &[],
             cull_mode: vk::CullModeFlags::NONE,
             depth: depth_ignored(),
             blend: if blending_supported {
@@ -102,9 +110,12 @@ impl Pipeline {
             push_constant_stages: interface::push_constant_stages(spec.interface),
         };
         let push_ranges = interface::push_constant_ranges(spec.interface);
-        let layout_info =
-            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_ranges);
-        // SAFETY: the device is alive and the create info with its array outlives the call.
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(spec.set_layouts)
+            .push_constant_ranges(&push_ranges);
+        // SAFETY: the device is alive and the create info with its arrays outlives the call.
+        // The set layouts are alive; there is at most one, far below the four sets
+        // (`maxBoundDescriptorSets`) every device supports.
         pipeline.layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
         pipeline.handle = pipeline.create_graphics(render_pass, spec, &vertex, &fragment)?;
         // The shader modules are dropped here; a built pipeline no longer needs them.
@@ -311,8 +322,9 @@ impl ShaderModule {
         // admits only core capabilities (push constants are the one optional naga
         // capability, and they are core Vulkan 1.0) AND checks the interface against the
         // pipeline's own description in `crate::interface`, the same one its layout's
-        // push-constant range and its vertex input state are built from: no descriptor
-        // resources, push constants only in the described stage and within the range,
+        // push-constant range, its descriptor set layout and its vertex input state are
+        // built from: only the descriptor resources it lists, of their kind, in their
+        // stage; push constants only in the described stage and within the range,
         // only the vertex attributes the pipeline feeds with their exact types, and
         // fragment inputs that the vertex stage writes. Do not widen either without
         // changing the device features or the pipeline.

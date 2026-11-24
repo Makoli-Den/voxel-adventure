@@ -1,4 +1,5 @@
-//! What the chunk pipeline provides to its shaders: vertex attributes and push constants.
+//! What the chunk pipeline provides to its shaders: vertex attributes, push constants and
+//! the block textures.
 //!
 //! # Vertex layout
 //! Each vertex is 6 bytes, little-endian, in one buffer binding:
@@ -30,10 +31,24 @@
 //!
 //! A `mat4` followed by a `vec4` has these offsets under the std430 rules push
 //! constants use, so a shader can declare the block as written in the table.
+//!
+//! # Descriptor resources
+//! One descriptor set (set 0) for the fragment stage only, holding the block textures
+//! (decision 0013): a 2D array image, one layer per texture, and a separate sampler that
+//! repeats and filters with `NEAREST`.
+//!
+//! | binding | content                 | GLSL                                       |
+//! |---------|-------------------------|--------------------------------------------|
+//! | 0       | the block texture array | `uniform texture2DArray block_textures;`   |
+//! | 1       | its sampler             | `uniform sampler block_sampler;`           |
+//!
+//! Sample with `texture(sampler2DArray(block_textures, block_sampler), vec3(uv, layer))`.
+//! The image and sampler are separate because naga's GLSL front end rejects a combined
+//! `sampler2DArray` uniform. A shader may declare neither, one or both.
 
 use super::{
     AttributeFormat, F32_SIZE, GUARANTEED_PUSH_CONSTANT_SIZE, PipelineInterface, PushConstants,
-    Stage, VertexAttribute,
+    RESOURCE_SET, ResourceBinding, ResourceKind, Stage, VertexAttribute,
 };
 
 /// Byte offset of the block id inside a vertex, right after the position and face bytes.
@@ -75,6 +90,28 @@ const ATTRIBUTES: [VertexAttribute; 2] = [
     },
 ];
 
+/// Binding of the block texture array in set [`RESOURCE_SET`].
+pub(crate) const BLOCK_TEXTURES_BINDING: u32 = 0;
+
+/// Binding of the block textures' sampler in set [`RESOURCE_SET`].
+pub(crate) const BLOCK_SAMPLER_BINDING: u32 = 1;
+
+/// Every descriptor resource, matching the table in the module docs.
+const RESOURCES: [ResourceBinding; 2] = [
+    ResourceBinding {
+        set: RESOURCE_SET,
+        binding: BLOCK_TEXTURES_BINDING,
+        kind: ResourceKind::SampledImage2DArray,
+        stage: Stage::Fragment,
+    },
+    ResourceBinding {
+        set: RESOURCE_SET,
+        binding: BLOCK_SAMPLER_BINDING,
+        kind: ResourceKind::Sampler,
+        stage: Stage::Fragment,
+    },
+];
+
 /// The chunk pipeline's interface, as the module docs describe it.
 pub(crate) const INTERFACE: PipelineInterface = PipelineInterface {
     vertex_stride: VERTEX_STRIDE,
@@ -83,6 +120,7 @@ pub(crate) const INTERFACE: PipelineInterface = PipelineInterface {
         stage: Stage::Vertex,
         size: PUSH_CONSTANT_SIZE,
     },
+    resources: &RESOURCES,
 };
 
 #[cfg(test)]
@@ -99,6 +137,16 @@ mod tests {
     fn push_constants_are_a_matrix_then_a_vec4() {
         assert_eq!(CHUNK_ORIGIN_OFFSET, 16 * 4);
         assert_eq!(PUSH_CONSTANT_SIZE, CHUNK_ORIGIN_OFFSET + 4 * 4);
+    }
+
+    #[test]
+    fn textures_then_sampler_for_the_fragment_stage() {
+        let [image, sampler] = RESOURCES;
+        assert_eq!((image.set, image.binding), (0, 0));
+        assert_eq!(image.kind, ResourceKind::SampledImage2DArray);
+        assert_eq!((sampler.set, sampler.binding), (0, 1));
+        assert_eq!(sampler.kind, ResourceKind::Sampler);
+        assert!(RESOURCES.iter().all(|r| r.stage == Stage::Fragment));
     }
 
     #[test]
