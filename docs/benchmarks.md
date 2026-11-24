@@ -642,3 +642,50 @@ About 2.1 ns more per mesh, 0.4 us per frame for 197 meshes, 0.2 percent of the 
 the driver's cost of the extra `vkCmdDrawIndexed` calls (99 draws instead of 69 here, about
 43 percent more). That part is only bounded by the frame figures above (`work` fell); it is
 re-measured on a CPU-bound low-end device in S9.
+
+## LOD tile generation (step S4 of decision 0015)
+
+`generate_lod_chunk` fills a chunk of 32 x 32 x 32 cells (cells of `2^level` blocks): one noise
+sample per cell column at its centre block, then one write per solid cell. A tile is meshed
+alone (`build_tile_mesh_into`, solid bedrock chunk below), so its four sides become walls
+(skirts).
+
+Method: `cargo bench -p vox-world --bench mesh -- "generate_seed_1|generate_lod|lod_tile"`, one
+full run (no `--quick`), nothing else running, seed 1, origin tile of the level. One run per
+case, so there is no spread across runs; the control moved a lot against the older tables
+(37 us here against 26 to 28 us in the sections above, same code), so only compare numbers
+inside this table. The ratios to the control are indicative only: the control drifted by
+about 35 percent against the older tables, which is larger than the differences between the
+levels.
+
+| Case | Median (range) | Notes |
+|---|---|---|
+| `terrain/generate_seed_1` (control, code unchanged) | 37.0 us (36.8 - 37.2) | one chunk, 1,024 samples |
+| `terrain/generate_lod_level_1` | 45.4 us (45.2 - 45.5) | 1.23 x control |
+| `terrain/generate_lod_level_2` | 39.5 us (39.3 - 39.6) | 1.07 x control |
+| `terrain/generate_lod_level_4` | 32.6 us (32.5 - 32.8) | 0.88 x control |
+| `mesh_reused/lod_tile_level_2` | 122.2 us (121.6 - 122.8) | 567 quads |
+
+Reading: a tile costs about one chunk generation, as decision 0015 estimated. The noise cost is the
+same 1,024 samples at every level; the finer levels fill more solid cells (level 1 reaches
+rows up to about 12, level 4 only 0 and 1), which is a plausible reason why level 1 costs the
+most (not isolated).
+Generation plus mesh of a level-2 tile is about 160 us, near the 0.2 ms per tile of the
+estimate.
+
+Quads and skirts (the test `skirt_share_is_reported_and_below_the_adr_limit` prints them; a
+skirt is a sideways quad on the tile's own border plane), seed 1, origin tile:
+
+| Level | Quads | Skirt share |
+|---|---|---|
+| 1 | 787 | 18.9 percent |
+| 2 | 567 | 14.3 percent (81 quads) |
+| 3 | 320 | 17.5 percent |
+| 4 | 31 | 96.8 percent |
+
+Over 5 seeds and the 3 x 3 tiles around the origin the skirt share at levels 1 to 3 stays
+under 26 percent (limit of the decision: 40), so neighbour-aware skirts are not needed. Level 4 is the exception in share only: with cells
+of 16 blocks the whole tile is nearly flat (rows 0 and 1), so it is 23 to 45 quads over the same
+tiles, and the share is meaningless; it is judged by its absolute cost. For comparison, a full
+chunk of the same terrain is 760 quads. The outward half of the skirts is dropped at draw time
+by the per-direction culling (S2b).
