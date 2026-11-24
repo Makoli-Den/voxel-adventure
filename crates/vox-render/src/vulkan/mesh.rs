@@ -241,6 +241,8 @@ mod tests {
         let mesh = ChunkMesh {
             vertices: vec![sample(); 3],
             indices: vec![0, 1, 2],
+            // Less than one quad of indices, so no quad in any direction.
+            face_quads: [0; vox_world::Face::COUNT],
         };
         let layout = MeshLayout::new(3, 3).unwrap();
         let bytes = mesh_bytes(&mesh, layout);

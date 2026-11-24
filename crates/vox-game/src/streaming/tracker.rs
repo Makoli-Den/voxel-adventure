@@ -169,6 +169,8 @@ mod tests {
             mesh: ChunkMesh {
                 vertices: Vec::new(),
                 indices: vec![0],
+                // Less than one quad of indices, so no quad in any direction.
+                face_quads: [0; vox_world::Face::COUNT],
             },
         }
     }

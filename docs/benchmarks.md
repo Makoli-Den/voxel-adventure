@@ -493,3 +493,38 @@ the limit, before the mod is disabled; an old CPU takes longer. It is a one-time
 is then off). The overrun is about `HOOK_INTERVAL` / (instructions per loop iteration) such
 instructions, so a lower `HOOK_INTERVAL` or a lower cap shrinks it in proportion. Documented
 as a residual risk for S7, which decides on the low-end device.
+
+## Face groups in the mesh (S2a of decision 0015)
+
+`ChunkMesh::face_quads` is filled once per face in `build_mesh_with_neighbours_into`, from the
+growth of the index buffer while that face was meshed. The quads were already emitted face by
+face, so the vertices and indices are grouped by direction with no change to the loops, and
+`push_quad` is unchanged.
+
+Method: `cargo bench -p vox-world --bench mesh` (full run, no `--quick`), three runs of the
+code before (main, a second worktree) and three of the code after, alternating, on the same
+machine. Medians of the three medians per case:
+
+| Case | Before | After | Change | Runs before | Runs after |
+|---|---|---|---|---|---|
+| `mesh/empty` | 1.33 us | 1.32 us | -1.1% | 1.40 / 1.33 / 1.33 | 1.32 / 1.32 / 1.34 |
+| `mesh/single_block` | 6.84 us | 6.63 us | -3.1% | 6.84 / 6.54 / 7.54 | 6.26 / 6.63 / 6.72 |
+| `mesh/terrain_seed_1` | 182.3 us | 168.8 us | -7.4% | 182.3 / 177.3 / 205.0 | 168.8 / 170.0 / 167.9 |
+| `mesh/slab` | 84.6 us | 83.6 us | -1.2% | 84.6 / 82.2 / 85.8 | 83.6 / 82.7 / 85.4 |
+| `mesh/solid` | 140.5 us | 139.4 us | -0.8% | 147.0 / 137.5 / 140.5 | 139.4 / 141.3 / 139.2 |
+| `mesh/checkerboard` | 2.87 ms | 2.73 ms | -4.8% | 2.87 / 2.55 / 3.04 | 2.73 / 2.82 / 2.62 |
+| `mesh_reused/terrain_seed_1` | 176.0 us | 167.6 us | -4.8% | 176.8 / 174.5 / 176.0 | 167.6 / 194.2 / 167.1 |
+| `mesh_reused/solid` | 139.7 us | 148.8 us | +6.5% | 139.7 / 137.3 / 143.0 | 138.9 / 204.8 / 148.8 |
+| `mesh_reused/checkerboard` | 1.63 ms | 1.79 ms | +9.4% | 1.63 / 1.73 / 1.58 | 1.61 / 2.54 / 1.79 |
+| `mesh_neighbours/terrain_seed_1` | 175.7 us | 173.6 us | -1.2% | 176.3 / 172.9 / 175.7 | 166.6 / 186.7 / 173.6 |
+| `terrain/generate_seed_1` (control, code unchanged) | 26.5 us | 26.6 us | +0.5% | 26.4 / 26.5 / 36.5 | 25.6 / 26.6 / 27.8 |
+
+Reading: the control moved 0.5 percent at the median but one of its runs was 38 percent above
+the others, so a spread of that size is present in this setup. Seven of the ten mesh cases are
+faster after (the terrain cases by 1 to 7 percent, which cannot be an effect of the change, so
+it is noise or placement). The two reused cases that are slower at the median each owe it to a
+single bad run after (204.8 us and 2.54 ms); their other two runs are within 1 to 7 percent of
+the runs before (lowest runs: 138.9 vs 137.3 us, 1.61 vs 1.58 ms, which is +1.2 and +1.4
+percent). So the criterion "within noise" is met in the sense that no case shows a difference
+larger than the run-to-run spread, but the data cannot prove a cost below that spread; the
+added work is three instructions per face (six times per chunk), not per quad.
