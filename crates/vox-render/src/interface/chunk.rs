@@ -40,8 +40,9 @@
 //!
 //! # Descriptor resources
 //! One descriptor set (set 0) for the fragment stage only, holding the block textures
-//! (decision 0013): a 2D array image, one layer per texture, and a separate sampler that
-//! repeats and filters with `NEAREST`.
+//! (decision 0013): a 2D array image, one layer per texture, with a full mip chain down to
+//! 1x1, and a separate sampler that repeats, filters with `NEAREST` within a level and
+//! blends `LINEAR` between levels.
 //!
 //! | binding | content                 | GLSL                                       |
 //! |---------|-------------------------|--------------------------------------------|

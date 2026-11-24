@@ -2,9 +2,9 @@
 //! samples it through (decision 0013, sections "Textures" and "Descriptors").
 //!
 //! [`TextureArray`] is one device-local `R8G8B8A8_UNORM` image with optimal tiling, filled
-//! once through a host-visible staging buffer. [`BlockTextureSet`] owns the descriptor set
-//! layout, pool, set and sampler; the set is pointed at a new array when the textures are
-//! replaced. No mip chain yet (that is step S8): one level, sampled with `NEAREST`.
+//! once through a host-visible staging buffer, every mip level at once (the chain is built
+//! on the CPU by [`MipChain`]). [`BlockTextureSet`] owns the descriptor set layout, pool, set
+//! and sampler; the set is pointed at a new array when the textures are replaced.
 
 use ash::vk;
 
@@ -17,23 +17,22 @@ use crate::RenderError;
 use crate::TextureLayers;
 use crate::interface::PipelineInterface;
 use crate::interface::chunk::{BLOCK_SAMPLER_BINDING, BLOCK_TEXTURES_BINDING};
+use crate::mipmap::{MipChain, MipLevel, mip_level_count};
 
 /// The image format: 8-bit RGBA used as stored. Vulkan 1.0 requires every device to support
-/// it for sampling with optimal tiling (and linear filtering, which mipmaps will use).
+/// it for sampling with optimal tiling and linear filtering; the sampler's `LINEAR` mip mode
+/// needs the latter (`SAMPLED_IMAGE_FILTER_LINEAR`), so no capability check is required.
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
-
-/// Mip levels of the image: only the base level until mipmaps arrive (step S8).
-const MIP_LEVELS: u32 = 1;
 
 /// The only descriptor set the pool hands out: the block textures'.
 const MAX_SETS: u32 = 1;
 
-/// The whole color image: every layer of the one mip level.
-fn color_range(layer_count: u32) -> vk::ImageSubresourceRange {
+/// The whole color image: every layer of every mip level.
+fn color_range(layer_count: u32, mip_levels: u32) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
-        level_count: MIP_LEVELS,
+        level_count: mip_levels,
         base_array_layer: 0,
         layer_count,
     }
@@ -48,31 +47,41 @@ pub struct TextureArray {
 }
 
 impl TextureArray {
-    /// Validates `textures` against this GPU's limits, creates the image and uploads the
-    /// pixels. Returns once the GPU has finished the copy (it waits on a fence) and the
-    /// image is in the shader-read layout.
+    /// Validates `textures` against this GPU's limits, builds the mip chain, creates the
+    /// image and uploads every level. Returns once the GPU has finished the copy (it waits
+    /// on a fence) and the image is in the shader-read layout.
     ///
     /// # Errors
-    /// [`RenderError::InvalidTextures`] before anything is allocated if the data does not
-    /// pass [`TextureLayers::validate`]; another error if the GPU cannot allocate or copy.
+    /// [`RenderError::InvalidTextures`] before anything is allocated on the GPU if the data
+    /// does not pass [`TextureLayers::validate`] or the chain does not fit into memory;
+    /// another error if the GPU cannot allocate or copy.
     pub fn upload(gpu: &Gpu, textures: &TextureLayers<'_>) -> Result<Self, RenderError> {
         textures.validate(gpu.texture_limits())?;
-        let staging = Buffer::with_data(gpu, vk::BufferUsageFlags::TRANSFER_SRC, textures.pixels)?;
+        let chain = MipChain::build(textures)?;
+        let staging = Buffer::with_data(gpu, vk::BufferUsageFlags::TRANSFER_SRC, chain.pixels())?;
         let array = Self::new(gpu, textures.size, textures.layer_count)?;
         let commands = OneTimeCommands::begin(gpu)?;
-        // SAFETY: the command buffer is recording. `validate` above proved the pixels are
-        // exactly `layer_count * size * size * 4` bytes, which the staging buffer holds,
-        // and the image was just created with that size and layer count. Both are handed
-        // to `submit_and_wait`, which gives them back only once the GPU finished and leaks
-        // them if nothing proves that.
-        unsafe { array.record_upload(commands.command_buffer(), &staging, textures) };
+        // SAFETY: the command buffer is recording. The staging buffer holds exactly the
+        // chain's pixels, built for this size and layer count, and the image was just
+        // created with that size, layer count and `mip_level_count(size)` levels, the
+        // chain's level count. Both are handed to `submit_and_wait`, which gives them back
+        // only once the GPU finished and leaks them if nothing proves that.
+        unsafe {
+            array.record_upload(
+                commands.command_buffer(),
+                &staging,
+                chain.levels(),
+                textures.layer_count,
+            );
+        }
         let (array, staging) = commands.submit_and_wait((array, staging))?;
         // The fence wait proved the copy finished, so the staging buffer can go.
         drop(staging);
         Ok(array)
     }
 
-    /// Creates an empty image of `layer_count` layers of `size` pixels, its memory and view.
+    /// Creates an empty image of `layer_count` layers of `size` pixels with a full mip
+    /// chain, its memory and view.
     fn new(gpu: &Gpu, size: u32, layer_count: u32) -> Result<Self, RenderError> {
         let device = gpu.device();
         // Start with null handles: if a later call fails, `Drop` destroys whatever
@@ -86,7 +95,8 @@ impl TextureArray {
         let info = image_info(size, layer_count);
         // SAFETY: the device is alive and `info` outlives the call. The format supports
         // sampling with optimal tiling on every device; size and layer count were validated
-        // against the device's `maxImageDimension2D` and `maxImageArrayLayers`.
+        // against the device's `maxImageDimension2D` and `maxImageArrayLayers`, and
+        // `log2(size) + 1` levels is the full chain every image of that size may have.
         array.image = unsafe { device.create_image(&info, None)? };
         // SAFETY: the image was just created from this device.
         let requirements = unsafe { device.get_image_memory_requirements(array.image) };
@@ -102,9 +112,9 @@ impl TextureArray {
             .image(array.image)
             .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
             .format(FORMAT)
-            .subresource_range(color_range(layer_count));
-        // SAFETY: the image is alive, bound to memory, created with `FORMAT` and
-        // `layer_count` layers, which the view covers exactly.
+            .subresource_range(color_range(layer_count, mip_level_count(size)));
+        // SAFETY: the image is alive, bound to memory, created with `FORMAT`, `layer_count`
+        // layers and `mip_level_count(size)` levels, which the view covers exactly.
         array.view = unsafe { device.create_image_view(&view_info, None)? };
         Ok(array)
     }
@@ -114,20 +124,23 @@ impl TextureArray {
         self.view
     }
 
-    /// Records the move to the transfer layout, the copy of every layer and the move to the
-    /// shader-read layout.
+    /// Records the move to the transfer layout, the copy of every level and layer and the
+    /// move to the shader-read layout.
     ///
     /// # Safety
-    /// `command_buffer` must be recording, outside a render pass. `staging` must hold the
-    /// pixels of `textures`, whose size and layer count must be those this image was
-    /// created with, and both must stay alive until the GPU finished the commands.
+    /// `command_buffer` must be recording, outside a render pass. `staging` must hold a mip
+    /// chain laid out as `levels` describe (see [`MipChain`]) with `layer_count` layers;
+    /// levels and layer count must be those this image was created with, and buffer and
+    /// image must stay alive until the GPU finished the commands.
     unsafe fn record_upload(
         &self,
         command_buffer: vk::CommandBuffer,
         staging: &Buffer,
-        textures: &TextureLayers<'_>,
+        levels: &[MipLevel],
+        layer_count: u32,
     ) {
-        let range = color_range(textures.layer_count);
+        // `levels` has at most `mip_level_count(MAX_SIZE)` entries, far below `u32::MAX`.
+        let range = color_range(layer_count, levels.len() as u32);
         // The previous contents do not matter (UNDEFINED): the copy overwrites everything.
         let to_transfer = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -149,12 +162,15 @@ impl TextureArray {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(self.image)
             .subresource_range(range);
-        let copy = copy_region(textures.size, textures.layer_count);
+        let copies = copy_regions(levels, layer_count);
         // SAFETY: the caller guarantees the recording state, the sizes and the lifetimes.
         // The image was created with TRANSFER_DST and SAMPLED usage, the buffer with
-        // TRANSFER_SRC. The copy reads `layer_count * size * size * 4` bytes from offset 0
-        // (tightly packed, layer after layer), exactly the buffer's length. Host writes to
-        // the staging memory are made visible by the submission itself.
+        // TRANSFER_SRC. Each region reads one level's `layer_count * side * side * 4` bytes
+        // from that level's offset (tightly packed, layer after layer), so the regions
+        // cover the buffer exactly and write disjoint subresources. Every offset is a
+        // multiple of 4, the texel size, as the format requires. Both barriers cover every
+        // level and layer. Host writes to the staging memory are made visible by the
+        // submission itself.
         unsafe {
             self.device.cmd_pipeline_barrier(
                 command_buffer,
@@ -170,7 +186,7 @@ impl TextureArray {
                 staging.handle(),
                 self.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[copy],
+                &copies,
             );
             self.device.cmd_pipeline_barrier(
                 command_buffer,
@@ -200,7 +216,7 @@ impl Drop for TextureArray {
     }
 }
 
-/// A single-sample 2D array image to copy into and sample from.
+/// A single-sample 2D array image with a full mip chain to copy into and sample from.
 fn image_info(size: u32, layer_count: u32) -> vk::ImageCreateInfo<'static> {
     vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
@@ -210,7 +226,7 @@ fn image_info(size: u32, layer_count: u32) -> vk::ImageCreateInfo<'static> {
             height: size,
             depth: 1,
         })
-        .mip_levels(MIP_LEVELS)
+        .mip_levels(mip_level_count(size))
         .array_layers(layer_count)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
@@ -219,26 +235,31 @@ fn image_info(size: u32, layer_count: u32) -> vk::ImageCreateInfo<'static> {
         .initial_layout(vk::ImageLayout::UNDEFINED)
 }
 
-/// One region copying every layer from a tightly packed buffer: a zero row length and image
-/// height mean "as wide and high as the image", and the layers follow each other.
-fn copy_region(size: u32, layer_count: u32) -> vk::BufferImageCopy {
-    vk::BufferImageCopy {
-        buffer_offset: 0,
-        buffer_row_length: 0,
-        buffer_image_height: 0,
-        image_subresource: vk::ImageSubresourceLayers {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            mip_level: 0,
-            base_array_layer: 0,
-            layer_count,
-        },
-        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-        image_extent: vk::Extent3D {
-            width: size,
-            height: size,
-            depth: 1,
-        },
-    }
+/// One region per mip level, each copying every layer of that level from the tightly packed
+/// chain: a zero row length and image height mean "as wide and high as the level", and the
+/// layers follow each other. A region spans all layers, so no level needs one per layer.
+fn copy_regions(levels: &[MipLevel], layer_count: u32) -> Vec<vk::BufferImageCopy> {
+    (0..)
+        .zip(levels)
+        .map(|(mip_level, level)| vk::BufferImageCopy {
+            // Lossless: `usize` fits the 64-bit `DeviceSize`.
+            buffer_offset: level.offset as vk::DeviceSize,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level,
+                base_array_layer: 0,
+                layer_count,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width: level.size,
+                height: level.size,
+                depth: 1,
+            },
+        })
+        .collect()
 }
 
 /// The descriptor set the chunk pipeline reads its block textures through, with its layout,
@@ -362,22 +383,24 @@ impl Drop for BlockTextureSet {
     }
 }
 
-/// Pixel-art sampling: `NEAREST` in both directions, the tile repeated across a greedy quad
-/// spanning several blocks. With a single mip level the minification filter and mip mode
-/// are `NEAREST` too, and the LOD is clamped to the base level; step S8 adds the mip chain
-/// and `LINEAR` between levels.
+/// Pixel-art sampling with mipmaps, the tile repeated across a greedy quad spanning several
+/// blocks. Within a level the filter is `NEAREST` both ways, so near faces keep sharp
+/// texels. Between the two levels nearest the pixel size the mode is `LINEAR`: the GPU
+/// blends them, so no visible line marks where one level hands over to the next. The LOD is
+/// not clamped (`LOD_CLAMP_NONE`): the view's level count limits it, so the one sampler
+/// fits arrays of every tile size. No anisotropy (an optional device feature).
 fn sampler_info() -> vk::SamplerCreateInfo<'static> {
     vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::NEAREST)
         .min_filter(vk::Filter::NEAREST)
-        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
         .address_mode_u(vk::SamplerAddressMode::REPEAT)
         .address_mode_v(vk::SamplerAddressMode::REPEAT)
         .address_mode_w(vk::SamplerAddressMode::REPEAT)
         .anisotropy_enable(false)
         .compare_enable(false)
         .min_lod(0.0)
-        .max_lod(0.0)
+        .max_lod(vk::LOD_CLAMP_NONE)
         .unnormalized_coordinates(false)
 }
 
@@ -390,9 +413,18 @@ mod tests {
         let info = sampler_info();
         assert_eq!(info.mag_filter, vk::Filter::NEAREST);
         assert_eq!(info.min_filter, vk::Filter::NEAREST);
+        assert_eq!(info.mipmap_mode, vk::SamplerMipmapMode::LINEAR);
         assert_eq!(info.address_mode_u, vk::SamplerAddressMode::REPEAT);
         assert_eq!(info.address_mode_v, vk::SamplerAddressMode::REPEAT);
         assert_eq!(info.anisotropy_enable, vk::FALSE);
+    }
+
+    #[test]
+    fn the_sampler_reaches_the_smallest_level_of_the_largest_tile() {
+        let info = sampler_info();
+        assert_eq!(info.min_lod, 0.0);
+        let last_level = mip_level_count(TextureLayers::MAX_SIZE) - 1;
+        assert!(info.max_lod >= last_level as f32);
     }
 
     #[test]
@@ -400,19 +432,32 @@ mod tests {
         let info = image_info(16, 3);
         assert_eq!(info.format, vk::Format::R8G8B8A8_UNORM);
         assert_eq!((info.extent.width, info.extent.height), (16, 16));
-        assert_eq!((info.array_layers, info.mip_levels), (3, 1));
+        assert_eq!((info.array_layers, info.mip_levels), (3, 5));
         assert!(info.usage.contains(vk::ImageUsageFlags::SAMPLED));
         assert_eq!(info.tiling, vk::ImageTiling::OPTIMAL);
     }
 
     #[test]
-    fn one_copy_covers_every_layer() {
-        let copy = copy_region(32, 5);
-        assert_eq!(copy.image_subresource.layer_count, 5);
-        assert_eq!(
-            (copy.image_extent.width, copy.image_extent.height),
-            (32, 32)
-        );
-        assert_eq!((copy.buffer_row_length, copy.buffer_image_height), (0, 0));
+    fn one_copy_per_level_covers_every_layer_from_its_offset() {
+        let pixels = vec![0; 4 * 4 * 5 * TextureLayers::BYTES_PER_TEXEL];
+        let textures = TextureLayers {
+            size: 4,
+            layer_count: 5,
+            pixels: &pixels,
+        };
+        let chain = MipChain::build(&textures).expect("valid test textures");
+        let copies = copy_regions(chain.levels(), 5);
+        let seen: Vec<(u32, u64, u32)> = copies
+            .iter()
+            .map(|copy| {
+                assert_eq!(copy.image_subresource.layer_count, 5);
+                assert_eq!(copy.image_extent.width, copy.image_extent.height);
+                assert_eq!((copy.buffer_row_length, copy.buffer_image_height), (0, 0));
+                let level = copy.image_subresource.mip_level;
+                (level, copy.buffer_offset, copy.image_extent.width)
+            })
+            .collect();
+        // Level offsets: 0, then 4 * 4 * 5 * 4 = 320, then 320 + 2 * 2 * 5 * 4 = 400.
+        assert_eq!(seen, [(0, 0, 4), (1, 320, 2), (2, 400, 1)]);
     }
 }

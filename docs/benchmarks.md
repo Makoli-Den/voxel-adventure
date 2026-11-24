@@ -373,4 +373,40 @@ The figures are the run summaries' `gpu` (upper bound) and FPS.
 No measurable cost on this GPU: the differences are within the run-to-run spread, and the
 summary prints the GPU time to 0.01 ms. The textures are 16x16 with five layers, so
 they stay in the texture cache; a slow integrated GPU and larger packs (256x256 tiles) are not
-measured yet, and distant terrain samples without mipmaps until step S8.
+measured yet, and distant terrain samples without mipmaps until step S8 (measured below).
+
+### Mipmaps (2026-11-24, step S8 of decision 0013)
+
+The block textures now have a full mip chain (built on the CPU with a 2x2 box filter),
+sampled with `NEAREST` within a level and `LINEAR` between levels. Same command line,
+machine and method as above; "before" is `main` at the end of step S7.
+
+| Radius | GPU before (3 runs) | GPU after (3 runs) | FPS before | FPS after |
+|---|---|---|---|---|
+| 8 (default) | 0.09, 0.09, 0.09 ms | 0.09, 0.09, 0.09 ms | 3546, 3519, 3542 | 3512, 3538, 3579 |
+| 16 | 0.42, 0.43, 0.42 ms | 0.43, 0.43, 0.42 ms | 1736, 1752, 1739 | 1737, 1728, 1717 |
+
+No measurable cost on this GPU, although `LINEAR` between levels reads two texels instead of
+one. A hypothesis, not measured: distant faces now read small levels, which are friendlier to
+the texture cache, and that pays for the second read. The visible gain is the point: distant grass shows its average colour instead of a speckle of
+single texels that changes as the camera moves. The chain adds a third to the texture
+memory: for five 16x16 layers, 1700 bytes on top of the 5120-byte base level, built once
+per upload. The slow-GPU caveat above still applies.
+
+**Choosing the filters.** Screenshots of the same frame with three sampler settings (temporary
+overrides, removed afterwards): `NEAREST` within a level with `NEAREST` between levels (NN),
+`NEAREST` with `LINEAR` between levels (NL, chosen) and `LINEAR` with `LINEAR` (LL). Two
+views at radius 16: the start position looking at the horizon (pitch -0.03) and a camera 3
+blocks above the highest terrain (height 27, pitch -0.12). The figure is the share of
+terrain pixels (the window below the panel) whose per-channel difference, converted to grey,
+is 8 or more out of 255 (Pillow `ImageChops.difference`, then `convert("L")`).
+
+| Views compared | Horizon | Low camera |
+|---|---|---|
+| NN vs NL | 1.1% | 1.6% |
+| NL vs LL | 6.2% | 7.7% |
+| NN vs LL | 8.8% | 10.8% |
+
+`LINEAR` within a level softens textures visibly at middle distance; the mip mode changes
+little in a still frame. NL is kept because it hides the line where one level hands over to
+the next while the camera moves (not measured, the frames are stills).
