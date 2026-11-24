@@ -21,6 +21,7 @@ crates/
   vox-world/     blocks and the block registry, chunks, the world of chunks, meshing and demo terrain; knows nothing about rendering, mods or networking
   vox-resources/ virtual resource file system: `namespace:path` ids and layered packs; no dependencies
   vox-content/   content read from resource packs: the blocks file and block textures (PNG decoding, tile size, the generated missing texture); depends on `vox-resources`, `vox-world`, `serde`, `serde_json`, `png`
+  vox-mods/      the mod system, first step: the `mod.json` manifest, finding mods in a folder and dependency resolution into a load order; no scripting yet, not used by the game yet; depends on `vox-resources`, `serde`, `serde_json`, `semver`
   vox-render/    rendering behind the `Renderer` trait; the only crate that touches Vulkan
   vox-game/      the executable: window, event loop, wires the layers together
 docs/

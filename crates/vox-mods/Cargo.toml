@@ -1,0 +1,19 @@
+[package]
+name = "vox-mods"
+version = "0.1.0"
+description = "The mod system: manifests, discovery and dependency resolution. Knows nothing about rendering."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# Versions and version requirements; the default `std` feature is the only one used and the
+# crate has no dependencies of its own.
+semver = "1.0.28"
+vox-resources = { path = "../vox-resources" }
+
+[lints]
+workspace = true

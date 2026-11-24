@@ -25,7 +25,7 @@ mods/example/
 ```
 `assets/` is a `DirPack`; nothing in the pack code changes. The manifest sits outside the pack, so no pack can override another mod's manifest. A resource pack (`--pack`) is the same pack without manifest and code. A data-only mod (no `entry`) is valid.
 
-**Manifest `mod.json`** (JSON, `deny_unknown_fields`, read with a size cap `MAX_MANIFEST_BYTES`):
+**Manifest `mod.json`** (JSON, `deny_unknown_fields`, read with a size cap `MAX_MANIFEST_BYTES` of 64 KiB, a leading UTF-8 byte order mark is skipped):
 ```json
 { "format": 1,
   "id": "example",
@@ -35,19 +35,21 @@ mods/example/
   "entry": "example:scripts/main.lua",
   "capabilities": ["world.read", "world.write"] }
 ```
-- `id`: the mod's namespace, same character rule as a `ResourceId` namespace; must equal the directory name (so a mods folder cannot hold the same id twice by accident); `core` is reserved for the engine.
+- `id`: the mod's namespace, same character rule as a `ResourceId` namespace; must equal the directory name (so a mods folder cannot hold the same id twice by accident); `core` is reserved for the engine, so it is refused as a dependency name too.
 - `version`: semver (`semver::Version`).
-- `api`: the mod API version the mod was written against, `MAJOR.MINOR`; it means `^MAJOR.MINOR` (see (c)).
-- `dependencies`: mod id to a cargo-style version requirement (`semver::VersionReq`). Required dependencies only.
+- `api`: the mod API version the mod was written against, `MAJOR.MINOR` without leading zeros; it means `^MAJOR.MINOR` (see (c)). Major 0 gets no special treatment.
+- `dependencies`: mod id to a cargo-style version requirement (`semver::VersionReq`). Required dependencies only. A mod id listed twice in the object is an error (JSON parsers would silently keep the last).
 - `entry`: optional resource id of the entry script; its namespace must be the mod's own id.
-- `capabilities`: optional, see (c). Unknown names are a manifest error.
+- `capabilities`: optional, see (c). Unknown names and duplicates are a manifest error.
 
-**Where mods are found.** Every immediate subdirectory with a `mod.json` of the built-in `mods/` folder of the source tree (baked in like `BUILT_IN_PACK`, same TODO for packaging) and of every `--mods DIR` (repeatable). The base game moves from `assets/base/` to `mods/base/` (`mods/base/mod.json`, `mods/base/assets/base/...`, version `0.1.0`, no script); `assets/` keeps only `core`.
+**Where mods are found.** Every immediate subdirectory (links are never followed, see below) with a `mod.json` of the built-in `mods/` folder of the source tree (baked in like `BUILT_IN_PACK`, same TODO for packaging) and of every `--mods DIR` (repeatable). The base game moves from `assets/base/` to `mods/base/` (`mods/base/mod.json`, `mods/base/assets/base/...`, version `0.1.0`, no script); `assets/` keeps only `core`.
 
-**Load order and the pack stack.** Dependency resolution is a pure function `resolve(manifests, MOD_API_VERSION) -> Result<Vec<ModManifest>, Vec<ResolveError>>`:
-1. Check each mod alone: duplicate id across folders, `api` major differs from the game's or minor is newer than the game's.
-2. Check each dependency: missing mod, or present with a version outside the requirement.
-3. Topological sort (Kahn) with ties broken by id, so the order is the same on every machine and run. Mods left over form cycles; the error names the mods of each cycle.
+**Links are not followed.** A mod folder, or a `mod.json`, that is a symbolic link or a junction is an error (`ModError::Symlink`), also when it dangles; a `mod.json` that is not a regular file is an error too. Reason: a mods folder (a download, an archive) must not make the game read outside it, and following links would let one mod appear under two ids. The player copies the mod instead. Every I/O error except "not found" is reported with its path. `discover` and `resolve` both collect all errors (`Vec<ModError>`, `Vec<ResolveError>`) instead of stopping at the first.
+
+**Load order and the pack stack.** Dependency resolution is a pure function `resolve(manifests, MOD_API_VERSION) -> Result<Vec<ModId>, Vec<ResolveError>>` (the ids in load order; the game looks the mods up by id):
+1. Check each mod alone: duplicate id across folders (the lowest version stands for the id in the later checks, so the errors do not depend on input order), `api` major differs from the game's or minor is newer than the game's.
+2. Check each dependency: missing mod, or present with a version outside the requirement. Pre-releases follow cargo's rule: `^1.0` does not match `1.1.0-beta`, a requirement that names a pre-release of the same version (`^1.1.0-alpha`) does.
+3. Topological sort (Kahn) with ties broken by id, so the order is the same on every machine and run. Cycles are found as strongly connected components (Tarjan, O(V+E)); the error names one shortest circle through the smallest id of each component, and a mod that depends on itself is a circle of one. Mods that merely depend on a circle are not reported as part of it.
 
 All errors are collected and reported together, and the game stops at startup, as it does for a broken blocks file: a half-loaded mod set is worse than a clear message. The pack stack becomes, bottom to top: `assets/` (`core`), each mod's `assets/` in load order (a mod overrides its dependencies), then every `--pack` (the player's texture packs win over mods). Blocks are registered per mod in load order from `<id>:blocks.json` if the mod has one, into one registry. Ids therefore depend on the mod set; this was already true (decision 0013) and is solved by the name-to-id table of world saves, not here.
 
@@ -82,7 +84,7 @@ Reasons: the first mods are small event handlers, where call overhead and memory
 **Error isolation:** any Lua error (runtime error, syntax error, budget, memory, too many writes, missing capability) disables that mod for the rest of the session: its state is dropped, its buffered writes of that call are discarded, and a warning with the mod id and the Lua traceback is returned to the game, which prints it. Other mods and the game continue. Mods that depend on a disabled mod keep running (in v1 mods cannot call each other). Its data (blocks, textures) stays registered: data is loaded before scripts and is not undone.
 
 ### (c) Mod API v1
-**Versioning.** `MOD_API_VERSION` (a `semver::Version`, starting at `1.0.0`) lives in `vox-mods`. Adding a function, event or event field is a minor bump; removing or changing anything is a major bump. The game supports exactly one major version. A mod declaring `"api": "1.2"` loads on 1.2 and later 1.x, and is refused on 1.1 and on 2.x with a message naming both versions. The API reference is `docs/mod-api.md`, updated in the same PR as every API change.
+**Versioning.** `MOD_API_VERSION` (an `ApiVersion` of major and minor, starting at `1.0`; the patch of a semver version has no meaning for an API) lives in `vox-mods`. Adding a function, event or event field is a minor bump; removing or changing anything is a major bump. The game supports exactly one major version. A mod declaring `"api": "1.2"` loads on 1.2 and later 1.x, and is refused on 1.1 and on 2.x with a message naming both versions. The API reference is `docs/mod-api.md`, updated in the same PR as every API change.
 
 **What a mod does in v1:**
 - Data (no code): blocks and textures through `<id>:blocks.json` and its pack, as the base game does; overrides of any resource.

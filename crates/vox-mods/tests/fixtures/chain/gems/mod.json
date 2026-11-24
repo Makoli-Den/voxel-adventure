@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "id": "gems",
+  "version": "2.3.4",
+  "api": "1.0",
+  "dependencies": { "ruby": "~1.0" },
+  "entry": "gems:scripts/main.lua",
+  "capabilities": ["world.read", "world.write"]
+}

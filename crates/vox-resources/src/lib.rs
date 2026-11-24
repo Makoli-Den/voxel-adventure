@@ -10,5 +10,5 @@ mod id;
 mod pack;
 
 pub use error::{IdProblem, ResourceError};
-pub use id::{NAMESPACE_SEPARATOR, PATH_SEPARATOR, ResourceId};
+pub use id::{NAMESPACE_SEPARATOR, PATH_SEPARATOR, ResourceId, validate_namespace};
 pub use pack::{DirPack, PackStack};

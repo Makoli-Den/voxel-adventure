@@ -1,0 +1,1 @@
+A plain file next to the mod folders is ignored.
