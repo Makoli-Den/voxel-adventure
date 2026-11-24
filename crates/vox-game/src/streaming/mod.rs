@@ -7,6 +7,7 @@
 
 pub mod area;
 mod job;
+pub mod lod;
 mod tracker;
 mod workers;
 

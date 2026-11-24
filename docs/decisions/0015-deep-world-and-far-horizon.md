@@ -79,7 +79,7 @@ Arithmetic that rules out "just raise the radius": full detail to 2048 blocks is
 | Fill time to the horizon | <= 1 s | <= 3 s |
 | Main-thread cost of one edit that creates chunks | <= 2 ms | same |
 
-`MAX_VIEW_RADIUS` drops from 30 to 16 when LOD lands: at 30 a single LOD ring would hold about 2,100 tiles. 300 k triangles at 60 FPS is 18 M per second, a small fraction of what 2012-era integrated GPUs are rated for; this is an estimate until S9 measures one.
+The meshes row is met by the measured counts of S6 only with these rules (see "S6 as built"): the default radius is 8 again when LOD lands (934 meshes at horizon 2048), and a radius above 14 gets a horizon below 4096 from `max_horizon_for`, so the total stays at most 3000. `MAX_VIEW_RADIUS` drops from 30 to 16 when LOD lands: at 30 a single LOD ring would hold about 2,100 tiles. 300 k triangles at 60 FPS is 18 M per second, a small fraction of what 2012-era integrated GPUs are rated for; this is an estimate until S9 measures one.
 
 ## Steps
 Each step is one PR, leaves the game running, passes `cargo fmt`, `cargo clippy -- -D warnings` and `cargo test`, gets an independent review, and records its measurement in `docs/benchmarks.md` (three runs before and after, as there). Window checks follow the project rule (`--background`, hidden console, no topmost).
@@ -107,7 +107,7 @@ S2b needs S1 (camera position) and S2a; S5 needs S2b (same renderer files) and S
 
 **S5. Tiles and reversed Z in the renderer** (render-dev; `vox-render`, `vox-game/src/camera.rs`, the call sites in `main.rs`). `set_tile_mesh`, cell size in the push, mesh `y` range for the box, reversed Z with the `D24` horizon cap, triangles per level in `RenderStats`. Done: frustum and push-layout tests; the picture at level 0 identical; one window check of a hand-placed level-2 tile next to full-detail chunks (seams closed, texture aligned).
 
-**S6. Tile selection** (world-dev; new `vox-game/src/streaming/lod.rs` and one line in `streaming/mod.rs`, not wired). The quadtree of (b). Done: the tests listed there, plus tile counts per level at radius 8 for horizons 2048 and 4096 within 20 percent of the estimates, and the cost of one selection (expected well under 1 ms) logged by a test.
+**S6. Tile selection** (world-dev; new `vox-game/src/streaming/lod.rs` and one line in `streaming/mod.rs`, not wired). The quadtree of (b). Done: the tests listed there, plus tile counts per level at radius 8, 12 and 16 for horizons 2048 and 4096 (the estimates were 45 percent too low: the real worst cases are in "S6 as built" and pinned by tests), `max_horizon_for` keeping the mesh count within the budget, and the cost of one selection (expected well under 1 ms) logged by a test.
 
 **S7. LOD streaming** (world-dev; `streaming/*`, `main.rs`, `cli.rs`, `hud.rs`). Tracker keyed by `TilePos`, LOD jobs on the same workers sharing the upload budget, nearest first; `--horizon`, fog end from the horizon; `MAX_VIEW_RADIUS` 16. Done: the default and maximum columns of the budget table met and recorded (standing and `--fly 8`); one window check at the default settings from the ground and from height 300.
 
@@ -182,6 +182,24 @@ Caves and cave culling; uniform or palette chunk storage; the two-stage generati
 - **Measured** (`docs/benchmarks.md`): a tile costs 33 to 45 us to generate (one chunk 37 us in the same run); level 2 meshes in 122 us. Skirt share of quads at levels 1 to 3: under 26 percent over 5 seeds and the 3 x 3 tiles around the origin, under the 40 percent limit, so the skirts stay neighbour-blind. Level 4 (23 to 45 quads, nearly all walls) is judged by its absolute cost, not by the share.
 - **`TilePos` fields are private** (`level()`, `pos()`): `new` clamps the level, so equal tiles are equal keys.
 - **For S5 to S7: layers outside the column span must not be meshed.** A tile meshed alone has a top and four walls, so a layer that lies fully inside the solid part would mesh a hidden top and four walls for nothing, and a solid layer above the surface layer (all stone, below the span) would do the same. The worker meshes only the layers of the span (selection in S6 and jobs in S7), as (a) says for chunks.
+
+## S6 as built
+- **API** (`vox-game/src/streaming/lod.rs`, not wired): `select_tiles(camera, view_radius, horizon) -> Vec<TilePos>`, `diff(previous, next) -> (added, removed)` for S7 and `max_horizon_for(view_radius) -> i32`. Tiles are layer-0 columns; the selection works on `(level, x, z)`. `DEFAULT_HORIZON_BLOCKS` (2048) and `MAX_HORIZON_BLOCKS` (4096) live there for now. The radius is clamped to `MIN_BALANCED_RADIUS` (1) ..= `MAX_VIEW_RADIUS_CHUNKS` (30; S7 sets the game maximum to 16), the horizon to 0 ..= 4096.
+- **The split rule has a snap slack.** The threshold is `view_radius / 2 + 0.375` tiles: the camera snapped to the centre of its level-1 tile can be 0.354 of a tile from the real column, and without the slack a column at the view radius could fall in a level-1 tile that does not split. With it every column of `area::wanted` is a level-0 leaf (tested for radii 0 to 16 at every position in the root tile grid). The horizon cut uses the real camera column (it only adds or removes tiles at the far edge); the splits use the snapped one, so leaves of level `k` and up do not change while the camera stays inside one level-`k` tile.
+- **The horizon disc is centred on the centre of the camera column**, up to 0.71 chunks (22.6 blocks) from the camera. S7 must set the fog end to at most `horizon - 22.6` blocks.
+- **Level-0 keep range.** The level-0 leaves reach up to 3.56 chunks beyond the radius (`LEVEL0_MARGIN_CHUNKS` 3.6 in the tests), more than `area::UNLOAD_MARGIN` (1), so S7 cannot use `area::is_kept` for them: the keep range comes from the selection itself.
+- **Balance** (neighbouring leaves differ by at most one level) holds from radius 1, tested at every position in the root tile grid for radii 1 to 3 and over many cameras (negative columns, tile borders) for larger ones. Radius 0 breaks it (a test shows it), so a smaller radius is clamped up to 1: an unbalanced selection is worse than one more column of full detail. The ratio was not raised.
+- **The counts are about 45 percent above the estimates of (b)**: the estimate used the ideal ring area, a real ring is cut in whole parent tiles and level-0 leaves come in groups of four. Worst case over all 256 camera positions modulo 16 chunks (the count varies by under 1 percent):
+
+| View radius | Horizon 2048 | Horizon 4096 |
+|---|---|---|
+| 8 | 934 (308, 231, 231, 164 by level 0..3) | 1165 (308, 231, 231, 231, 164 by level 0..4) |
+| 12 | 1582 | 2029 |
+| 16 | 2367 | 3116 |
+
+- **Consequences for the budget (e).** The default radius goes back from 12 to 8 when LOD lands (S7): the horizon replaces the big full-detail radius, and 934 meshes fit the budget of 1500. A radius up to 16 is allowed only with the horizon clamped so that the mesh count stays at most 3000: `max_horizon_for(radius)` does this by code (bisection over steps of 256 blocks, a few selections, run when an option changes). It gives 4096 up to radius 14, 3840 at 15, 3328 at 16, 2048 at 18 and 768 at 27 to 30. GPU mesh memory at 30 KB a tile: about 28 MB at 934 meshes and about 90 MB at 3000; worker time to fill 934 tiles at 0.2 ms is about 12 ms over 15 workers. S7 checks these against the table.
+- **`diff`:** `added` is in load order (nearest first), `removed` is farthest first (unload order). A level change is one tile removed and four added (or the reverse) with no link between them; S8 must derive the replacement from the tile rectangles. One chunk step changes at most 6 leaves inside one level-1 tile (the horizon edge only) and at most 48, 93, 141 and 141 when a border of level 1, 2, 3 and 4 is crossed (radius 8, horizon 2048).
+- **Cost of one selection:** about 26 us at horizon 2048 and 52 us at 4096 (release, `docs/benchmarks.md`).
 
 ## Answers to the open questions
 - The world bounds are -512 and 512 (named parameters, easy to change).
