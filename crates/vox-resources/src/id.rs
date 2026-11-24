@@ -114,20 +114,38 @@ fn is_reserved(name: &str) -> bool {
     RESERVED_NAMES.contains(&stem)
 }
 
+/// Checks `text` as a namespace alone, with the same rules as the namespace of a
+/// [`ResourceId`]: `[a-z0-9_]+`, not a Windows device name. Mods use their id as a namespace,
+/// so they share this rule instead of copying it.
+///
+/// ```
+/// use vox_resources::{IdProblem, validate_namespace};
+///
+/// assert_eq!(validate_namespace("my_mod2"), Ok(()));
+/// assert_eq!(validate_namespace("My"), Err(IdProblem::BadNamespaceChar('M')));
+/// ```
+///
+/// # Errors
+/// The first [`IdProblem`] the text breaks.
+pub fn validate_namespace(text: &str) -> Result<(), IdProblem> {
+    if text.is_empty() {
+        return Err(IdProblem::EmptyNamespace);
+    }
+    if let Some(bad) = text.chars().find(|&c| !is_namespace_char(c)) {
+        return Err(IdProblem::BadNamespaceChar(bad));
+    }
+    if is_reserved(text) {
+        return Err(IdProblem::ReservedName);
+    }
+    Ok(())
+}
+
 /// Splits `text` into namespace and path, or names the first broken rule.
 fn validate(text: &str) -> Result<(&str, &str), IdProblem> {
     let (namespace, path) = text
         .split_once(NAMESPACE_SEPARATOR)
         .ok_or(IdProblem::MissingColon)?;
-    if namespace.is_empty() {
-        return Err(IdProblem::EmptyNamespace);
-    }
-    if let Some(bad) = namespace.chars().find(|&c| !is_namespace_char(c)) {
-        return Err(IdProblem::BadNamespaceChar(bad));
-    }
-    if is_reserved(namespace) {
-        return Err(IdProblem::ReservedName);
-    }
+    validate_namespace(namespace)?;
     if path.is_empty() {
         return Err(IdProblem::EmptyPath);
     }
@@ -255,6 +273,22 @@ mod tests {
     fn backslash_is_rejected() {
         assert_eq!(problem("base:a\\b"), IdProblem::Backslash);
         assert_eq!(problem("base:..\\secret"), IdProblem::Backslash);
+    }
+
+    #[test]
+    fn namespace_alone_follows_the_namespace_rules() {
+        assert_eq!(validate_namespace("my_mod2"), Ok(()));
+        assert_eq!(validate_namespace(""), Err(IdProblem::EmptyNamespace));
+        assert_eq!(
+            validate_namespace("a-b"),
+            Err(IdProblem::BadNamespaceChar('-'))
+        );
+        assert_eq!(validate_namespace("nul"), Err(IdProblem::ReservedName));
+        // A colon is not a namespace character: this is a namespace, not an id.
+        assert_eq!(
+            validate_namespace("a:b"),
+            Err(IdProblem::BadNamespaceChar(':'))
+        );
     }
 
     #[test]

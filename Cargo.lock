@@ -1816,6 +1816,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox-mods"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "vox-resources",
+]
+
+[[package]]
 name = "vox-render"
 version = "0.1.0"
 dependencies = [
