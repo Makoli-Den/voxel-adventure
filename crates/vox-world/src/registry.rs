@@ -42,6 +42,27 @@ pub struct FaceTextures {
 }
 
 impl FaceTextures {
+    /// A table from the layers of each block, indexed by block id: entry `i` holds the six
+    /// layers of block `i`, in the order of [`Face::ALL`].
+    ///
+    /// The registry builds its own table as blocks are registered; this is for a caller that
+    /// wants another mapping, for example one where the layer equals the block id. The caller
+    /// owns the mapping and nothing is checked: by convention entry 0 belongs to air (which
+    /// is never drawn), a block id past the end of the table reads as
+    /// [`TextureLayer::MISSING`], and an empty `layers` makes every block read as missing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vox_world::{BlockId, Face, FaceTextures, TextureLayer};
+    ///
+    /// let table = FaceTextures::from_layers(vec![[TextureLayer(7); Face::COUNT]]);
+    /// assert_eq!(table.get(BlockId(0), Face::NegZ), TextureLayer(7));
+    /// ```
+    pub fn from_layers(layers: Vec<[TextureLayer; Face::COUNT]>) -> Self {
+        Self { layers }
+    }
+
     /// The layer of `face` of `block`, or [`TextureLayer::MISSING`] for an unknown block.
     ///
     /// # Example

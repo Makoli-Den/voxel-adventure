@@ -427,9 +427,16 @@ mod tests {
         // Recompute them when either changes on purpose. The naive mesher gives one quad
         // per visible face; the greedy one merges them.
         let chunk = generate_terrain(1);
-        let naive = crate::mesh::naive_mesh(&chunk, &crate::Neighbours::none());
+        let naive = crate::mesh::naive_mesh(
+            &chunk,
+            &crate::Neighbours::none(),
+            &crate::mesh::identity_textures(),
+        );
         assert_eq!(naive.quad_count(), 4848);
-        assert_eq!(build_mesh(&chunk).quad_count(), GREEDY_QUADS);
+        assert_eq!(
+            build_mesh(&chunk, &crate::mesh::identity_textures()).quad_count(),
+            GREEDY_QUADS
+        );
     }
 
     /// The most the surface height can change between two adjacent columns. The noise has

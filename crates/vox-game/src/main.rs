@@ -37,7 +37,7 @@ use winit::window::{Window, WindowId};
 
 use camera::{Camera, Movement};
 use cli::{Command, Options};
-use content::Content;
+use content::{Content, identity_face_textures};
 use controls::Controls;
 use editing::{EditAction, REACH};
 use metrics::FrameHistory;
@@ -180,7 +180,13 @@ struct App {
 impl App {
     fn new(options: Options, shaders: ShaderSources, content: &Content) -> Self {
         Self {
-            terrain: Arc::new(Terrain::new(WORLD_SEED, content.terrain)),
+            terrain: Arc::new(Terrain::new(
+                WORLD_SEED,
+                content.terrain,
+                // Until step S7 the layer equals the block id, so the palette shader still
+                // colours by block.
+                identity_face_textures(content.registry.len()),
+            )),
             place_block: content.place_block,
             options,
             shaders,

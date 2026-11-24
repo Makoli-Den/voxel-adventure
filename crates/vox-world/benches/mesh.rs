@@ -11,7 +11,8 @@ use std::mem::size_of;
 
 use criterion::{Criterion, Throughput};
 use vox_world::{
-    BlockId, CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, LocalPos,
+    BlockId, CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, FaceTextures,
+    LocalPos, TextureLayer,
 };
 use vox_world::{Neighbours, build_mesh, build_mesh_into, build_mesh_with_neighbours_into};
 use vox_world::{TerrainBlocks, generate_chunk, generate_terrain};
@@ -23,6 +24,21 @@ const TERRAIN: TerrainBlocks = TerrainBlocks {
     dirt: BlockId(2),
     stone: BlockId(3),
 };
+/// Blocks the benchmark table covers: air and every id up to stone, the highest terrain
+/// block (checked below); the solid and checkerboard cases use ids among them.
+const TABLE_BLOCKS: u16 = TERRAIN.stone.0 + 1;
+
+const _: () = assert!(TERRAIN.grass.0 < TERRAIN.stone.0 && TERRAIN.dirt.0 < TERRAIN.stone.0);
+
+/// A table where the layer of every face equals the block id, one array read per quad.
+fn textures() -> FaceTextures {
+    FaceTextures::from_layers(
+        (0..TABLE_BLOCKS)
+            .map(|id| [TextureLayer(id); Face::COUNT])
+            .collect(),
+    )
+}
+
 /// Coordinate of the middle of the chunk along an axis: far from every border, so the
 /// single block of `single_block_chunk` has all six neighbours inside the chunk.
 const MIDDLE: usize = CHUNK_SIZE / 2;
@@ -92,7 +108,7 @@ fn print_mesh_stats() {
         "case", "quads", "vertices", "bytes", "vtx cap", "vtx len", "idx cap", "idx len"
     );
     for (name, chunk) in mesh_cases() {
-        let mesh = build_mesh(&chunk);
+        let mesh = build_mesh(&chunk, &textures());
         println!(
             "{:<16} {:>8} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
             name,
@@ -118,8 +134,11 @@ fn mesh_bytes(mesh: &ChunkMesh) -> usize {
 fn bench_mesh(c: &mut Criterion) {
     let mut group = c.benchmark_group("mesh");
     group.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
+    let textures = textures();
     for (name, chunk) in mesh_cases() {
-        group.bench_function(name, |b| b.iter(|| build_mesh(black_box(&chunk))));
+        group.bench_function(name, |b| {
+            b.iter(|| build_mesh(black_box(&chunk), black_box(&textures)))
+        });
     }
     group.finish();
 }
@@ -135,12 +154,13 @@ fn bench_mesh_reused(c: &mut Criterion) {
         ("solid", solid_chunk()),
         ("checkerboard", checkerboard_chunk()),
     ];
+    let textures = textures();
     for (name, chunk) in cases {
         let mut mesh = ChunkMesh::default();
-        build_mesh_into(&chunk, &mut mesh);
+        build_mesh_into(&chunk, &textures, &mut mesh);
         group.bench_function(name, |b| {
             b.iter(|| {
-                build_mesh_into(black_box(&chunk), &mut mesh);
+                build_mesh_into(black_box(&chunk), &textures, &mut mesh);
                 black_box(&mesh);
             })
         });
@@ -158,15 +178,21 @@ fn bench_mesh_neighbours(c: &mut Criterion) {
     let around =
         Face::ALL.map(|face| generate_chunk(SEED, ChunkPos::ORIGIN.neighbour(face), &TERRAIN));
     let neighbours = Neighbours::new(around.each_ref().map(Some));
+    let textures = textures();
     let mut mesh = ChunkMesh::default();
-    build_mesh_with_neighbours_into(&chunk, &neighbours, &mut mesh);
+    build_mesh_with_neighbours_into(&chunk, &neighbours, &textures, &mut mesh);
     println!(
         "terrain_seed_1 with neighbours: {} quads",
         mesh.quad_count()
     );
     group.bench_function("terrain_seed_1", |b| {
         b.iter(|| {
-            build_mesh_with_neighbours_into(black_box(&chunk), black_box(&neighbours), &mut mesh);
+            build_mesh_with_neighbours_into(
+                black_box(&chunk),
+                black_box(&neighbours),
+                &textures,
+                &mut mesh,
+            );
             black_box(&mesh);
         })
     });
