@@ -4,6 +4,8 @@
 //! extracted from the combined view-projection matrix (the Gribb-Hartmann method), so
 //! the test follows whatever projection the game sets.
 
+use vox_world::CHUNK_SIZE;
+
 /// Planes of a view frustum: left, right, bottom, top, near, far.
 const PLANE_COUNT: usize = 6;
 
@@ -58,6 +60,15 @@ impl Frustum {
             let distance = farthest + plane[3];
             distance >= 0.0 || !distance.is_finite()
         })
+    }
+
+    /// Whether any part of a chunk may be visible, by its bounding box (the chunk's cube of
+    /// `CHUNK_SIZE` blocks). `min` is the chunk's origin in the same space as the matrix the
+    /// planes came from: relative to the camera for the renderer's camera-relative matrix.
+    // HOT PATH: runs for every chunk every frame; three additions and the box test.
+    pub(crate) fn may_see_chunk(&self, min: [f32; 3]) -> bool {
+        let size = CHUNK_SIZE as f32;
+        self.may_see_box(min, min.map(|value| value + size))
     }
 }
 

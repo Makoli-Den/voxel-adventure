@@ -277,34 +277,102 @@ void main() { broken }
 
     #[test]
     fn push_constants_of_exactly_the_range_are_accepted() {
-        // 80 bytes: the matrix and the chunk origin, like the built-in shader.
+        // 112 bytes: the matrix, the chunk origin, the fog and its colour, like the built-in
+        // shaders.
         let source = "#version 450
-            layout(push_constant) uniform Draw { mat4 m; vec4 origin; } draw;
-            void main() { gl_Position = draw.m * draw.origin; }";
+            layout(push_constant) uniform Draw { mat4 m; vec4 origin; vec4 fog; vec4 fog_color; } draw;
+            void main() { gl_Position = draw.m * draw.origin + draw.fog * draw.fog_color; }";
         assert!(compiles_for(source, ShaderStage::Vertex, &CHUNK));
     }
 
     #[test]
     fn push_constants_one_vec4_past_the_range_are_rejected() {
-        // 96 bytes: one `vec4` more than the pipeline provides.
+        // 128 bytes: one `vec4` more than the pipeline provides, though every device has 128.
         let source = "#version 450
-            layout(push_constant) uniform Draw { mat4 m; vec4 origin; vec4 extra; } draw;
+            layout(push_constant) uniform Draw {
+                mat4 m; vec4 origin; vec4 fog; vec4 fog_color; vec4 extra;
+            } draw;
             void main() { gl_Position = draw.m * draw.origin + draw.extra; }";
         let text = compile_error(source, ShaderStage::Vertex);
         assert!(
-            text.contains("96 bytes") && text.contains("80 bytes"),
+            text.contains("128 bytes") && text.contains("112 bytes"),
             "{text}"
         );
     }
 
     #[test]
-    fn push_constants_in_the_fragment_stage_are_rejected() {
+    fn chunk_push_constants_in_the_fragment_stage_are_accepted() {
+        // The fragment stage reads the fog from the same block.
         let source = "#version 450
-            layout(push_constant) uniform Tint { vec4 color; } tint;
+            layout(push_constant) uniform Draw { mat4 m; vec4 origin; vec4 fog; vec4 fog_color; } draw;
             layout(location = 0) out vec4 out_color;
-            void main() { out_color = tint.color; }";
-        let text = compile_error(source, ShaderStage::Fragment);
-        assert!(text.contains("vertex stage"), "{text}");
+            void main() { out_color = draw.fog_color * draw.fog.x; }";
+        assert!(compiles_for(source, ShaderStage::Fragment, &CHUNK));
+    }
+
+    /// The byte offset of every member of the push-constant block of the built-in shader
+    /// `file_name`, in declaration order.
+    fn built_in_push_offsets(file_name: &str, stage: ShaderStage) -> Vec<u32> {
+        let source = built_in(file_name).text;
+        let module = glsl::Frontend::default()
+            .parse(&glsl::Options::from(stage), &source)
+            .unwrap();
+        let (_, block) = module
+            .global_variables
+            .iter()
+            .find(|(_, global)| global.space == naga::AddressSpace::Immediate)
+            .unwrap_or_else(|| panic!("{file_name} declares no push constants"));
+        match &module.types[block.ty].inner {
+            naga::TypeInner::Struct { members, .. } => {
+                members.iter().map(|member| member.offset).collect()
+            }
+            other => panic!("{file_name}: the push constants are a {other:?}"),
+        }
+    }
+
+    /// The built-in `chunk.frag` computes the fog exactly as the Rust copy in `crate::view`'s
+    /// tests (`fog_amount`) does, which pins the meaning of the pushed fog values. Compared
+    /// with all whitespace removed, so formatting does not matter.
+    #[test]
+    fn built_in_chunk_fog_matches_the_documented_formula() {
+        let source: String = built_in("chunk.frag")
+            .text
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for expression in [
+            "floatt=clamp((distance-draw.fog.x)*draw.fog.z,0.0,1.0);",
+            "returnt*t*(3.0-2.0*t);",
+            "mix(texel*v_shade,draw.fog_color.rgb,fog_amount(length(v_offset)))",
+        ] {
+            assert!(source.contains(expression), "chunk.frag lacks {expression}");
+        }
+    }
+
+    #[test]
+    fn built_in_chunk_shaders_declare_the_documented_push_block() {
+        use crate::interface::chunk::{
+            CHUNK_ORIGIN_OFFSET, FOG_COLOR_OFFSET, FOG_OFFSET, PUSH_CONSTANT_SIZE,
+        };
+        let expected = vec![0, CHUNK_ORIGIN_OFFSET, FOG_OFFSET, FOG_COLOR_OFFSET];
+        for (file_name, stage) in [
+            ("chunk.vert", ShaderStage::Vertex),
+            ("chunk.frag", ShaderStage::Fragment),
+        ] {
+            assert_eq!(
+                built_in_push_offsets(file_name, stage),
+                expected,
+                "{file_name}"
+            );
+            let module = glsl::Frontend::default()
+                .parse(&glsl::Options::from(stage), &built_in(file_name).text)
+                .unwrap();
+            assert_eq!(
+                check::push_constant_size(&module),
+                Ok(Some(PUSH_CONSTANT_SIZE)),
+                "{file_name}"
+            );
+        }
     }
 
     #[test]

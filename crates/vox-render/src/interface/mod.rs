@@ -111,10 +111,24 @@ pub(crate) struct VertexAttribute {
 /// The one push-constant range of a pipeline, at offset 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PushConstants {
-    /// The only shader stage that may read them.
-    pub(crate) stage: Stage,
+    /// The shader stages that may read them, each listed once. The range is declared for
+    /// all of them together, so every push names all of them.
+    pub(crate) stages: &'static [Stage],
     /// Size of the range in bytes.
     pub(crate) size: u32,
+}
+
+impl PushConstants {
+    /// Whether a shader of `stage` may read the push constants.
+    pub(crate) fn visible_to(&self, stage: Stage) -> bool {
+        self.stages.contains(&stage)
+    }
+
+    /// The stages that may read them, for error messages: "vertex" or "vertex and fragment".
+    pub(crate) fn stage_names(&self) -> String {
+        let names: Vec<&str> = self.stages.iter().map(|stage| stage.name()).collect();
+        names.join(" and ")
+    }
 }
 
 /// The kind of a descriptor resource, and therefore what the shader must declare.

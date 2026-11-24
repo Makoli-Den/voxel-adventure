@@ -4,6 +4,7 @@
 //! game talks to it through the [`Renderer`] trait, so the backend can be
 //! replaced (for example by a fallback for old devices) without touching other layers.
 
+mod chunk_push;
 mod error;
 mod frustum;
 mod interface;
@@ -12,6 +13,7 @@ mod overlay;
 mod shader;
 mod stats;
 mod texture;
+mod view;
 mod vulkan;
 
 use std::sync::Arc;
@@ -23,6 +25,7 @@ pub use overlay::OverlayRect;
 pub use shader::{ShaderSource, ShaderSources};
 pub use stats::RenderStats;
 pub use texture::TextureLayers;
+pub use view::{CameraView, Fog};
 
 /// What the game needs from a renderer.
 pub trait Renderer {
@@ -66,11 +69,22 @@ pub trait Renderer {
     /// Removes the mesh of the chunk at `pos`, if there is one. Does nothing otherwise.
     fn remove_chunk_mesh(&mut self, pos: vox_world::ChunkPos);
 
-    /// Sets the combined view-projection matrix, column-major, exactly `glam::Mat4::to_cols_array_2d()`.
+    /// Sets the camera the next frames are drawn from, see [`CameraView`].
     ///
-    /// The matrix must already produce Vulkan clip space (Y down, depth 0..1); the
-    /// renderer applies it unchanged.
-    fn set_camera(&mut self, view_projection: [[f32; 4]; 4]);
+    /// The matrix is that of the camera placed at the world origin (no translation) and must
+    /// already produce Vulkan clip space (Y down, depth 0..1). The renderer draws everything
+    /// relative to [`CameraView::position`]: it places each chunk by its origin minus the
+    /// position, computed on the CPU, so the picture stays precise far from the world origin.
+    /// Frustum culling follows the matrix, far plane included. Until this is called, the
+    /// identity matrix at the world origin is used.
+    fn set_camera(&mut self, camera: &CameraView);
+
+    /// Sets the distance fog of the next frames, see [`Fog`]: chunk faces fade into the sky
+    /// colour, which the frame is cleared to, between `start` and `end` blocks from the
+    /// camera, so terrain that ends at `end` has no visible edge. Fog that is not
+    /// [`Fog::is_enabled`] (for example `end <= start`) turns it off, which is also the
+    /// state until this is called. The overlay is never fogged.
+    fn set_fog(&mut self, fog: Fog);
 
     /// Replaces the overlay. The rectangles are drawn on top of everything else, in slice
     /// order (later ones over earlier ones), blended by their alpha. An empty slice removes

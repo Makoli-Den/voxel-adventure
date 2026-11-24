@@ -12,9 +12,6 @@ use glam::camera::rh::{proj::vulkan, view};
 const FIELD_OF_VIEW_DEGREES: f32 = 70.0;
 /// Distance of the near clipping plane, in blocks.
 const NEAR: f32 = 0.1;
-/// Distance of the far clipping plane, in blocks. It must cover the loaded area from any point
-/// inside it (the largest `--view-radius`; a test checks it), otherwise the far edge of the world is cut off when the camera flies.
-const FAR: f32 = 3000.0;
 /// How far short of straight up or down the pitch may go, in degrees. At exactly 90 degrees
 /// the look direction is parallel to the world's up axis and the view matrix degenerates.
 const PITCH_MARGIN_DEGREES: f32 = 1.0;
@@ -120,15 +117,20 @@ impl Camera {
         self.position += direction.normalize_or_zero() * distance;
     }
 
-    /// The view-projection matrix for a window of `width` by `height` pixels, column-major.
+    /// The view-projection matrix for a window of `width` by `height` pixels with the far
+    /// clipping plane `far` blocks away, column-major, **for offsets from the eye**: the view
+    /// is built at the world origin, with the camera's rotation but not its position, as the
+    /// renderer's `CameraView` asks. Keeping the position out keeps the matrix exact however
+    /// far the camera is from the world origin.
     ///
-    /// Vulkan clip space: Y points down and depth runs from 0 to 1.
-    pub fn view_projection(&self, width: u32, height: u32) -> [[f32; 4]; 4] {
+    /// Vulkan clip space: Y points down and depth runs from 0 to 1. `far` must lie beyond the
+    /// near plane ([`NEAR`]).
+    pub fn view_projection(&self, width: u32, height: u32, far: f32) -> [[f32; 4]; 4] {
         // A zero side only happens while minimized, when nothing is drawn anyway.
         let aspect = width.max(1) as f32 / height.max(1) as f32;
         // glam's Vulkan projection already flips Y and maps depth to 0..1.
-        let projection = vulkan::perspective(FIELD_OF_VIEW_DEGREES.to_radians(), aspect, NEAR, FAR);
-        let view = view::look_at_mat4(self.position, self.position + self.forward(), Vec3::Y);
+        let projection = vulkan::perspective(FIELD_OF_VIEW_DEGREES.to_radians(), aspect, NEAR, far);
+        let view = view::look_at_mat4(Vec3::ZERO, self.forward(), Vec3::Y);
         (projection * view).to_cols_array_2d()
     }
 }
@@ -144,22 +146,28 @@ mod tests {
 
     use super::*;
 
+    /// A far plane for the tests, in blocks.
+    const FAR: f32 = 500.0;
+
     #[test]
-    fn the_far_plane_covers_the_largest_world_diagonal() {
-        let side = (2 * crate::cli::MAX_VIEW_RADIUS + 1) as f32 * vox_world::CHUNK_SIZE as f32;
-        assert!(
-            FAR >= side * std::f32::consts::SQRT_2,
-            "{FAR} < diagonal of {side}"
-        );
+    fn the_far_plane_of_every_view_radius_lies_beyond_the_near_plane() {
+        // The far plane follows the fog, which follows the view radius; a far plane at or
+        // before the near plane would break the projection.
+        for radius in 0..=crate::cli::MAX_VIEW_RADIUS {
+            let far = crate::view_distance::far_plane(crate::view_distance::fog(radius));
+            assert!(far > NEAR, "radius {radius}: far plane at {far}");
+        }
     }
 
     fn close(a: Vec3, b: Vec3) -> bool {
         (a - b).length() < 1e-5
     }
 
-    /// Normalized device coordinates of a world point seen through `camera`.
+    /// Normalized device coordinates of a world point seen through `camera`: the matrix
+    /// takes the offset from the eye.
     fn ndc(camera: &Camera, point: Vec3) -> Vec3 {
-        let clip = Mat4::from_cols_array_2d(&camera.view_projection(800, 600)) * point.extend(1.0);
+        let matrix = Mat4::from_cols_array_2d(&camera.view_projection(800, 600, FAR));
+        let clip = matrix * (point - camera.position).extend(1.0);
         clip.truncate() / clip.w
     }
 
@@ -229,7 +237,7 @@ mod tests {
         assert!(close(camera.position, Vec3::new(1.0, 2.0, 3.0)));
         assert!(
             camera
-                .view_projection(800, 600)
+                .view_projection(800, 600, FAR)
                 .iter()
                 .flatten()
                 .all(|v| v.is_finite())
@@ -324,6 +332,25 @@ mod tests {
     }
 
     #[test]
+    fn the_matrix_ignores_the_position() {
+        // The same rotation gives the same matrix anywhere, so nothing in it grows with the
+        // distance from the world origin.
+        let near_origin = Camera::new(Vec3::ZERO, 0.3, -0.2);
+        let far_away = Camera::new(Vec3::new(1_000_000.0, 60.0, -1_000_000.0), 0.3, -0.2);
+        assert_eq!(
+            near_origin.view_projection(800, 600, FAR),
+            far_away.view_projection(800, 600, FAR)
+        );
+    }
+
+    #[test]
+    fn a_point_beyond_the_far_plane_is_outside_the_depth_range() {
+        let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        assert!(ndc(&camera, Vec3::new(0.0, 0.0, -FAR * 0.9)).z < 1.0);
+        assert!(ndc(&camera, Vec3::new(0.0, 0.0, -FAR * 1.1)).z > 1.0);
+    }
+
+    #[test]
     fn world_up_points_up_on_screen() {
         // Vulkan's NDC Y points down, so "higher in the world" must be a smaller Y.
         let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
@@ -339,7 +366,7 @@ mod tests {
     #[test]
     fn zero_sized_window_still_gives_a_finite_matrix() {
         let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
-        let matrix = camera.view_projection(0, 0);
+        let matrix = camera.view_projection(0, 0, FAR);
         assert!(matrix.iter().flatten().all(|v| v.is_finite()));
     }
 }

@@ -21,7 +21,7 @@ Arithmetic that rules out "just raise the radius": full detail to 2048 blocks is
 |---|---|---|
 | `WORLD_FLOOR_Y` | -512 | lowest block (a bedrock row); 16 chunk layers below 0; aligned to a chunk border (const assertion) |
 | `WORLD_CEILING_Y` | 512 | first block that can never be set (build limit); 16 layers above 0 |
-| `DEFAULT_VIEW_RADIUS` | 8 chunks (256 blocks), re-measured in S1 and S7 | full-detail area, editable |
+| `DEFAULT_VIEW_RADIUS` | 8 chunks (256 blocks), re-measured in S1 and S7 *(12 chunks since S1, see "S1 as built")* | full-detail area, editable |
 | `DEFAULT_HORIZON` | 2048 blocks | where terrain ends; reached with level of detail (LOD) |
 | `MAX_HORIZON` | 4096 blocks | `--horizon` upper bound |
 | `MAX_LOD_LEVEL` | 4 | coarsest cell is 16 blocks, coarsest tile 512 blocks |
@@ -156,6 +156,13 @@ S2b needs S1 (camera position) and S2a; S5 needs S2b (same renderer files) and S
 
 ## What must not be built yet
 Caves and cave culling; uniform or palette chunk storage; the two-stage generation pipeline; indirect draws, a shared vertex buffer, Hi-Z, GPU-driven or mesh-shader culling; geomorphing; LOD from saved or edited chunks; a sky gradient, atmospheric scattering or an underground colour; block properties such as "unbreakable" in data; a time-based upload budget.
+
+## S1 as built
+- **`CameraView { view_projection, position }`, but the matrix comes without translation from the caller.** (d) planned `view_projection * translation(position)` in the renderer. A full `f32` view-projection already lost the precision that step is meant to keep: its translation column is rounded at the scale of the position, and the projection's small depth term drowns in it (at a million blocks the far plane moved from 500 to 625 blocks even with the product in `f64`, pinned by a test in `vox-render/src/view.rs`). So `view_projection` is the matrix of the camera placed at the origin (`look_at(ZERO, forward, Y)`); the renderer only subtracts the position from each integer chunk origin in `f64` and rounds once to `f32`. `position` is `[f32; 3]`, the type the game keeps its camera in. Frustum planes and boxes are both camera-relative.
+- **Push constants: 112 bytes for the vertex and fragment stages** as in (d): matrix, origin relative to the camera with the cell size in `w` (1.0, chunk meshes are blocks), fog `vec4`, fog colour (`SKY_COLOR`, the clear value, one constant). The fog `vec4` is start, end, `1 / (end - start)` and 0, all zeros while fog is off: the shader computes `clamp((d - start) * z, 0, 1)` and its smoothstep polynomial, because GLSL `smoothstep(start, end, d)` is undefined for `end <= start`. The vertex shader passes the camera-relative position, the fragment shader takes its length (radial distance, exact per fragment). The shader check accepts push constants in every stage an interface lists.
+- **Fog end `(radius - sqrt 2) * 32` blocks, not "minus one chunk".** A column is loaded when its offset in chunks is within the radius; the camera can be anywhere in its column and a missing column's nearest corner faces it, so missing terrain can be up to `sqrt 2` chunks inside the radius (along a diagonal). A test checks the bound against `area::wanted` for every radius from 2 to 30. The end is at least one chunk (radius 0 and 1). Start = 0.6 of the end; the far plane is the end plus 1 block. Code: `vox-game/src/view_distance.rs`.
+- **Measured** (`docs/benchmarks.md`, "Fog and camera-relative drawing"): the fog shader costs nothing measurable (at most 0.01 ms at radius 12); the closer far plane draws 59 instead of 67 chunks at the default view of radius 8. Radius 16 stands at about 1740 FPS, so **`DEFAULT_VIEW_RADIUS` is 12** (about 2490 FPS standing, 2440 flying); the default column of the budget table (e) was written for radius 8 and is re-checked in S7.
+- **Window check:** screenshots at the start view and from height 200 looking down towards the edge (a temporary camera pose, reverted): at radius 8 from that height everything beyond the fog end is sky, at radius 16 the terrain fades into the sky with no edge, where `main` shows the cut-off slab against the sky.
 
 ## Answers to the open questions
 - The world bounds are -512 and 512 (named parameters, easy to change).

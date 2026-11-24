@@ -58,7 +58,7 @@ pub(crate) const INTERFACE: PipelineInterface = PipelineInterface {
     vertex_stride: VERTEX_STRIDE,
     attributes: &ATTRIBUTES,
     push_constants: PushConstants {
-        stage: Stage::Vertex,
+        stages: &[Stage::Vertex],
         size: PUSH_CONSTANT_SIZE,
     },
     // No descriptor set: the overlay's shaders may declare no resource at all.
@@ -78,6 +78,6 @@ mod tests {
     #[test]
     fn push_constants_are_one_vec2() {
         assert_eq!(PUSH_CONSTANT_SIZE, 8);
-        assert_eq!(INTERFACE.push_constants.stage, Stage::Vertex);
+        assert_eq!(INTERFACE.push_constants.stages, [Stage::Vertex]);
     }
 }

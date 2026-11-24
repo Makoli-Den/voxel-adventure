@@ -411,6 +411,48 @@ is 8 or more out of 255 (Pillow `ImageChops.difference`, then `convert("L")`).
 little in a still frame. NL is kept because it hides the line where one level hands over to
 the next while the camera moves (not measured, the frames are stills).
 
+## Fog and camera-relative drawing (2026-11-24, step S1 of decision 0015)
+
+The chunk fragment shader now fades faces into the sky colour with the radial distance from
+the camera (`smoothstep` from 60 percent of the fog end to the fog end, which lies
+`(radius - 1.41) * 32` blocks away), chunks are placed relative to the camera, and the far
+plane lies 1 block beyond the fog end instead of at 3000 blocks. Command line:
+`vox-game.exe --background --view-radius N` standing still at the start position for 8 s, or
+with `--fly 8` (flies sideways for 8 s, then quits); release build, default window size, RTX
+4070 SUPER. The figures are the run summaries' `gpu` (upper bound, printed to 0.01 ms) and FPS;
+runs alternated, three each.
+
+**The fog shader alone.** The same build with and without a pack that replaces `chunk.frag` by
+the fog-free one of `main` (`--pack DIR`), so culling and the far plane are identical:
+
+| Radius | GPU without fog | GPU with fog | FPS without fog | FPS with fog |
+|---|---|---|---|---|
+| 8 | 0.08, 0.08, 0.08 ms | 0.08, 0.08, 0.08 ms | 3713, 3781, 3801 | 3813, 3721, 3746 |
+| 12 | 0.22, 0.22, 0.22 ms | 0.23, 0.22, 0.23 ms | 2508, 2539, 2530 | 2551, 2543, 2554 |
+| 16 | 0.43, 0.43, 0.43 ms | 0.43, 0.42, 0.43 ms | 1775, 1753, 1736 | 1754, 1762, 1766 |
+
+No measurable cost: at most 0.01 ms at radius 12, the printing resolution (decision 0015 asks
+for at most 0.01 ms at 8 and 5 percent at 16). One `length`, a multiply-add, a clamp, the
+smoothstep polynomial and a `mix` per fragment.
+
+**The whole step against `main`** (the far plane now culls the fully fogged outer ring: at the
+start view, radius 8 draws 59 chunks and 71 k triangles instead of 67 and 80 k):
+
+| Case | GPU before | GPU after | FPS before | FPS after | Worst frame before | Worst frame after |
+|---|---|---|---|---|---|---|
+| radius 8, standing | 0.09, 0.09, 0.09 ms | 0.08, 0.08, 0.08 ms | 3517, 3403, 3581 | 3655, 3597, 3754 | 9.7, 10.0, 10.6 ms | 8.7, 10.2, 9.7 ms |
+| radius 12, standing | 0.22, 0.22, 0.23 ms | 0.22, 0.22, 0.23 ms | 2497, 2491, 2551 | 2497, 2474, 2501 | 9.6, 9.4, 10.1 ms | 9.8, 8.8, 10.0 ms |
+| radius 16, standing | 0.42, 0.42, 0.42 ms | 0.43, 0.43, 0.43 ms | 1763, 1749, 1765 | 1749, 1709, 1757 | 9.5, 15.7, 8.4 ms | 9.5, 9.4, 9.1 ms |
+| radius 8, `--fly 8` | 0.10, 0.10, 0.10 ms | 0.08, 0.08, 0.08 ms | 3395, 3281, 3398 | 3646, 3548, 3584 | 10.0, 9.9, 11.4 ms | 9.4, 9.7, 10.1 ms |
+| radius 12, `--fly 8` | 0.21, 0.21, 0.21 ms | 0.23, 0.23, 0.23 ms | 2181, 2350, 2396 | 2400, 2462, 2466 | 10.1, 10.5, 9.4 ms | 8.6, 9.2, 8.5 ms |
+| radius 16, `--fly 8` | 0.46, 0.45, 0.46 ms | 0.44, 0.44, 0.44 ms | 1635, 1663, 1662 | 1617, 1680, 1674 | 9.2, 9.4, 9.7 ms | 8.1, 10.1, 8.8 ms |
+
+**Default radius.** Decision 0015 sets it to the largest of 8, 12 and 16 that keeps at least
+2000 FPS standing and 1000 FPS flying here: radius 16 stands at about 1740 FPS, radius 12 at
+about 2490 standing and 2440 flying, so `DEFAULT_VIEW_RADIUS` is now 12 (fog from about 203 to
+339 blocks, 441 chunks loaded, filled in about 85 ms). On a slow GPU these figures do not hold;
+step S9 measures one.
+
 ## Lua sandbox: build cost and state size (2026-11-24, step S4 of decision 0014)
 
 `vox-mods` now depends on `mlua` 0.11.6 with Lua 5.4.8 compiled from source (`vendored`). The

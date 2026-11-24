@@ -2,8 +2,11 @@
 
 use std::path::PathBuf;
 
-/// The radius of the streamed circle of chunks when `--view-radius` is not given.
-pub const DEFAULT_VIEW_RADIUS: i32 = 8;
+/// The radius of the streamed circle of chunks when `--view-radius` is not given: the largest
+/// of 8, 12 and 16 that kept at least 2000 FPS standing and 1000 FPS flying (`--fly 8`) on the
+/// development machine with fog (decision 0015 S1, `docs/benchmarks.md`); 16 reached about 1700
+/// standing.
+pub const DEFAULT_VIEW_RADIUS: i32 = 12;
 
 /// The largest accepted `--view-radius`: a circle of about 2800 chunk columns around the camera
 /// (about 3000 kept loaded with the unload margin), enough to measure how the frame time grows

@@ -23,6 +23,7 @@ mod physics;
 mod selection;
 mod startup;
 mod streaming;
+mod view_distance;
 
 use std::env;
 use std::error::Error;
@@ -35,7 +36,8 @@ use std::time::{Duration, Instant};
 use glam::Vec3;
 use vox_content::BlockTextures;
 use vox_render::{
-    RenderError, RenderStats, Renderer, ShaderSources, TextureLayers, create_renderer,
+    CameraView, Fog, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers,
+    create_renderer,
 };
 use vox_world::{ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
@@ -159,6 +161,10 @@ struct App {
     /// Reused for the mesh of every chunk rebuilt after an edit.
     edit_scratch: ChunkMesh,
     camera: Camera,
+    /// The fog, set from the view radius: it ends where the loaded terrain may end.
+    fog: Fog,
+    /// Distance of the camera's far plane in blocks, just beyond the fog end.
+    far_plane: f32,
     /// The player's box. While flying it only follows the camera; while walking it moves the
     /// camera.
     body: Body,
@@ -200,6 +206,7 @@ struct App {
 impl App {
     fn new(options: Options, shaders: ShaderSources, content: Content) -> Self {
         let input_mode = InputMode::new(input_mode::starts_awaiting(&options));
+        let fog = view_distance::fog(options.view_radius);
         Self {
             terrain: Arc::new(Terrain::new(
                 WORLD_SEED,
@@ -218,6 +225,8 @@ impl App {
             world: World::new(),
             edit_scratch: ChunkMesh::default(),
             camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
+            fog,
+            far_plane: view_distance::far_plane(fog),
             body: Body::from_eye(CAMERA_START.to_array()),
             walking: false,
             controls: Controls::default(),
@@ -259,7 +268,8 @@ impl App {
                     )
                 })?;
         }
-        renderer.set_camera(self.camera.view_projection(size.width, size.height));
+        renderer.set_fog(self.fog);
+        renderer.set_camera(&self.camera_view(size.width, size.height));
 
         // No chunk is loaded here: the first frames stream them in, nearest first.
         self.fill = FillReport::new();
@@ -325,11 +335,23 @@ impl App {
             self.body = Body::from_eye(self.camera.position().to_array());
         }
 
-        if let (Some(window), Some(renderer)) = (&self.window, self.renderer.as_mut()) {
-            // The aspect ratio comes from the window. For a frame or so after a resize the
-            // swapchain may still have the old size, which only stretches that one frame.
-            let size = window.inner_size();
-            renderer.set_camera(self.camera.view_projection(size.width, size.height));
+        // The aspect ratio comes from the window. For a frame or so after a resize the
+        // swapchain may still have the old size, which only stretches that one frame.
+        let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else {
+            return;
+        };
+        let view = self.camera_view(size.width, size.height);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_camera(&view);
+        }
+    }
+
+    /// What the renderer needs of the camera for a window of `width` by `height` pixels:
+    /// the matrix around the eye with the far plane just beyond the fog, and the eye.
+    fn camera_view(&self, width: u32, height: u32) -> CameraView {
+        CameraView {
+            view_projection: self.camera.view_projection(width, height, self.far_plane),
+            position: self.camera.position().to_array(),
         }
     }
 
