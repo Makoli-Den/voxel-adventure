@@ -16,6 +16,7 @@ mod pacing;
 mod packs;
 mod physics;
 mod selection;
+mod startup;
 mod streaming;
 
 use std::env;
@@ -31,7 +32,6 @@ use vox_content::BlockTextures;
 use vox_render::{
     RenderError, RenderStats, Renderer, ShaderSources, TextureLayers, create_renderer,
 };
-use vox_resources::PackStack;
 use vox_world::{ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
 use winit::event::{
@@ -665,30 +665,6 @@ fn texture_layers(textures: &BlockTextures) -> TextureLayers<'_> {
     }
 }
 
-/// Stacks the built-in pack and the `--pack` directories and warns about any `--pack` that is
-/// not a directory.
-///
-/// # Errors
-/// A message naming the built-in pack's path if it is missing (the game cannot run without
-/// it).
-fn build_pack_stack(options: &Options) -> Result<PackStack, String> {
-    let built_in = packs::built_in_pack();
-    if !built_in.exists() {
-        return Err(format!(
-            "the built-in resource pack {} is not a directory",
-            packs::describe_root(built_in.root())
-        ));
-    }
-    let (stack, missing) = packs::pack_stack(built_in, &options.packs);
-    for root in missing {
-        eprintln!(
-            "warning: the pack {} is not a directory, so it provides nothing",
-            packs::describe_root(&root)
-        );
-    }
-    Ok(stack)
-}
-
 fn main() -> ExitCode {
     let options = match cli::parse(env::args().skip(1)) {
         Ok(Command::Run(options)) => options,
@@ -703,21 +679,34 @@ fn main() -> ExitCode {
     };
     // Everything is read before the window opens, so a missing shader or a broken blocks file
     // is reported without flashing one.
-    let stack = match build_pack_stack(&options) {
-        Ok(stack) => stack,
-        Err(error) => {
-            eprintln!("error: {error}");
+    let startup = match startup::assemble(
+        &startup::mod_dirs(&options.mods),
+        packs::built_in_pack(),
+        &options.packs,
+    ) {
+        Ok(startup) => startup,
+        Err(errors) => {
+            for error in errors {
+                eprintln!("error: {error}");
+            }
             return ExitCode::FAILURE;
         }
     };
-    let shaders = match packs::load_shaders(&stack) {
+    for root in &startup.missing_packs {
+        eprintln!(
+            "warning: the pack {} is not a directory, so it provides nothing",
+            packs::describe_root(root)
+        );
+    }
+    println!("{}", startup.load_order_line());
+    let shaders = match packs::load_shaders(&startup.stack) {
         Ok(shaders) => shaders,
         Err(error) => {
             eprintln!("error: cannot load the shaders: {error}");
             return ExitCode::FAILURE;
         }
     };
-    let content = match Content::new(&stack) {
+    let content = match Content::new(&startup.stack, &startup.blocks_files) {
         Ok(content) => content,
         Err(error) => {
             eprintln!("error: cannot load the blocks: {error}");

@@ -799,6 +799,8 @@ mod tests {
         let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
+            .join("mods")
+            .join("base")
             .join("assets");
         let mut stack = PackStack::new();
         stack.push(DirPack::new(assets));

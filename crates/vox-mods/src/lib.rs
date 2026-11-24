@@ -2,8 +2,9 @@
 //! running their scripts in a Lua sandbox (decision 0014).
 //!
 //! A mod is a directory `<id>/` with a `mod.json` manifest and an `assets/` pack, whose entry
-//! script runs in a Lua 5.4 state of its own. This crate knows nothing about rendering and is
-//! not used by the game yet.
+//! script runs in a Lua 5.4 state of its own. This crate knows nothing about rendering. The game
+//! calls its manifest and load-order part at startup (`vox-game`, decision 0014 step S3); the
+//! scripts are not run by the game yet.
 //!
 //! - [`manifest`]: [`ModManifest`], [`ModId`], [`ApiVersion`], [`Capability`] and their rules.
 //! - [`discover()`]: finds the mods of a folder.

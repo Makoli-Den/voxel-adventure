@@ -26,7 +26,7 @@ None of the new code knows Vulkan. `vox-render` does not depend on `vox-resource
 - **`DirPack`** is a directory; `ns:a/b.png` is the file `<root>/ns/a/b.png`. A missing file is `Ok(None)`, any other I/O failure is an error.
 - **`PackStack`** is an ordered list of `DirPack`, lowest priority first. `read(&id)` asks the packs from the top down and returns the first hit; `read_to_string` does the same for UTF-8 text; `source_of(&id)` names the pack that served it, for messages. No hit is `ResourceError::NotFound`.
 - **Override semantics: whole file, per resource.** The highest pack that has the file wins; files are never merged. Every resource is resolved on its own, so a pack can replace one texture and leave the rest to lower packs.
-- **Order at startup:** the built-in pack `assets/` (from the source tree, as decision 0003 does for shaders) at the bottom, then every `--pack DIR` in command-line order; a later `--pack` overrides an earlier one.
+- **Order at startup:** *(since decision 0014 step S3 the base game lives in `mods/base/assets/`, and the mods' packs sit between `assets/` and the `--pack` directories.)* The built-in pack `assets/` (from the source tree, as decision 0003 does for shaders) at the bottom, then every `--pack DIR` in command-line order; a later `--pack` overrides an earlier one.
 - **No `Pack` trait and no zip yet.** One kind of pack exists; the trait is extracted when the zip pack (second implementation) arrives. No directory listing either: everything is reached by a known id.
 
 ### (b) Blocks as data

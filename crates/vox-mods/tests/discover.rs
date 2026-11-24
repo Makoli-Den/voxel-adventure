@@ -268,3 +268,49 @@ fn a_bom_in_a_manifest_file_is_accepted() {
     fs::write(folder.join(MANIFEST_FILE), bytes).unwrap();
     assert_eq!(discover(&root).unwrap().len(), 1);
 }
+
+#[test]
+fn a_symlinked_assets_folder_is_reported_and_not_followed() {
+    let root = scratch("discover_link_assets");
+    let outside = scratch("discover_link_assets_outside").join("real");
+    fs::create_dir_all(&outside).unwrap();
+    let folder = root.join("m");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join(MANIFEST_FILE), manifest_text("m")).unwrap();
+    if !make_dir_link(&outside, &folder.join("assets")) {
+        eprintln!("skipped: the OS refused to create a directory link");
+        return;
+    }
+    let errors = discover(&root).unwrap_err();
+    assert!(
+        matches!(&errors[..], [ModError::Symlink { path }] if path.ends_with("assets")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn an_assets_entry_that_is_a_file_is_reported() {
+    let root = scratch("discover_assets_file");
+    let folder = root.join("m");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join(MANIFEST_FILE), manifest_text("m")).unwrap();
+    fs::write(folder.join("assets"), "x").unwrap();
+    let errors = discover(&root).unwrap_err();
+    assert!(
+        matches!(&errors[..], [ModError::NotADirectory { path }] if path.ends_with("assets")),
+        "{errors:?}"
+    );
+    assert!(errors[0].to_string().contains("not a directory"));
+}
+
+#[test]
+fn a_missing_or_real_assets_folder_is_fine() {
+    let root = scratch("discover_assets_ok");
+    for name in ["without", "with"] {
+        let folder = root.join(name);
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join(MANIFEST_FILE), manifest_text(name)).unwrap();
+    }
+    fs::create_dir_all(root.join("with").join("assets")).unwrap();
+    assert_eq!(discover(&root).unwrap().len(), 2);
+}

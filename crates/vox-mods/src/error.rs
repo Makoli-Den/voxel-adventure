@@ -187,6 +187,12 @@ pub enum ModError {
         /// The manifest path.
         path: PathBuf,
     },
+    /// A mod's `assets` entry exists but is not a directory (a file, for example). A missing
+    /// `assets` is fine: a mod may have no resources.
+    NotADirectory {
+        /// The assets path.
+        path: PathBuf,
+    },
     /// A manifest was read but is not valid.
     Manifest {
         /// The manifest file.
@@ -212,6 +218,9 @@ impl fmt::Display for ModError {
             ),
             Self::NotAFile { path } => {
                 write!(f, "{} is not a regular file", path.display())
+            }
+            Self::NotADirectory { path } => {
+                write!(f, "{} is not a directory", path.display())
             }
             Self::Manifest { path, problem } => {
                 write!(f, "{}: {problem}", path.display())
