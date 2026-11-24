@@ -10,17 +10,20 @@ use vox_world::{ChunkMesh, ChunkVertex};
 use super::buffer::Buffer;
 use super::gpu::Gpu;
 use crate::RenderError;
+use crate::face_culling::FaceGroups;
 use crate::interface::chunk::VERTEX_STRIDE;
 
 /// One chunk mesh in a single GPU buffer, ready to draw: the vertices first, then the
-/// `u32` indices from [`Self::index_offset`] on.
+/// `u32` indices from [`Self::index_offset`] on, grouped by face direction as
+/// [`Self::face_groups`] records.
 ///
 /// One buffer instead of two halves the device memory allocations per chunk; Vulkan
 /// guarantees only 4096 of them in total (`maxMemoryAllocationCount`).
 pub struct GpuMesh {
     buffer: Buffer,
     index_offset: vk::DeviceSize,
-    index_count: u32,
+    /// Copied from the mesh at upload; the draws of a frame are ranges of these groups.
+    face_groups: FaceGroups,
 }
 
 impl GpuMesh {
@@ -37,8 +40,17 @@ impl GpuMesh {
                 "an index points past the last vertex",
             ));
         }
-        let index_count = u32::try_from(mesh.indices.len())
-            .map_err(|_| RenderError::InvalidMesh("more than 2^32 indices"))?;
+        // A draw's first index and count are `u32`.
+        if u32::try_from(mesh.indices.len()).is_err() {
+            return Err(RenderError::InvalidMesh("more than 2^32 indices"));
+        }
+        // Every frame draws ranges of these groups, so counts that disagree with the
+        // indices would draw past them. Refused like a bad index rather than drawn whole:
+        // the counts are part of the mesh's contract, and a silent fallback would hide a
+        // broken mesher together with the saving it costs.
+        let face_groups = FaceGroups::from_mesh(mesh).ok_or(RenderError::InvalidMesh(
+            "the quads per face direction do not add up to the indices",
+        ))?;
         let layout = MeshLayout::new(mesh.vertices.len(), mesh.indices.len())
             .ok_or(RenderError::InvalidMesh("the mesh does not fit in memory"))?;
         let usage = vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER;
@@ -47,7 +59,7 @@ impl GpuMesh {
             buffer,
             // Lossless: `usize` is at most 64 bits on every supported target.
             index_offset: layout.index_offset as vk::DeviceSize,
-            index_count,
+            face_groups,
         }))
     }
 
@@ -62,9 +74,10 @@ impl GpuMesh {
         self.index_offset
     }
 
-    /// How many indices to draw.
-    pub fn index_count(&self) -> u32 {
-        self.index_count
+    /// Where the quads of each face direction lie among the indices; together they cover
+    /// all of them, so every range drawn from them lies inside the index data.
+    pub fn face_groups(&self) -> &FaceGroups {
+        &self.face_groups
     }
 
     /// Gives up the mesh, keeping only its buffer, so it can be retired with the others.

@@ -61,15 +61,15 @@ impl Frustum {
             distance >= 0.0 || !distance.is_finite()
         })
     }
+}
 
-    /// Whether any part of a chunk may be visible, by its bounding box (the chunk's cube of
-    /// `CHUNK_SIZE` blocks). `min` is the chunk's origin in the same space as the matrix the
-    /// planes came from: relative to the camera for the renderer's camera-relative matrix.
-    // HOT PATH: runs for every chunk every frame; three additions and the box test.
-    pub(crate) fn may_see_chunk(&self, min: [f32; 3]) -> bool {
-        let size = CHUNK_SIZE as f32;
-        self.may_see_box(min, min.map(|value| value + size))
-    }
+/// The far corner of a chunk's bounding box (its cube of `CHUNK_SIZE` blocks) whose near
+/// corner, the chunk's origin, is `min`, in the same space: relative to the camera in the
+/// renderer, where the box goes to both the frustum test and the per-direction culling.
+// HOT PATH: runs for every chunk every frame; three additions.
+pub(crate) fn chunk_box_max(min: [f32; 3]) -> [f32; 3] {
+    let size = CHUNK_SIZE as f32;
+    min.map(|value| value + size)
 }
 
 #[cfg(test)]

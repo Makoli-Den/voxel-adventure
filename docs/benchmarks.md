@@ -570,3 +570,75 @@ the runs before (lowest runs: 138.9 vs 137.3 us, 1.61 vs 1.58 ms, which is +1.2 
 percent). So the criterion "within noise" is met in the sense that no case shows a difference
 larger than the run-to-run spread, but the data cannot prove a cost below that spread; the
 added work is three instructions per face (six times per chunk), not per quad.
+
+## Per-direction culling (2026-11-24, step S2b of decision 0015)
+
+The renderer draws, of each mesh in view, only the face directions the camera can be in front
+of (one to three ranged draws per mesh instead of one draw of the whole mesh). Before is
+`main` at the end of S1 and S2a (exported with `git archive` and built separately), after is
+this step; release builds, default window size, RTX 4070 SUPER, start position.
+
+**Picture.** One screenshot of each build at the start view (`--background --view-radius N`,
+captured with `PrintWindow` after 4 s), compared pixel by pixel outside the HUD panel (the
+full width below y = 300 and the strip right of x = 615, 356,700 pixels):
+
+| Radius | Pixels that differ |
+|---|---|
+| 8 | 0 |
+| 12 (default) | 0 |
+| 16 | 0 |
+
+Only the HUD numbers differ. One of the first radius-16 shots of the new build showed the
+camera somewhere else (a different view, 216 instead of 224 chunks, its worst frame 22 ms); a
+second shot of the same build, and a repeat of the old one, matched exactly. The terrain in
+that shot was right, seen from another place, so it is not a rendering difference.
+Hypothesis, not confirmed: the `--background` window received the focus once, the game
+entered playing mode on that first focus event, and mouse or keys moved the camera.
+
+**Triangles drawn** at the start view (HUD "Drawn" line, same shots):
+
+| Radius | Chunks | Triangles before | Triangles after | Change |
+|---|---|---|---|---|
+| 8 | 59 | 71,354 | 51,810 | -27.4% |
+| 12 | 132 | 155,918 | 111,650 | -28.4% |
+| 16 | 224 | 261,848 | 186,244 | -28.9% |
+
+Decision 0015 asks for at least 20 percent (expected 25 to 40): met. The camera stands above
+the terrain, so all bottoms and the side faces turned away drop out; tops stay.
+
+**Frame figures.** 8 s per run (`--fly 8` flies sideways for 8 s), the run summary's FPS,
+`work` average and `gpu`, three runs each, before and after alternating. Median, then the
+three runs:
+
+| Case | FPS before | FPS after | Work before | Work after | GPU before | GPU after |
+|---|---|---|---|---|---|---|
+| radius 8, standing | 3559 (3499, 3559, 3635) | 3901 (3908, 3784, 3901) | 0.20 (0.20, 0.20, 0.20) ms | 0.18 (0.17, 0.18, 0.18) ms | 0.08 ms | 0.06 ms |
+| radius 16, standing | 1675 (1719, 1675, 1615) | 2089 (2150, 2054, 2089) | 0.50 (0.49, 0.50, 0.53) ms | 0.39 (0.37, 0.39, 0.39) ms | 0.43 (0.43, 0.43, 0.44) ms | 0.29 ms |
+| radius 8, `--fly 8` | 3555 (3560, 3555, 3485) | 3626 (3626, 3700, 3570) | 0.20 (0.20, 0.21, 0.20) ms | 0.19 (0.19, 0.19, 0.19) ms | 0.08 ms | 0.06 ms |
+| radius 16, `--fly 8` | 1597 (1597, 1630, 1563) | 1980 (1980, 2019, 1941) | 0.53 (0.53, 0.53, 0.50) ms | 0.40 (0.41, 0.40, 0.39) ms | 0.45 ms | 0.30 ms |
+
+FPS is not lower in any case (+2 to +25 percent), and `work` is lower, not higher. The GPU
+time drops by about a third at radius 16 (0.43 to 0.29 ms standing), a little more than the
+triangle count, while radius 8 is near the printing resolution. The lows moved within their
+run-to-run spread (radius 16 flying, 0.1% low: 196 to 222 before, 182 to 220 after).
+
+**CPU cost of the culling itself.** `work` includes `render_frame`'s wait for the GPU, so
+the lighter GPU load hides the CPU side. An ignored timing test measures it apart:
+`cargo test -p vox-render --release -- --ignored per_chunk_cpu_cost --nocapture`
+(`vox-render/src/face_culling.rs`). It runs the renderer's per-chunk path over 197 surface
+chunks (a circle of radius 8, one layer, face groups shaped like terrain: many tops, sides in
+every direction, almost no bottoms) from a camera at the start height looking slightly down;
+69 are in view and get 99 draws. Old path: relative origin, box, frustum test. New path: the
+same plus `visible_ranges` and summing the drawn indices. Fastest of 14 rounds of 20,000
+frames, three runs:
+
+| Path | ns per mesh (3 runs) |
+|---|---|
+| old: frustum test only | 6.07, 6.15, 6.21 |
+| new: frustum test and per-direction ranges | 8.22, 8.22, 8.26 |
+
+About 2.1 ns more per mesh, 0.4 us per frame for 197 meshes, 0.2 percent of the 0.20 ms
+`work` at radius 8: far below the 10 percent the decision allows. Not covered by the test:
+the driver's cost of the extra `vkCmdDrawIndexed` calls (99 draws instead of 69 here, about
+43 percent more). That part is only bounded by the frame figures above (`work` fell); it is
+re-measured on a CPU-bound low-end device in S9.

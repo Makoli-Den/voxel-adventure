@@ -6,6 +6,7 @@
 
 mod chunk_push;
 mod error;
+mod face_culling;
 mod frustum;
 mod interface;
 mod mipmap;
@@ -51,14 +52,18 @@ pub trait Renderer {
     /// Adds or replaces the mesh of the chunk at `pos`. An empty mesh (no indices) removes the entry.
     ///
     /// Every chunk that has a mesh is drawn each frame unless its bounding box lies entirely
-    /// outside the camera's view (frustum culling). Mesh coordinates are chunk-local
+    /// outside the camera's view (frustum culling). Of a drawn mesh only the face directions
+    /// the camera can be in front of are drawn (per-direction culling): the quads must be
+    /// grouped by direction as [`vox_world::ChunkMesh::face_quads`] describes, which the
+    /// greedy mesher does. Mesh coordinates are chunk-local
     /// block units; the renderer places the chunk at `pos.origin()`. A replaced mesh's GPU
     /// memory is freed a few frames later, once no frame in flight can use it, so this
     /// never waits for the GPU.
     ///
     /// # Errors
     /// Returns [`RenderError::InvalidMesh`] if the data is malformed (an index points
-    /// past the last vertex), or another error if the GPU cannot allocate or fill the
+    /// past the last vertex, or `face_quads` does not add up to the indices, six per
+    /// quad), or another error if the GPU cannot allocate or fill the
     /// buffer. The chunk's previous mesh is then kept.
     fn set_chunk_mesh(
         &mut self,
