@@ -6,12 +6,12 @@
 
 // The layout is fixed by the renderer (vox-render's interface/chunk.rs). Everything is relative
 // to the camera, so the numbers stay small far from the world origin. The matrix and the fog
-// are pushed once per frame, the origin once per chunk.
+// are pushed once per frame, the origin and cell size once per mesh.
 layout(push_constant) uniform Draw {
     // The camera's view-projection without its translation: the camera is at (0, 0, 0).
     mat4 view_projection;
-    // xyz: the chunk's corner (0, 0, 0) relative to the camera, in blocks; w: the cell size
-    // in blocks (always 1.0 for now, unused here).
+    // xyz: the corner (0, 0, 0) of the mesh's chunk or tile relative to the camera, in blocks;
+    // w: the cell size in blocks (1.0 for a chunk, 2^level for a level-of-detail tile).
     vec4 chunk_origin;
     // x: fog start, y: fog end (blocks from the camera), z: 1 / (end - start), or 0 when
     // fog is off; w: 0. Used by the fragment shader.
@@ -20,7 +20,8 @@ layout(push_constant) uniform Draw {
     vec4 fog_color;
 } draw;
 
-// xyz: corner position in blocks (0..32), w: face index (order of vox_world::Face::ALL).
+// xyz: corner position in cells (0..32; a cell is a block in a chunk), w: face index (order of
+// vox_world::Face::ALL).
 layout(location = 0) in uvec4 in_pos_face;
 // Layer of the block texture array this face is drawn with.
 layout(location = 1) in uint in_layer;
@@ -33,8 +34,8 @@ layout(location = 2) out float v_shade;
 // The corner relative to the camera in blocks; its length is the distance the fog fades by.
 layout(location = 3) out vec3 v_offset;
 
-// Per face (+X, -X, +Y, -Y, +Z, -Z): brightness, then the two tangent axes the chunk-local
-// position is projected on to get u and v.
+// Per face (+X, -X, +Y, -Y, +Z, -Z): brightness, then the two tangent axes the position in
+// blocks (from the mesh's corner) is projected on to get u and v.
 //
 // The top is brightest, the bottom darkest, and every side differs, so block edges read
 // clearly without lighting.
@@ -49,8 +50,11 @@ layout(location = 3) out vec3 v_offset;
 //   +Z    +x      -y      the viewer's right is +x
 //   -Z    -x      -y      the viewer's right is -x
 // Nothing is mirrored because u x v = -normal for every face (right x down points into the
-// face). Positions are chunk-local and a chunk is a whole number of blocks, so the pattern
-// lines up across chunk borders; negative coordinates are fine with repeat addressing.
+// face). The axes are applied to the position in blocks (cells times the cell size), so a
+// texture repeats once per block at every level of detail: a greedy quad w cells wide on a
+// level-2 tile spans 4 * w blocks and shows 4 * w repeats. Positions are relative to the
+// tile's corner, which lies on a whole block, so the pattern lines up across chunk and tile
+// borders of any level; negative coordinates are fine with repeat addressing.
 // vox-render's shader tests read these tables and check both properties.
 const float FACE_SHADE[6] = float[6](0.80, 0.65, 1.00, 0.50, 0.90, 0.72);
 const vec3 FACE_U[6] = vec3[6](
@@ -71,7 +75,8 @@ const vec3 FACE_V[6] = vec3[6](
 );
 
 void main() {
-    vec3 local = vec3(in_pos_face.xyz);
+    // The corner in blocks from the mesh's origin; exact (small integers times a power of two).
+    vec3 local = vec3(in_pos_face.xyz) * draw.chunk_origin.w;
     uint face = in_pos_face.w;
     vec3 offset = local + draw.chunk_origin.xyz;
     gl_Position = draw.view_projection * vec4(offset, 1.0);

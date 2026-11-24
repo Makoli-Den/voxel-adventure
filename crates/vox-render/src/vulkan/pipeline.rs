@@ -7,9 +7,9 @@ use super::context::Context;
 use super::gpu::Gpu;
 use super::interface;
 use super::render_pass::RenderPass;
-use crate::RenderError;
 use crate::interface::{PipelineInterface, chunk, overlay};
 use crate::shader::{self, ShaderSource, ShaderSources};
+use crate::{DepthMode, RenderError};
 
 /// Entry point name of every shader stage; GLSL always calls it `main`.
 const ENTRY_POINT: &std::ffi::CStr = c"main";
@@ -44,13 +44,15 @@ struct Spec<'a> {
 
 impl Pipeline {
     /// Compiles the chunk shaders of `shaders` and builds the opaque, depth-tested chunk
-    /// pipeline for `render_pass`. `texture_set_layout` must be the layout built from
-    /// `chunk::INTERFACE` (see `texture::BlockTextureSet`); it becomes set 0.
+    /// pipeline for `render_pass`, testing depth the way `depth_mode` maps it.
+    /// `texture_set_layout` must be the layout built from `chunk::INTERFACE` (see
+    /// `texture::BlockTextureSet`); it becomes set 0.
     pub fn chunk(
         device: &ash::Device,
         render_pass: &RenderPass,
         shaders: &ShaderSources,
         texture_set_layout: vk::DescriptorSetLayout,
+        depth_mode: DepthMode,
     ) -> Result<Self, RenderError> {
         let spec = Spec {
             vertex: &shaders.chunk_vertex,
@@ -58,7 +60,7 @@ impl Pipeline {
             interface: &chunk::INTERFACE,
             set_layouts: &[texture_set_layout],
             cull_mode: vk::CullModeFlags::BACK,
-            depth: depth_tested(),
+            depth: depth_tested(depth_mode),
             blend: opaque(),
         };
         Self::new(device, render_pass, &spec)
@@ -255,12 +257,22 @@ fn rasterization_state(
         .line_width(1.0)
 }
 
-/// Nearer fragments win: test with LESS against a buffer cleared to 1.0, and write.
-fn depth_tested() -> vk::PipelineDepthStencilStateCreateInfo<'static> {
+/// Nearer fragments win, and write their depth: LESS against a buffer cleared to 1 with
+/// standard depth, GREATER against a buffer cleared to 0 with reversed depth
+/// (`DepthMode::far_depth`). A fragment at exactly the stored depth loses in both modes.
+fn depth_tested(mode: DepthMode) -> vk::PipelineDepthStencilStateCreateInfo<'static> {
     vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
         .depth_write_enable(true)
-        .depth_compare_op(vk::CompareOp::LESS)
+        .depth_compare_op(nearer(mode))
+}
+
+/// The compare op that passes a fragment nearer than the stored depth under `mode`.
+fn nearer(mode: DepthMode) -> vk::CompareOp {
+    match mode {
+        DepthMode::Standard => vk::CompareOp::LESS,
+        DepthMode::Reversed => vk::CompareOp::GREATER,
+    }
 }
 
 /// Drawn over everything: no depth test and no depth write. The render pass still has a
@@ -415,6 +427,22 @@ mod tests {
         assert_eq!(depth.depth_test_enable, vk::FALSE);
         assert_eq!(depth.depth_write_enable, vk::FALSE);
         assert_eq!(depth.stencil_test_enable, vk::FALSE);
-        assert_eq!(depth_tested().depth_test_enable, vk::TRUE);
+        assert_eq!(
+            depth_tested(DepthMode::Standard).depth_test_enable,
+            vk::TRUE
+        );
+    }
+
+    #[test]
+    fn chunks_test_depth_towards_the_near_plane_of_each_mode() {
+        let standard = depth_tested(DepthMode::Standard);
+        assert_eq!(standard.depth_compare_op, vk::CompareOp::LESS);
+        assert_eq!(standard.depth_write_enable, vk::TRUE);
+        let reversed = depth_tested(DepthMode::Reversed);
+        assert_eq!(reversed.depth_compare_op, vk::CompareOp::GREATER);
+        assert_eq!(reversed.depth_write_enable, vk::TRUE);
+        // The clear value is the far plane, which every nearer fragment passes against.
+        assert!(0.5 < DepthMode::Standard.far_depth());
+        assert!(0.5 > DepthMode::Reversed.far_depth());
     }
 }

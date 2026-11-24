@@ -390,8 +390,8 @@ pub fn lines(
             lines.push(line(
                 "Drawn",
                 format!(
-                    "{} chunks, {} triangles",
-                    stats.chunks_drawn, stats.triangles
+                    "{} meshes, {} triangles",
+                    stats.meshes_drawn, stats.triangles
                 ),
             ));
         }
@@ -655,12 +655,12 @@ mod tests {
     #[test]
     fn the_drawn_counts_come_from_the_render_stats() {
         let stats = RenderStats {
-            chunks_drawn: 289,
+            meshes_drawn: 289,
             triangles: 1_014_652,
             ..RenderStats::default()
         };
         let text = lines(Some(&summary()), &stats, &StreamStats::default(), false).join("\n");
-        assert!(text.contains("289 chunks, 1014652 triangles"), "{text}");
+        assert!(text.contains("289 meshes, 1014652 triangles"), "{text}");
     }
 
     #[test]

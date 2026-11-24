@@ -1,9 +1,10 @@
-//! Per-direction culling (decision 0015, (c)): which parts of a chunk mesh can face the
-//! camera.
+//! Per-direction culling (decision 0015, (c)): which parts of a chunk or tile mesh can face
+//! the camera.
 //!
 //! The mesher groups the quads of a mesh by face direction in [`Face::ALL`] order, so each
 //! direction is one contiguous range of the index buffer ([`ChunkMesh::face_index_range`]). A
-//! face looking along `+X` lies on a plane `x = p` inside the chunk's box, and the camera
+//! face looking along `+X` lies on a plane `x = p` inside the mesh's box
+//! (`crate::tile_box`), and the camera
 //! sees its front only from `x > p`. When the whole box lies on the far side
 //! (`camera.x < box.min.x`) none of the `+X` faces can be front-facing, the rasterizer would
 //! discard every one of them as a back face, and the range need not be drawn. The test
@@ -12,10 +13,10 @@
 //! The test is conservative so the picture can never change: a camera exactly on a face
 //! plane counts as in front of it, and a box that is not a number (a broken camera) draws
 //! everything. The box is built from the same rounded camera-relative origin the vertex
-//! shader adds the chunk-local positions to, and rounding to nearest keeps order, so a plane
-//! the test puts beyond the camera is beyond it on the GPU too. It assumes what the built-in
-//! chunk shader does: vertices stay inside the
-//! chunk's box and every quad faces the direction of its group. A shader pack that moves
+//! shader adds the scaled mesh positions to, in the same operations, and rounding to nearest
+//! keeps order, so a plane the test puts beyond the camera is beyond it on the GPU too. It
+//! assumes what the built-in chunk shader does: vertices stay inside the mesh's box and every
+//! quad faces the direction of its group. A shader pack that moves
 //! vertices out of the box or turns faces would break that contract.
 //!
 //! Pure logic with no graphics API, so it is unit tested; the renderer turns the ranges
@@ -443,10 +444,11 @@ mod timing {
     use std::time::{Duration, Instant};
 
     use glam::Vec3;
-    use vox_world::ChunkPos;
+    use vox_world::{ChunkPos, TilePos};
 
     use super::*;
-    use crate::frustum::{Frustum, chunk_box_max};
+    use crate::frustum::Frustum;
+    use crate::tile_box::{FULL_HEIGHT, tile_box};
     use crate::view::CameraView;
 
     /// View radius in chunks of the measured set: about 200 columns, the default view of
@@ -525,13 +527,19 @@ mod timing {
         let camera = camera();
         let frustum = Frustum::from_view_projection(&camera.view_projection);
         let meshes = meshes();
-        let origin = |pos: ChunkPos| camera.relative(pos.origin());
+        let chunk_box = |pos: ChunkPos| {
+            tile_box(
+                camera.relative(pos.origin()),
+                TilePos::chunk(pos),
+                FULL_HEIGHT,
+            )
+        };
         // Before S2b: one frustum test per mesh, one draw of the whole mesh.
         let old = || {
             let mut drawn = 0;
             for (pos, _) in black_box(&meshes) {
-                let min = origin(*pos);
-                if frustum.may_see_box(min, chunk_box_max(min)) {
+                let (min, max) = chunk_box(*pos);
+                if frustum.may_see_box(min, max) {
                     drawn += 1;
                 }
             }
@@ -542,8 +550,7 @@ mod timing {
         let new = || {
             let mut indices = 0u64;
             for (pos, groups) in black_box(&meshes) {
-                let min = origin(*pos);
-                let max = chunk_box_max(min);
+                let (min, max) = chunk_box(*pos);
                 if !frustum.may_see_box(min, max) {
                     continue;
                 }
@@ -556,8 +563,7 @@ mod timing {
         let in_view = old();
         let mut draws = 0;
         for (pos, groups) in &meshes {
-            let min = origin(*pos);
-            let max = chunk_box_max(min);
+            let (min, max) = chunk_box(*pos);
             if frustum.may_see_box(min, max) {
                 draws += visible_ranges(min, max, groups).as_slice().len();
             }

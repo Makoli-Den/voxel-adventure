@@ -6,7 +6,7 @@
 //!
 //! | byte | content                 | attribute                              |
 //! |------|-------------------------|----------------------------------------|
-//! | 0..3 | position x, y, z (`u8`) | location 0, 4 x `u8`, `uvec4` as `xyz` |
+//! | 0..3 | position x, y, z (`u8`) in cells | location 0, 4 x `u8`, `uvec4` as `xyz` |
 //! | 3    | face index (`u8`)       | location 0, 4 x `u8`, `uvec4` as `w`   |
 //! | 4..6 | texture layer (`u16`)   | location 1, 1 x `u16`, `uint`          |
 //!
@@ -16,9 +16,12 @@
 //!
 //! The texture layer is the layer of the block texture array the face is drawn with; the
 //! mesher looks it up per quad from the block and the face, so the block id itself does not
-//! reach the shaders. No texture coordinates are stored: corners are whole blocks, so the
-//! built-in vertex shader derives them from the position (the table next to `FACE_SHADE` in
-//! `chunk.vert`).
+//! reach the shaders. No texture coordinates are stored: corners are whole cells, so the
+//! built-in vertex shader derives them from the position (see "Texture coordinates" below).
+//!
+//! Positions count **cells** of the mesh's tile, `0..=32` per axis. A cell is one block in a
+//! chunk (level 0) and `2^level` blocks in a level-of-detail tile (decision 0015); the cell
+//! size reaches the vertex shader in the origin's `w` (see the push constants).
 //!
 //! # Shader contract
 //! Positions reach the shaders **relative to the camera** (decision 0015): the renderer
@@ -26,10 +29,12 @@
 //! without the camera's translation, so the numbers the GPU sees stay small and `f32`
 //! keeps sub-block precision however far the camera is from the world origin.
 //!
-//! The renderer skips chunks whose box (the chunk's 32-block cube at its origin) lies outside
-//! the view, so a vertex shader must place every vertex inside that box:
-//! `chunk_origin + position` with no displacement. A shader pack that moves vertices
-//! (waves, wind) must keep them within the box, or chunks will disappear at the screen edges.
+//! The renderer skips meshes whose box lies outside the view. The box spans the whole tile on
+//! X and Z (32 cells) and on Y the mesh's lowest to highest vertex (`crate::tile_box`), so a
+//! vertex shader must place every vertex where the renderer expects it:
+//! `chunk_origin.xyz + position * chunk_origin.w` with no displacement. A shader pack that
+//! moves vertices (waves, wind) must keep them within that box, or meshes will disappear at
+//! the screen edges.
 //!
 //! The renderer also skips, per mesh, the face directions the camera cannot be in front of
 //! (per-direction culling, `crate::face_culling`): it assumes every triangle faces the
@@ -45,15 +50,16 @@
 //! | byte    | content                                                         | GLSL   |
 //! |---------|-----------------------------------------------------------------|--------|
 //! | 0..64   | the camera's view-projection without its translation, column-major | `mat4` |
-//! | 64..80  | the chunk's origin relative to the camera in `xyz`; `w` the cell size | `vec4` |
+//! | 64..80  | the tile's origin relative to the camera in `xyz`; `w` the cell size | `vec4` |
 //! | 80..96  | fog: `x` start, `y` end (blocks from the camera), `z` `1 / (end - start)`, `w` 0 | `vec4` |
 //! | 96..112 | fog colour, `rgb` the sky colour the frame is cleared to, `a` 1  | `vec4` |
 //!
-//! The matrix and the fog are pushed once per frame, the origin once per chunk drawn.
+//! The matrix and the fog are pushed once per frame, the origin once per mesh drawn.
 //!
-//! - **Cell size:** the edge of one mesh cell in blocks; always 1.0 today (chunk meshes are
-//!   made of blocks). The built-in shaders ignore it; coarser level-of-detail tiles will use
-//!   it (decision 0015, S5).
+//! - **Origin:** the lowest corner of the mesh's chunk or tile, `TilePos::origin()`, minus the
+//!   camera position, in blocks.
+//! - **Cell size:** the edge of one mesh cell in blocks: 1.0 for a chunk, `2^level` for a
+//!   level-of-detail tile (exact in `f32`). A vertex lies at `origin + position * cell size`.
 //! - **Fog:** the fraction of a fragment's colour replaced by the fog colour is
 //!   `smoothstep(start, end, distance)`, with `distance` the straight-line (radial) distance
 //!   from the camera, so the fog does not change when the camera turns. `z` saves the
@@ -62,6 +68,22 @@
 //!   `smoothstep(x, y, ...)` directly, it is undefined while fog is off.
 //! - **Fog colour:** equal to the clear colour, so a fully fogged face cannot be told from
 //!   the sky and the end of the loaded terrain is invisible.
+//!
+//! # Texture coordinates
+//! The built-in `chunk.vert` derives them from the position **in blocks**, so a texture
+//! repeats once per block at every level of detail:
+//!
+//! ```glsl
+//! vec3 local = vec3(in_pos_face.xyz) * draw.chunk_origin.w;   // cells to blocks
+//! v_uv = vec2(dot(local, FACE_U[face]), dot(local, FACE_V[face]));
+//! ```
+//!
+//! `FACE_U` and `FACE_V` are unit axes per face. A greedy quad `w` cells wide on a tile of
+//! level `k` spans `w * 2^k` blocks and the same number of texture repeats; its corners land
+//! on whole numbers, as do tile origins, so the pattern lines up with full-detail chunks and
+//! tiles of other levels (repeat addressing). The mip level comes from the screen derivatives
+//! of `v_uv` as before, so a far tile samples the same small levels a far chunk would. Both
+//! lines are pinned by a test in `shader/mod.rs`, which also checks a level-2 quad.
 //!
 //! A `mat4` followed by `vec4`s has these offsets under the std430 rules push constants
 //! use, so a shader can declare the block as written in the table.

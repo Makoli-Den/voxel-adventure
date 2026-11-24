@@ -7,6 +7,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 
 use glam::Vec3;
 use glam::camera::rh::{proj::vulkan, view};
+use vox_render::DepthMode;
 use vox_world::{CHUNK_SIZE, WORLD_CEILING_Y, WORLD_FLOOR_Y};
 
 /// Vertical field of view of the projection, in degrees.
@@ -136,13 +137,26 @@ impl Camera {
     /// renderer's `CameraView` asks. Keeping the position out keeps the matrix exact however
     /// far the camera is from the world origin.
     ///
-    /// Vulkan clip space: Y points down and depth runs from 0 to 1. `far` must lie beyond the
+    /// Vulkan clip space: Y points down and depth runs from 0 to 1, the near plane at 0 and the
+    /// far plane at 1 for [`DepthMode::Standard`], the other way round for
+    /// [`DepthMode::Reversed`] (the renderer says which it uses). `far` must lie beyond the
     /// near plane ([`NEAR`]).
-    pub fn view_projection(&self, width: u32, height: u32, far: f32) -> [[f32; 4]; 4] {
+    pub fn view_projection(
+        &self,
+        width: u32,
+        height: u32,
+        far: f32,
+        depth: DepthMode,
+    ) -> [[f32; 4]; 4] {
         // A zero side only happens while minimized, when nothing is drawn anyway.
         let aspect = width.max(1) as f32 / height.max(1) as f32;
-        // glam's Vulkan projection already flips Y and maps depth to 0..1.
-        let projection = vulkan::perspective(FIELD_OF_VIEW_DEGREES.to_radians(), aspect, NEAR, far);
+        let fov = FIELD_OF_VIEW_DEGREES.to_radians();
+        // glam's Vulkan projection already flips Y and maps depth to 0..1, the first distance
+        // to 0 and the second to 1: swapping them gives reversed depth.
+        let projection = match depth {
+            DepthMode::Standard => vulkan::perspective(fov, aspect, NEAR, far),
+            DepthMode::Reversed => vulkan::perspective(fov, aspect, far, NEAR),
+        };
         let view = view::look_at_mat4(Vec3::ZERO, self.forward(), Vec3::Y);
         (projection * view).to_cols_array_2d()
     }
@@ -179,7 +193,12 @@ mod tests {
     /// Normalized device coordinates of a world point seen through `camera`: the matrix
     /// takes the offset from the eye.
     fn ndc(camera: &Camera, point: Vec3) -> Vec3 {
-        let matrix = Mat4::from_cols_array_2d(&camera.view_projection(800, 600, FAR));
+        ndc_in(camera, point, DepthMode::Standard)
+    }
+
+    /// [`ndc`] with the depth mapping `depth`.
+    fn ndc_in(camera: &Camera, point: Vec3, depth: DepthMode) -> Vec3 {
+        let matrix = Mat4::from_cols_array_2d(&camera.view_projection(800, 600, FAR, depth));
         let clip = matrix * (point - camera.position).extend(1.0);
         clip.truncate() / clip.w
     }
@@ -250,7 +269,7 @@ mod tests {
         assert!(close(camera.position, Vec3::new(1.0, 2.0, 3.0)));
         assert!(
             camera
-                .view_projection(800, 600, FAR)
+                .view_projection(800, 600, FAR, DepthMode::Reversed)
                 .iter()
                 .flatten()
                 .all(|v| v.is_finite())
@@ -351,8 +370,8 @@ mod tests {
         let near_origin = Camera::new(Vec3::ZERO, 0.3, -0.2);
         let far_away = Camera::new(Vec3::new(1_000_000.0, 60.0, -1_000_000.0), 0.3, -0.2);
         assert_eq!(
-            near_origin.view_projection(800, 600, FAR),
-            far_away.view_projection(800, 600, FAR)
+            near_origin.view_projection(800, 600, FAR, DepthMode::Reversed),
+            far_away.view_projection(800, 600, FAR, DepthMode::Reversed)
         );
     }
 
@@ -361,6 +380,36 @@ mod tests {
         let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
         assert!(ndc(&camera, Vec3::new(0.0, 0.0, -FAR * 0.9)).z < 1.0);
         assert!(ndc(&camera, Vec3::new(0.0, 0.0, -FAR * 1.1)).z > 1.0);
+    }
+
+    #[test]
+    fn reversed_depth_puts_the_near_plane_at_one_and_the_far_plane_at_zero() {
+        let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
+        let depth =
+            |distance: f32| ndc_in(&camera, Vec3::new(0.0, 0.0, -distance), DepthMode::Reversed).z;
+        assert!((depth(NEAR) - 1.0).abs() < 1e-6);
+        assert!(depth(FAR).abs() < 1e-6);
+        assert!(depth(10.0) > depth(20.0), "nearer is greater");
+        assert!(depth(FAR * 1.1) < 0.0, "beyond the far plane");
+        assert!(depth(NEAR * 0.5) > 1.0, "before the near plane");
+    }
+
+    #[test]
+    fn the_d24_horizon_cap_keeps_the_depth_step_under_a_block_with_the_real_near_plane() {
+        // Standard depth in a 24-bit buffer: the step at distance d is d^2 * 2^-24 / near
+        // (decision 0015, "Depth precision"). The cap is only valid with this camera's NEAR.
+        let distance = f64::from(vox_render::D24_MAX_HORIZON);
+        let step = distance * distance * 2.0_f64.powi(-24) / f64::from(NEAR);
+        assert!(step < 1.0, "depth step {step} blocks at the cap");
+    }
+
+    #[test]
+    fn both_depth_modes_put_a_point_at_the_same_place_on_screen() {
+        let camera = Camera::new(Vec3::ZERO, 0.4, -0.3);
+        let point = Vec3::new(5.0, -3.0, -40.0);
+        let standard = ndc_in(&camera, point, DepthMode::Standard);
+        let reversed = ndc_in(&camera, point, DepthMode::Reversed);
+        assert!((standard.truncate() - reversed.truncate()).length() < 1e-6);
     }
 
     #[test]
@@ -394,7 +443,9 @@ mod tests {
     #[test]
     fn zero_sized_window_still_gives_a_finite_matrix() {
         let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
-        let matrix = camera.view_projection(0, 0, FAR);
-        assert!(matrix.iter().flatten().all(|v| v.is_finite()));
+        for depth in [DepthMode::Standard, DepthMode::Reversed] {
+            let matrix = camera.view_projection(0, 0, FAR, depth);
+            assert!(matrix.iter().flatten().all(|v| v.is_finite()));
+        }
     }
 }

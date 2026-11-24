@@ -182,7 +182,7 @@ fn missing(spans: &ColumnSpans, pos: ChunkPos) -> Missing {
 /// below the span and air above it, as in a column job, and in a column that is not loaded the
 /// neighbour is generated. For a chunk nobody has edited the result therefore equals
 /// [`build_column`]'s mesh. An empty `scratch` afterwards means nothing is visible, which
-/// `Renderer::set_chunk_mesh` takes as a removal.
+/// `Renderer::set_tile_mesh` takes as a removal.
 pub fn remesh(
     terrain: &Terrain,
     world: &World,
