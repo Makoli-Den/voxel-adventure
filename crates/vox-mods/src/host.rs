@@ -22,7 +22,7 @@ use crate::error::ModFailure;
 use crate::manifest::{Capability, ModId};
 use crate::sandbox::{CallLimits, LogEntry, Sandbox};
 use crate::world_handle::{
-    BlockEdit, BlockEvent, CallRecord, WorldAccess, event_table, world_handle,
+    BlockEdit, BlockEvent, CallRecord, MAX_EDITS_PER_EVENT, WorldAccess, event_table, world_handle,
 };
 
 /// Largest entry script that is read, 1 MiB. Real event scripts are a few KiB; the cap keeps a
@@ -154,7 +154,9 @@ impl ModHost {
 
     /// Sends `event` to the handler of every running mod that has one, in load order, and
     /// returns the block writes they queued, in load order and in each mod's own order, so
-    /// applying them one after the other lets a later mod win on the same cell.
+    /// applying them one after the other lets a later mod win on the same cell. At most
+    /// [`MAX_EDITS_PER_EVENT`] are returned; the rest are dropped without disabling their mod,
+    /// and a log line of that mod says how many.
     ///
     /// Every handler reads the same `world`, the state right after the player's edit: writes
     /// are only queued, never applied here. A mod that fails (a Lua error, a spent budget, a
@@ -190,7 +192,19 @@ impl ModHost {
             };
             collect_log(&running.id, &running.sandbox, &mut self.messages);
             match result {
-                Ok(queued) => {
+                Ok(mut queued) => {
+                    let room = MAX_EDITS_PER_EVENT - edits.len();
+                    if queued.len() > room {
+                        let dropped = queued.len() - room;
+                        queued.truncate(room);
+                        self.messages.push(ModMessage {
+                            id: self.mods[index].id.clone(),
+                            kind: MessageKind::Log(format!(
+                                "{dropped} block writes dropped: an event applies at most \
+                                 {MAX_EDITS_PER_EVENT} writes of all mods together"
+                            )),
+                        });
+                    }
                     edits.extend(queued);
                     index += 1;
                 }
@@ -342,6 +356,7 @@ mod tests {
 
     use crate::budget::{MAX_INSTRUCTIONS_AT_LOAD, MAX_INSTRUCTIONS_PER_CALL};
     use crate::discover::discover;
+    use crate::error::MAX_FAILURE_MESSAGE_BYTES;
     use crate::sandbox::MAX_LOG_LINES_PER_CALL;
     use crate::world_handle::MAX_EDITS_PER_CALL;
     use std::path::PathBuf;
@@ -1151,32 +1166,152 @@ mod tests {
 
     #[test]
     fn world_functions_are_charged() {
-        // A loop iteration is about six Lua instructions (`SELF`, three loads, `CALL`,
-        // `FORLOOP`), so these calls alone fit the budget; with the charge of each call (one per
-        // argument and result plus the lookup) they do not.
-        let calls = MAX_INSTRUCTIONS_PER_CALL / 10;
+        // A loop iteration is about six or seven Lua instructions (`SELF`, the loads, `CALL`,
+        // `FORLOOP`), so these loops alone fit the budget (at most 7/13 of it); with the charge
+        // of each call (one per argument, the lookup, one per result: 9) they do not. Without
+        // the charge, or without `WORLD_LOOKUP_INSTRUCTIONS` (4), they fit again.
+        const CALLS: u64 = MAX_INSTRUCTIONS_PER_CALL / 13;
         let temp = TempMod::new("charged");
+        let looping = |call: &str| {
+            format!(
+                r#"vox.on("block_broken", function(event, world)
+                     for i = 1, {CALLS} do {call} end
+                   end)"#
+            )
+        };
         scripted(
             &temp,
-            "busy",
+            "reads",
             &["world.read"],
-            &format!(
-                r#"vox.on("block_broken", function(event, world)
-                     for i = 1, {calls} do world:get_block(0, 0, 0) end
-                   end)"#
-            ),
+            &looping("world:get_block(0, 0, 0)"),
         );
-        let mut host = start(&temp, &["busy"]);
+        scripted(
+            &temp,
+            "writes",
+            &["world.write"],
+            &looping(r#"world:set_block(0, 1000, 0, "test:gold")"#),
+        );
+        for id in ["reads", "writes"] {
+            let mut host = start(&temp, &[id]);
+            let edits = fire_at_origin(&mut host, &registry());
+            assert!(edits.is_empty());
+            assert_eq!(
+                host.take_messages(),
+                vec![disabled(
+                    id,
+                    ModFailure::InstructionBudget {
+                        limit: MAX_INSTRUCTIONS_PER_CALL
+                    }
+                )],
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spent_budget_wins_over_a_recorded_mistake() {
+        let temp = TempMod::new("spent");
+        scripted(
+            &temp,
+            "both",
+            READ_WRITE,
+            r#"vox.on("block_broken", function(event, world)
+                 pcall(world.set_block, world, 0, 0, 0, "x:nope")
+                 while true do end
+               end)"#,
+        );
+        let mut host = start(&temp, &["both"]);
         fire_at_origin(&mut host, &registry());
         assert_eq!(
             host.take_messages(),
             vec![disabled(
-                "busy",
+                "both",
                 ModFailure::InstructionBudget {
                     limit: MAX_INSTRUCTIONS_PER_CALL
                 }
             )]
         );
+    }
+
+    #[test]
+    fn an_unknown_block_name_is_clean_and_cut() {
+        let temp = TempMod::new("names");
+        let names = [
+            ("zero_byte", r#""x:\0y""#),
+            ("escape_code", r#""x:\27[31mred""#),
+            ("huge", r#"string.rep(string.rep("a", 1000), 1000)"#),
+        ];
+        for (id, name) in names {
+            scripted(
+                &temp,
+                id,
+                READ_WRITE,
+                &format!(
+                    r#"vox.on("block_broken", function(event, world)
+                         world:set_block(0, 0, 0, {name})
+                       end)"#
+                ),
+            );
+        }
+        for (id, _) in names {
+            let mut host = start(&temp, &[id]);
+            fire_at_origin(&mut host, &registry());
+            let messages = host.take_messages();
+            let [
+                ModMessage {
+                    kind: MessageKind::Disabled(failure @ ModFailure::UnknownBlock { name }),
+                    ..
+                },
+            ] = messages.as_slice()
+            else {
+                panic!("{id}: {messages:?}");
+            };
+            assert!(name.len() <= MAX_FAILURE_MESSAGE_BYTES, "{id}");
+            for text in [name.as_str(), &failure.to_string()] {
+                assert!(!text.chars().any(char::is_control), "{id}: {text:?}");
+            }
+            if id == "huge" {
+                assert_eq!(name.len(), MAX_FAILURE_MESSAGE_BYTES);
+            }
+        }
+    }
+
+    #[test]
+    fn writes_past_the_event_total_are_dropped_not_fatal() {
+        let temp = TempMod::new("total");
+        let writer = |count: usize| {
+            format!(
+                r#"vox.on("block_broken", function(event, world)
+                     for i = 1, {count} do world:set_block(i % 16, 0, 0, "test:gold") end
+                   end)"#
+            )
+        };
+        // Four mods fill the total except for four writes, the fifth wants ten.
+        let counts = [
+            MAX_EDITS_PER_CALL,
+            MAX_EDITS_PER_CALL,
+            MAX_EDITS_PER_CALL,
+            MAX_EDITS_PER_CALL - 4,
+            10,
+        ];
+        assert_eq!(counts.iter().sum::<usize>() - 10 + 4, MAX_EDITS_PER_EVENT);
+        let ids = ["w1", "w2", "w3", "w4", "w5"];
+        for (id, count) in ids.iter().zip(counts) {
+            scripted(&temp, id, READ_WRITE, &writer(count));
+        }
+        let mut host = start(&temp, &ids);
+        let edits = fire_at_origin(&mut host, &registry());
+        assert_eq!(edits.len(), MAX_EDITS_PER_EVENT);
+        let messages = host.take_messages();
+        let [dropped] = messages.as_slice() else {
+            panic!("{messages:?}");
+        };
+        assert_eq!(dropped.id, id("w5"));
+        assert!(
+            matches!(&dropped.kind, MessageKind::Log(line) if line.starts_with("6 block writes dropped")),
+            "{dropped:?}"
+        );
+        assert!(host.is_enabled(&id("w5")), "dropping disables nothing");
     }
 
     #[test]

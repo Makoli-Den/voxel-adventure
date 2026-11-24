@@ -42,4 +42,4 @@ pub use manifest::{
 };
 pub use resolve::resolve;
 pub use sandbox::{MAX_LOG_LINE_BYTES, MAX_LOG_LINES_PER_CALL, MAX_MOD_MEMORY};
-pub use world_handle::{BlockEdit, BlockEvent, MAX_EDITS_PER_CALL};
+pub use world_handle::{BlockEdit, BlockEvent, MAX_EDITS_PER_CALL, MAX_EDITS_PER_EVENT};

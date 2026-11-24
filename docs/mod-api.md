@@ -58,14 +58,23 @@ A handler is called as `handler(event, world)`.
 `event` is a fresh table per mod: `{ x = 10, y = 4, z = -3, block = "base:stone" }`, the world
 block position of the cell and a block name. Changing it does not change what other mods see.
 
-- Handlers run **after** the player's edit and cannot cancel it.
+- Handlers run **after** the player's edit and cannot cancel it. A `block_broken` handler can
+  write the old block back (`world:set_block(e.x, e.y, e.z, e.block)`): that does not cancel
+  the event, it writes the cell again, and the other mods still saw the break.
 - Every mod with a handler for the event is called, in load order (dependencies first).
 - All of them see **the same world**: the state right after the player's edit. Writes are
   queued, not applied, so a mod does not see the writes of the mods before it.
 - When all mods have returned, the queued writes are applied in load order, each mod's in the
   order it made them, so **a later mod wins** on the same cell.
 - Writes by mods **raise no events**, so mods never call each other through the world.
+- At most 256 writes of all mods together are applied per event; the rest are dropped (the mod
+  keeps running) and the console says how many.
 - Every chunk the edit and the writes changed is rebuilt once.
+- **Seams at the edge of the loaded area:** a write in a chunk at the edge of the loaded world
+  is applied and remeshed with what is loaded; the neighbour that is not loaded yet is built
+  later without knowing the write, so a seam can show along that border (a known seam of
+  decision 0011, shared with the player's own edits). Keep writes away from the edge of the
+  loaded area when that matters.
 
 ## The world handle
 
@@ -92,7 +101,9 @@ These mistakes **disable the mod even if `pcall` catches the error**; from the m
 both world functions refuse every call, and none of the mod's writes of that call is applied:
 - calling a function whose capability `mod.json` does not declare;
 - a block name the game does not know (`set_block`);
-- more than 64 queued writes in one call (writes to chunks that are not loaded do not count).
+- more than 64 queued writes in one call of one mod (writes to chunks that are not loaded do
+  not count). The limit is per mod; the total over all mods is capped separately, see
+  [Events](#events).
 
 ## Capabilities
 
@@ -140,12 +151,13 @@ another error), and then keeps running, still held at its memory cap.
 | Limit | Value (provisional) |
 |---|---|
 | Lua instructions per event | 200,000 |
-| Block writes per event | 64 |
+| Block writes per mod per event | 64 |
+| Block writes per event, all mods (excess dropped) | 256 |
 | Lua instructions at startup | 10,000,000 |
 | Time per event | 50 ms |
 | Time at startup | 2 s |
 | Memory per mod | 4 MiB |
-| Nested `pcall`, `print` and library calls | 16 levels |
+| Nested `pcall`, `print` and library calls (not the world functions) | 16 levels |
 | Error message shown | 4096 bytes, one line |
 
 Library functions that work in C (`string`, `table`, `utf8` and the `utf8.codes` iterator,

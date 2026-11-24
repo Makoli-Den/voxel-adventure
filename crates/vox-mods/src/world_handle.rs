@@ -10,6 +10,8 @@
 //! Every function charges the budget like the library functions do and checks its arguments
 //! itself, so a wrong argument gets a message in script terms, never a Rust type name.
 //!
+//! The world functions never call back into Lua, so they take no nesting level of the budget.
+//!
 //! Three mistakes disable the mod even if the script catches the error with `pcall`: a missing
 //! capability, an unknown block name and more than [`MAX_EDITS_PER_CALL`] writes. They are
 //! recorded in the call's [`CallRecord`], which the host reads after the call.
@@ -27,11 +29,22 @@ use crate::library::{bytes_cost, count, guarded};
 use crate::manifest::Capability;
 use crate::text::printable;
 
-/// The most block writes one handler call may queue; one more disables the mod. A handler is
-/// a reaction to one player edit, and every write may remesh up to four chunks on the main
-/// thread, so this bounds the frame hitch one event can cause. Provisional: step S7 measures
-/// the cost of this many scattered writes with their remeshing.
+/// The most block writes one mod's handler call may queue; one more disables that mod. It
+/// limits one mod, not one event: every mod with a handler may use it, so the writes of a whole
+/// event are bounded by [`MAX_EDITS_PER_EVENT`](crate::MAX_EDITS_PER_EVENT). Every write may
+/// remesh up to four chunks on the main thread. Provisional: step S7 measures the cost of this
+/// many scattered writes with their remeshing.
 pub const MAX_EDITS_PER_CALL: usize = 64;
+
+/// How many mods may each use their whole [`MAX_EDITS_PER_CALL`] in one event before the
+/// event's total cap cuts in. A guess for a modest mod set; S7 measures what the total costs.
+const MODS_AT_FULL_WRITES: usize = 4;
+
+/// The most block writes one event returns over all mods together. The writes past it are
+/// dropped (their mod keeps running) and a log line names how many, so a crowd of mods cannot
+/// multiply [`MAX_EDITS_PER_CALL`] into a long frame. Provisional: step S7 measures the total
+/// cost of writes per event and fixes this value.
+pub const MAX_EDITS_PER_EVENT: usize = MODS_AT_FULL_WRITES * MAX_EDITS_PER_CALL;
 
 /// Extra instructions charged for one call of a world function, besides one per argument and
 /// result: it looks a chunk up in a hash map and a name up in the registry, which take about
@@ -160,7 +173,6 @@ fn get_block(
     record: &RefCell<CallRecord>,
     args: &MultiValue,
 ) -> mlua::Result<Value> {
-    let _level = budget.enter()?;
     budget.charge(count(args.len()).saturating_add(WORLD_LOOKUP_INSTRUCTIONS))?;
     allow(access, record, GET_BLOCK, Capability::WorldRead)?;
     let position = position(args, GET_BLOCK)?;
@@ -184,7 +196,6 @@ fn set_block(
     record: &RefCell<CallRecord>,
     args: &MultiValue,
 ) -> mlua::Result<bool> {
-    let _level = budget.enter()?;
     let name_bytes = match args.get(NAME_ARGUMENT) {
         Some(Value::String(name)) => name.as_bytes().len(),
         _ => 0,
