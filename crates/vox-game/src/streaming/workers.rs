@@ -14,8 +14,6 @@ use std::time::{Duration, Instant};
 
 use vox_world::ChunkMesh;
 
-use super::column::Column;
-
 /// Why streaming stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamError {
@@ -35,35 +33,35 @@ impl Error for StreamError {}
 
 /// A finished job.
 #[derive(Debug)]
-pub struct JobResult<T> {
-    /// The column the job was for.
-    pub column: Column,
+pub struct JobResult<J, T> {
+    /// The job that was run.
+    pub job: J,
     /// What the job produced for it.
     pub output: T,
     /// How long the job took on its worker.
     pub took: Duration,
 }
 
-/// A pool of threads that run one function on every column sent to it and return its
-/// output of type `T`.
-pub struct Workers<T> {
+/// A pool of threads that run one function on every job of type `J` sent to it and return
+/// its output of type `T`.
+pub struct Workers<J, T> {
     /// Closed on drop, which ends the worker loops. `None` only while dropping.
-    jobs: Option<Sender<Column>>,
-    results: Receiver<JobResult<T>>,
+    jobs: Option<Sender<J>>,
+    results: Receiver<JobResult<J, T>>,
     /// Set on drop so workers skip the jobs still waiting in the channel.
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
 
-impl<T: Send + 'static> Workers<T> {
+impl<J: Copy + Send + 'static, T: Send + 'static> Workers<J, T> {
     /// Starts `count` threads (at least 1), each with its own scratch mesh, that run `work`
-    /// on every column sent and report the result and how long it took.
+    /// on every job sent and report the result and how long it took.
     pub fn spawn(
         count: usize,
-        work: impl Fn(Column, &mut ChunkMesh) -> T + Send + Sync + 'static,
+        work: impl Fn(J, &mut ChunkMesh) -> T + Send + Sync + 'static,
     ) -> Self {
-        let (job_sender, job_receiver) = mpsc::channel::<Column>();
-        let (result_sender, results) = mpsc::channel::<JobResult<T>>();
+        let (job_sender, job_receiver) = mpsc::channel::<J>();
+        let (result_sender, results) = mpsc::channel::<JobResult<J, T>>();
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let work = Arc::new(work);
         let stop = Arc::new(AtomicBool::new(false));
@@ -85,20 +83,20 @@ impl<T: Send + 'static> Workers<T> {
         }
     }
 
-    /// Queues `column` for the next free worker.
+    /// Queues `job` for the next free worker.
     ///
     /// # Errors
     /// [`StreamError::WorkerStopped`] when no worker is left to take it.
-    pub fn send(&self, column: Column) -> Result<(), StreamError> {
+    pub fn send(&self, job: J) -> Result<(), StreamError> {
         let jobs = self.jobs.as_ref().ok_or(StreamError::WorkerStopped)?;
-        jobs.send(column).map_err(|_| StreamError::WorkerStopped)
+        jobs.send(job).map_err(|_| StreamError::WorkerStopped)
     }
 
     /// A finished job, if any, without blocking.
     ///
     /// # Errors
     /// [`StreamError::WorkerStopped`] when every worker is gone and nothing is left to read.
-    pub fn try_recv(&self) -> Result<Option<JobResult<T>>, StreamError> {
+    pub fn try_recv(&self) -> Result<Option<JobResult<J, T>>, StreamError> {
         match self.results.try_recv() {
             Ok(result) => Ok(Some(result)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -107,7 +105,7 @@ impl<T: Send + 'static> Workers<T> {
     }
 
     /// Checks that every worker thread still runs. A worker only ends before the pool is
-    /// dropped when its job panicked, and the chunk it held would never load.
+    /// dropped when its job panicked, and the job it held would never finish.
     ///
     /// # Errors
     /// [`StreamError::WorkerStopped`] when any worker thread has finished.
@@ -120,7 +118,7 @@ impl<T: Send + 'static> Workers<T> {
     }
 }
 
-impl<T> Drop for Workers<T> {
+impl<J, T> Drop for Workers<J, T> {
     /// Stops the workers and waits for them: each finishes the job it is running, at most.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
@@ -134,10 +132,10 @@ impl<T> Drop for Workers<T> {
 }
 
 /// The loop of one worker thread: take a job, run it, report it, until the pool shuts down.
-fn run_worker<T>(
-    jobs: &Mutex<Receiver<Column>>,
-    results: &Sender<JobResult<T>>,
-    work: &(impl Fn(Column, &mut ChunkMesh) -> T + ?Sized),
+fn run_worker<J: Copy, T>(
+    jobs: &Mutex<Receiver<J>>,
+    results: &Sender<JobResult<J, T>>,
+    work: &(impl Fn(J, &mut ChunkMesh) -> T + ?Sized),
     stop: &AtomicBool,
 ) {
     let mut scratch = ChunkMesh::default();
@@ -148,16 +146,16 @@ fn run_worker<T>(
             Ok(receiver) => receiver.recv(),
             Err(_) => return,
         };
-        let Ok(column) = job else {
+        let Ok(job) = job else {
             return;
         };
         if stop.load(Ordering::Acquire) {
             return;
         }
         let started = Instant::now();
-        let output = work(column, &mut scratch);
+        let output = work(job, &mut scratch);
         let result = JobResult {
-            column,
+            job,
             output,
             took: started.elapsed(),
         };
@@ -173,6 +171,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
+    use crate::streaming::column::Column;
 
     /// How long a test waits for the workers before it fails.
     const TIMEOUT: Duration = Duration::from_secs(10);
@@ -207,12 +206,8 @@ mod tests {
             assert!(started.elapsed() < TIMEOUT, "timed out");
             match workers.try_recv().expect("workers run") {
                 Some(result) => {
-                    assert_eq!(result.output.indices, vec![result.column.x.unsigned_abs()]);
-                    assert!(
-                        seen.insert(result.column),
-                        "{:?} came back twice",
-                        result.column
-                    );
+                    assert_eq!(result.output.indices, vec![result.job.x.unsigned_abs()]);
+                    assert!(seen.insert(result.job), "{:?} came back twice", result.job);
                 }
                 None => thread::sleep(POLL),
             }
@@ -235,7 +230,7 @@ mod tests {
 
     #[test]
     fn a_panicking_job_is_reported_by_check() {
-        let workers = Workers::spawn(2, |column, scratch| {
+        let workers = Workers::spawn(2, |column: Column, scratch| {
             assert!(column.x != 0, "the test job panics on purpose");
             marked(column, scratch)
         });

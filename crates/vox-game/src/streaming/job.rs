@@ -1,5 +1,6 @@
 //! The work of one streaming job: generate the layers of a chunk column that can show a face and
-//! mesh them, and the same meshing for a chunk of the game's world after an edit.
+//! mesh them, or generate and mesh one level-of-detail tile; and the same meshing for a chunk of
+//! the game's world after an edit.
 //!
 //! A job depends on nothing but the [`Terrain`] and the column, so jobs can run in any order on
 //! any thread and a mesh is final when it is built, until a neighbour is edited (decisions 0010,
@@ -7,8 +8,9 @@
 //! which is cheap next to meshing.
 
 use vox_world::{
-    Chunk, ChunkMesh, ChunkPos, Face, FaceTextures, LocalPos, Neighbours, TerrainBlocks, World,
-    build_mesh_with_neighbours_into, column_span, generate_chunk,
+    CHUNK_SIZE, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, FaceTextures, MAX_SURFACE,
+    Neighbours, TerrainBlocks, TilePos, World, build_mesh_with_neighbours_into,
+    build_tile_mesh_into, column_span, generate_chunk, generate_lod_chunk, solid_chunk,
 };
 
 use super::column::{Column, ColumnSpans, Span};
@@ -31,15 +33,11 @@ pub struct Terrain {
 impl Terrain {
     /// The terrain of `seed` made of `blocks`, meshed with the layers of `textures`.
     pub fn new(seed: u32, blocks: TerrainBlocks, textures: FaceTextures) -> Self {
-        let mut solid_below = Chunk::new();
-        for pos in LocalPos::all() {
-            solid_below.set(pos, blocks.bedrock);
-        }
         Self {
             seed,
             blocks,
             textures,
-            solid_below,
+            solid_below: solid_chunk(blocks.bedrock),
         }
     }
 
@@ -88,6 +86,12 @@ impl BuiltColumn {
             .filter(|(_, built)| !built.mesh.indices.is_empty())
             .count()
     }
+}
+
+/// Bytes of a mesh's vertices and indices: what its GPU buffer holds, short of the few bytes
+/// of alignment between the two parts. The estimate of GPU mesh memory adds these up.
+pub fn mesh_bytes(mesh: &ChunkMesh) -> usize {
+    mesh.vertices.len() * size_of::<ChunkVertex>() + mesh.indices.len() * size_of::<u32>()
 }
 
 /// An exact-size copy of `scratch`, or an empty mesh when nothing is visible.
@@ -150,6 +154,55 @@ fn build_span(
         .map(|(layer, (chunk, mesh))| (column.chunk(layer), Built { chunk, mesh }))
         .collect();
     BuiltColumn { span, layers }
+}
+
+/// Every surface lies in tile layer 0 at every level: the highest surface block is below the
+/// top of a chunk, and a level-`k` tile of layer 0 is `2^k` times taller than a chunk. So the
+/// one layer a tile job builds is the whole span of every tile (decision 0015, "S4 as built":
+/// only layers of the span are meshed). A generator with higher terrain fails this check and
+/// must give tiles a span first.
+const _: () = assert!(MAX_SURFACE < CHUNK_SIZE);
+
+/// The tile layer every level-of-detail tile lives in; see the check above.
+pub const TILE_LAYER: i32 = 0;
+
+/// One unit of work for a streaming worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Job {
+    /// Generate and mesh the layers of a full-detail column ([`build_column`]).
+    Column(Column),
+    /// Generate and mesh one level-of-detail tile of level 1 or more ([`build_tile`]).
+    Tile(TilePos),
+}
+
+/// The result of a [`Job`], carrying the key it was made for, so a result can not be filed
+/// under another job.
+#[derive(Debug)]
+pub enum Finished {
+    /// The chunks and meshes of a column.
+    Column(Column, BuiltColumn),
+    /// The mesh of a tile; the tile's cells were dropped on the worker.
+    Tile(TilePos, ChunkMesh),
+}
+
+/// Runs `job` on a worker with its reused `scratch` mesh.
+pub fn run(terrain: &Terrain, job: Job, scratch: &mut ChunkMesh) -> Finished {
+    match job {
+        Job::Column(column) => Finished::Column(column, build_column(terrain, column, scratch)),
+        Job::Tile(tile) => Finished::Tile(tile, build_tile(terrain, tile, scratch)),
+    }
+}
+
+/// Generates the cells of `tile` and meshes them alone, with the solid stand-in below
+/// (decision 0015: the borders become the skirts). The cells are dropped here: a tile of level
+/// 1 or more keeps no blocks, only its mesh. Returns an exact-size copy of the mesh, or an
+/// empty mesh when nothing is visible.
+pub fn build_tile(terrain: &Terrain, tile: TilePos, scratch: &mut ChunkMesh) -> ChunkMesh {
+    // HOT PATH: runs for every streamed tile on a worker thread: one generation (1,024 height
+    // samples) and one mesh into the worker's reused scratch; the cells are freed at the end.
+    let cells = generate_lod_chunk(terrain.seed, tile, &terrain.blocks);
+    build_tile_mesh_into(&cells, &terrain.solid_below, &terrain.textures, scratch);
+    finished(scratch)
 }
 
 /// What stands in for a neighbour that is missing from the world.
@@ -224,7 +277,7 @@ pub fn remesh(
 
 #[cfg(test)]
 mod tests {
-    use vox_world::{BlockId, CHUNK_SIZE, CHUNK_VOLUME, build_mesh_into};
+    use vox_world::{BlockId, CHUNK_VOLUME, LocalPos, build_mesh_into};
 
     use super::*;
     use crate::streaming::test_blocks::{BLOCKS, face_textures};

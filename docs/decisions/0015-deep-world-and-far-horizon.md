@@ -21,7 +21,7 @@ Arithmetic that rules out "just raise the radius": full detail to 2048 blocks is
 |---|---|---|
 | `WORLD_FLOOR_Y` | -512 | lowest block (a bedrock row); 16 chunk layers below 0; aligned to a chunk border (const assertion) |
 | `WORLD_CEILING_Y` | 512 | first block that can never be set (build limit); 16 layers above 0 |
-| `DEFAULT_VIEW_RADIUS` | 8 chunks (256 blocks), re-measured in S1 and S7 *(12 chunks since S1, see "S1 as built")* | full-detail area, editable |
+| `DEFAULT_VIEW_RADIUS` | 8 chunks (256 blocks), re-measured in S1 and S7 *(12 chunks from S1 to S6, 8 again since S7, see "S1 as built" and "S7 as built")* | full-detail area, editable |
 | `DEFAULT_HORIZON` | 2048 blocks | where terrain ends; reached with level of detail (LOD) |
 | `MAX_HORIZON` | 4096 blocks | `--horizon` upper bound |
 | `MAX_LOD_LEVEL` | 4 | coarsest cell is 16 blocks, coarsest tile 512 blocks |
@@ -79,6 +79,8 @@ Arithmetic that rules out "just raise the radius": full detail to 2048 blocks is
 | Fill time to the horizon | <= 1 s | <= 3 s |
 | Main-thread cost of one edit that creates chunks | <= 2 ms | same |
 
+**Accepted deviations (measured in S7, see "S7 as built"):** the row "each LOD ring" is missed at the default (level 1: 63 k against 60 k) and at the maximum (levels 1 and 2: 185 k and 138 k against 120 k), because with `SPLIT_RATIO = view_radius / 2` a ring's area grows with the square of the radius; the totals, which set the frame time, are met. The worst frame of `--fly 8` at the maximum (25.7 ms against 16.7) is a renderer cost of removing about 260 meshes in one frame, left for a later `vox-render` change. The GPU mesh memory row is measured as the vertex and index payload only (23.8 and 74.7 MiB), not the driver's allocations.
+
 The meshes row is met by the measured counts of S6 only with these rules (see "S6 as built"): the default radius is 8 again when LOD lands (934 meshes at horizon 2048), and a radius above 14 gets a horizon below 4096 from `max_horizon_for`, so the total stays at most 3000. `MAX_VIEW_RADIUS` drops from 30 to 16 when LOD lands: at 30 a single LOD ring would hold about 2,100 tiles. 300 k triangles at 60 FPS is 18 M per second, a small fraction of what 2012-era integrated GPUs are rated for; this is an estimate until S9 measures one.
 
 ## Steps
@@ -109,9 +111,9 @@ S2b needs S1 (camera position) and S2a; S5 needs S2b (same renderer files) and S
 
 **S6. Tile selection** (world-dev; new `vox-game/src/streaming/lod.rs` and one line in `streaming/mod.rs`, not wired). The quadtree of (b). Done: the tests listed there, plus tile counts per level at radius 8, 12 and 16 for horizons 2048 and 4096 (the estimates were 45 percent too low: the real worst cases are in "S6 as built" and pinned by tests), `max_horizon_for` keeping the mesh count within the budget, and the cost of one selection (expected well under 1 ms) logged by a test.
 
-**S7. LOD streaming** (world-dev; `streaming/*`, `main.rs`, `cli.rs`, `hud.rs`). Tracker keyed by `TilePos`, LOD jobs on the same workers sharing the upload budget, nearest first; `--horizon`, fog end from the horizon; `MAX_VIEW_RADIUS` 16. Done: the default and maximum columns of the budget table met and recorded (standing and `--fly 8`); one window check at the default settings from the ground and from height 300.
+**S7. LOD streaming** (world-dev; `streaming/*`, `main.rs`, `cli.rs`, `hud.rs`). Tracker keyed by `TilePos`, LOD jobs on the same workers sharing the upload budget, nearest first; `--horizon`, fog end from the horizon; `MAX_VIEW_RADIUS` 16. Done: the default and maximum columns of the budget table measured and recorded (standing and `--fly 8`), each row met or recorded as an accepted deviation with its reason (see "S7 as built"); one window check at the default settings from the ground and from height 300.
 
-**S8. No holes during level changes** (world-dev; `streaming/tracker.rs`, `mod.rs`). A tile leaves the renderer only when the area it covered is fully drawn by uploaded tiles of the new selection (or it left the keep range). Done: a pure metric "uncovered area" in the stats, zero frames with uncovered area inside the horizon during `--fly 8` after the first fill; the meshes and memory budgets still met.
+**S8. No holes during level changes** (world-dev; `streaming/tracker.rs`, `mod.rs`). A tile leaves the renderer only when the area it covered is fully drawn by uploaded tiles of the new selection (or it left the keep range). Explicitly: **keep a column until its covering tile is uploaded, and a tile until its leaves are** (columns included), which also gives columns inside the horizon the hysteresis S7 lacks (see "S7 as built"). `lod::diff` is kept for this step. Done: a pure metric "uncovered area" in the stats, zero frames with uncovered area inside the horizon during `--fly 8` after the first fill; the meshes and memory budgets still met.
 
 **S9. Low-end device** (tester; `docs/benchmarks.md`, a new `docs/minimum-hardware.md`). Run S1, S2b and S7 measurements on the reference old device; set the default horizon and radius for it if the budgets do not hold. Done when the document names the device and the measured settings.
 
@@ -265,6 +267,84 @@ Caves and cave culling; uniform or palette chunk storage; the two-stage generati
 - **Not verified:** no Khronos validation layer is installed on the development machine, so
   no validation run; the standard-depth path on a real 24-bit-only device (the fallback was
   exercised only by forcing the mode on `D32_SFLOAT`); a low-end GPU (S9).
+
+## S7 as built
+- **One worker pool, two trackers, one scheduler.** `Workers<J, T>` is generic over the job;
+  a `Job` is `Column(Column)` or `Tile(TilePos)` and its result a `Finished` that carries the
+  same key (`streaming/job.rs`). The tracker became `Tracker<K, V>` (`streaming/tracker.rs`),
+  one for columns and one for tiles of level 1 and up, keyed by `TilePos`; it no longer knows
+  the area: `retarget(wanted, kept)` takes both from outside. `streaming/scheduler.rs` drives
+  both: when the camera enters another column it builds a `Plan` and retargets both trackers;
+  jobs go out **nearest first across both kinds** (the next column against the next tile by
+  `lod::distance_squared`, ties to the column) under **one cap** (2 per worker); finished meshes
+  share **one upload budget** (`MAX_UPLOADS_PER_FRAME` 4), columns first and tiles with the rest
+  (columns carry the blocks physics reads; waiting tiles hold cap slots, so columns are never
+  starved for long). A tile job is `generate_lod_chunk` plus `build_tile_mesh_into` with
+  `solid_chunk(bedrock)` below (the `Terrain` stand-in is now built by `solid_chunk`); the cells
+  are dropped on the worker, a tile keeps only its mesh. A result for a key that is no longer in
+  flight is dropped, as for columns.
+- **Which columns, which tiles (`streaming/plan.rs`).** The selection's level-0 leaves are
+  loaded as full-detail columns together with `area::wanted` (the leaves contain it; at radius 8
+  that is 308 columns instead of 197). *Deviation from "the game keeps loading level-0 columns
+  by the area logic":* loading only `area::wanted` leaves the level-0 leaves beyond it (up to 3.6
+  chunks, "S6 as built") drawn by nothing, a hole ring around the full-detail circle; drawing
+  their level-1 parents instead would overlap the loaded columns in the same parent. **Coverage
+  rule:** a column is kept while it is a level-0 leaf, or while it is in the radius's keep range
+  (`area::is_kept`) and no selected tile of level 1 or more covers it; a tile is kept only while
+  it is selected. Every place inside the horizon is then drawn by exactly one loaded column or
+  tile once nothing is queued. A pure test drives the scheduler with fake results along a walk
+  across tile borders of every level and at the default horizon and checks the partition column
+  by column; dropping the "not covered" half of the keep rule makes it fail (mutation-checked).
+  Tiles and columns never share a renderer key (a tile of level 0 is never selected as a tile).
+- **No hysteresis for tiles yet, and none for columns where tiles exist.** A tile that leaves the
+  selection is removed at once and its replacements are uploaded nearest first, so a level change
+  leaves a hole for a few frames (step S8). Inside the horizon a column is kept only by the
+  coverage rule, so stepping back and forth across a level-1 border swaps up to 48 leaves every
+  time, with visible holes about 260 to 370 blocks away at radius 8, and a column one chunk
+  beyond the radius that a tile now covers is dropped at once, its edits with it. S8 keeps a
+  column until its covering tile is uploaded and a tile until its leaves are. The stand-in metric is cheap: the run summary counts the frames after the first fill
+  that had tiles waiting and the most tiles waiting at once (a waiting tile is a hole or a new
+  tile at the fogged edge). The measured runs counted tiles only (a lower bound); the summary now
+  counts columns and tiles and says "first fill not reached" if the fill never completed.
+- **`lod::diff` stays unused** under `expect(dead_code)`, deliberately: S8 derives the
+  replacement of a tile from it.
+- **One tile layer.** A level-`k` tile of layer 0 is `32 * 2^k` blocks tall and every surface
+  lies below block 32 (`MAX_SURFACE` 24), so layer 0 is the whole span of every tile at every
+  level. A const assertion in `job.rs` (`MAX_SURFACE < CHUNK_SIZE`) fails when the generator
+  grows higher terrain, which then needs a tile span first.
+- **Horizon (`view_distance::effective_horizon`).** `--horizon BLOCKS` (default 2048, 0 to 4096,
+  0 = no tiles and the old radius-based fog). The game uses the smallest of the request,
+  `lod::max_horizon_for(radius)` and `DepthMode::max_horizon()`, computed once when the renderer
+  starts, and prints a note on stderr when it lowers it (radius 16: 4096 to 3328; a 24-bit depth
+  buffer: 1024). `--view-radius` now accepts 0 to 16, `DEFAULT_VIEW_RADIUS` is 8 again.
+- **Fog.** The end is the farther of the radius bound of S1 and `horizon - 22.6` (the tiles cover
+  the disc around the centre of the camera's column); start 0.6 of the end. A test checks the
+  bound against the real selection for several radii and horizons. **The far plane stays the
+  fog end plus 1 block**, as in (b) step 1, so it lies about 21 blocks inside the horizon:
+  everything beyond the fog end is fully fogged, that is the sky colour, and depth along the view
+  is never more than the radial fog distance, so a far plane at the horizon would only draw more
+  invisible triangles. With reversed Z the far plane costs no precision either way.
+- **HUD:** a `Tiles  loaded L  queued Q` line under `Columns`. The fill log line counts columns,
+  tiles, meshes and their bytes and the average column and tile job; the run summary adds the
+  horizon, the loaded columns and tiles and the estimated mesh memory (vertex and index bytes as
+  streamed).
+- **Measured** (`docs/benchmarks.md`, "LOD streaming"): at the default (radius 8, horizon 2048)
+  1898 FPS standing and 1762 flying (worst frame 15.6 ms), 927 meshes, 23.8 MiB, filled in about
+  0.19 s, 196 k triangles drawn (73 k full detail, 63 k / 44 k / 16 k at levels 1 to 3). At the
+  maximum (radius 16, horizon lowered to 3328) 846 FPS standing and 826 flying, 2,823 meshes,
+  74.7 MiB, filled in 0.65 s, 571 k triangles. **Missed:** the per-ring triangle limit at level 1
+  by default (63 k against 60 k) and at levels 1 and 2 at the maximum (185 k and 138 k against
+  120 k), because the rings grow with the square of the radius while the totals are met; and the
+  worst frame flying at the maximum (25.7 ms against 16.7), which a probe traced to the renderer's
+  `remove_tile_mesh` for about 260 meshes in the frame that crosses a level border (about 80 us
+  each; that this is the driver's free and not the fence poll in the same call is a hypothesis).
+  Both are recorded as accepted deviations in (e): the first is a question for the budget table
+  or the split ratio, the second for the renderer (bounded frees or one poll per frame, or
+  sub-allocation, decision 0007). Mesh memory is the payload only, unverified against the
+  driver; about 2,823 live meshes plus up to about 260 retired stay under the 4,096 allocations. Tile
+  jobs take 0.21 to 0.24 ms, as estimated.
+- **Not verified:** a validation-layer run (none installed), a low-end GPU (S9), interactive
+  flight by a player (only the `--fly` autopilot and still screenshots).
 
 ## Answers to the open questions
 - The world bounds are -512 and 512 (named parameters, easy to change).

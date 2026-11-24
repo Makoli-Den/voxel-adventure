@@ -178,11 +178,15 @@ mod tests {
 
     #[test]
     fn the_far_plane_of_every_view_radius_lies_beyond_the_near_plane() {
-        // The far plane follows the fog, which follows the view radius; a far plane at or
-        // before the near plane would break the projection.
+        // The far plane follows the fog, which follows the view radius and the horizon; a far
+        // plane at or before the near plane would break the projection.
+        let horizons = [0, crate::streaming::lod::MAX_HORIZON_BLOCKS];
         for radius in 0..=crate::cli::MAX_VIEW_RADIUS {
-            let far = crate::view_distance::far_plane(crate::view_distance::fog(radius));
-            assert!(far > NEAR, "radius {radius}: far plane at {far}");
+            for horizon in horizons {
+                let fog = crate::view_distance::fog(radius, horizon);
+                let far = crate::view_distance::far_plane(fog);
+                assert!(far > NEAR, "radius {radius}: far plane at {far}");
+            }
         }
     }
 

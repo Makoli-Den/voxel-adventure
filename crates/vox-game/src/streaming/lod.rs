@@ -26,9 +26,7 @@
 //! largest horizon that keeps a view radius inside it, so the game cannot ask for more meshes
 //! than the budgets of decision 0015 allow.
 //!
-//! Not wired into the streamer yet (step S7), hence the `dead_code` expectation (it does not
-//! apply to the tests, which use everything).
-#![cfg_attr(not(test), expect(dead_code, reason = "wired in S7"))]
+//! The streamer turns a selection into work through [`super::plan`] (step S7).
 
 use std::collections::HashSet;
 
@@ -280,6 +278,18 @@ pub fn max_horizon_for(view_radius_chunks: i32) -> i32 {
     low * HORIZON_STEP_BLOCKS
 }
 
+/// Squared distance in blocks from the centre of `camera`'s column (its `y` is ignored) to the
+/// nearest point of `tile`, seen from above: the distance [`select_tiles`] orders by, so the
+/// streamer can put columns and tiles in one nearest-first order.
+pub fn distance_squared(camera: ChunkPos, tile: TilePos) -> i64 {
+    let extent = i64::from(tile.extent());
+    let origin = [
+        i64::from(tile.pos().x) * extent,
+        i64::from(tile.pos().z) * extent,
+    ];
+    nearest_distance_squared(CameraColumn::new(camera).centre, origin, extent)
+}
+
 /// The tiles that appear and disappear between two selections: `(added, removed)`.
 ///
 /// `added` keeps the order of `next` (nearest first for a nearest-first selection, the order
@@ -290,6 +300,13 @@ pub fn max_horizon_for(view_radius_chunks: i32) -> i32 {
 /// four added (or the reverse) with no link. Step S8, which keeps the old tile until the new
 /// ones are drawn, must derive the replacement from the tile rectangles
 /// ([`TilePos::origin`] and [`TilePos::extent`]).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "S7 rebuilds the queues from the plan; step S8 derives replacements from the diff"
+    )
+)]
 pub fn diff(previous: &[TilePos], next: &[TilePos]) -> (Vec<TilePos>, Vec<TilePos>) {
     let old: HashSet<TilePos> = previous.iter().copied().collect();
     let new: HashSet<TilePos> = next.iter().copied().collect();
@@ -737,6 +754,9 @@ mod tests {
             })
             .collect();
         assert!(distances.windows(2).all(|pair| pair[0] <= pair[1]));
+        // The public distance is the one the selection orders by.
+        let public: Vec<i64> = tiles.iter().map(|t| distance_squared(camera, *t)).collect();
+        assert_eq!(public, distances);
         assert!(tiles.iter().all(|t| t.pos().y == TERRAIN_LAYER));
         let unique: HashSet<_> = tiles.iter().collect();
         assert_eq!(unique.len(), tiles.len());
