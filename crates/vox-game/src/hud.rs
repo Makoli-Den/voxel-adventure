@@ -398,7 +398,7 @@ pub fn lines(
         None => lines.push(line("FPS", "measuring...")),
     }
     lines.push(line(
-        "Chunks",
+        "Columns",
         format!("loaded {}  queued {}", stream.loaded, stream.queued),
     ));
     lines.push(line("Limit", if frame_limit { "on" } else { "off" }));
@@ -671,7 +671,7 @@ mod tests {
         };
         for summary in [Some(summary()), None] {
             let text = lines(summary.as_ref(), &RenderStats::default(), &stream, false).join("\n");
-            assert!(text.contains("Chunks   loaded 120  queued 77"), "{text}");
+            assert!(text.contains("Columns  loaded 120  queued 77"), "{text}");
         }
     }
 

@@ -60,11 +60,10 @@ pub fn far_plane(fog: Fog) -> f32 {
 mod tests {
     use std::collections::HashSet;
 
-    use vox_world::ChunkPos;
-
     use super::*;
     use crate::cli::{DEFAULT_VIEW_RADIUS, MAX_VIEW_RADIUS};
     use crate::streaming::area;
+    use crate::streaming::column::Column;
 
     /// The horizontal distance in blocks from the nearest point of the camera's column to the
     /// nearest point of the column `offset` chunks away: the closest that column can come.
@@ -77,13 +76,14 @@ mod tests {
     fn fog_is_complete_before_any_missing_terrain() {
         // From radius 2 on; below that the fog cannot end before its minimum.
         for radius in 2..=MAX_VIEW_RADIUS {
-            let loaded: HashSet<ChunkPos> =
-                area::wanted(ChunkPos::ORIGIN, radius).into_iter().collect();
+            let loaded: HashSet<Column> = area::wanted(Column::new(0, 0), radius)
+                .into_iter()
+                .collect();
             let reach = radius + 2;
             let fog = fog(radius);
             for z in -reach..=reach {
                 for x in -reach..=reach {
-                    let column = ChunkPos::new(x, area::TERRAIN_LAYER, z);
+                    let column = Column::new(x, z);
                     if !loaded.contains(&column) {
                         let distance = closest_distance((x, z));
                         assert!(

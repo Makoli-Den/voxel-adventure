@@ -39,7 +39,7 @@ use vox_render::{
     CameraView, Fog, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers,
     create_renderer,
 };
-use vox_world::{ChunkMesh, World, raycast};
+use vox_world::{ChunkMesh, World, raycast_with};
 use winit::application::ApplicationHandler;
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
@@ -52,13 +52,13 @@ use camera::{Camera, Movement};
 use cli::{Command, Options};
 use content::Content;
 use controls::Controls;
-use editing::{EditAction, REACH};
+use editing::{EditAction, EditedChunks, REACH};
 use input_mode::{InputMode, MenuButton, Outcome};
 use metrics::FrameHistory;
 use pacing::MAX_FRAME_TIME;
-use physics::{Body, WalkInput};
+use physics::{Body, Space, WalkInput};
 use selection::Selection;
-use streaming::{ChunkStreamer, Terrain, area, remesh};
+use streaming::{ChunkStreamer, ColumnSpans, Terrain, area, remesh};
 
 /// The window title.
 const WINDOW_TITLE: &str = "Voxel Adventure";
@@ -124,7 +124,7 @@ impl FillReport {
             Duration::ZERO
         };
         Some(format!(
-            "Streaming: {} chunks loaded in {:.1} ms, average job {:.3} ms, average upload {:.3} ms, {} workers",
+            "Streaming: {} columns loaded in {:.1} ms, average job {:.3} ms, average upload {:.3} ms, {} workers",
             stats.loaded,
             metrics::millis(self.started.elapsed()),
             metrics::millis(average_job),
@@ -158,6 +158,12 @@ struct App {
     /// Chunks are added and dropped as streaming loads and unloads them, so it stays as big
     /// as the view area.
     world: World,
+    /// The span of every loaded column: what physics and editing know of the layers that are
+    /// not in `world`. Updated together with `world` from the streaming changes.
+    spans: ColumnSpans,
+    /// The chunks the player wrote into, whose neighbours must be completed when they stream
+    /// in again (decision 0015).
+    edited: EditedChunks,
     /// Reused for the mesh of every chunk rebuilt after an edit.
     edit_scratch: ChunkMesh,
     camera: Camera,
@@ -223,6 +229,8 @@ impl App {
             streamer: None,
             fill: FillReport::new(),
             world: World::new(),
+            spans: ColumnSpans::default(),
+            edited: EditedChunks::default(),
             edit_scratch: ChunkMesh::default(),
             camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
             fog,
@@ -314,7 +322,11 @@ impl App {
                     direction: self.camera.walk_direction(movement),
                     jump: movement.up > 0.0,
                 };
-                self.body.step(&self.world, input, dt);
+                let space = Space {
+                    world: &self.world,
+                    spans: &self.spans,
+                };
+                self.body.step(space, input, dt);
                 self.camera.set_position(Vec3::from(self.body.eye()));
             }
         } else {
@@ -330,6 +342,8 @@ impl App {
                 (self.controls.movement(), MOVE_SPEED)
             };
             self.camera.translate(movement, speed * dt);
+            self.camera
+                .clamp_height(camera::FLY_FLOOR, camera::FLY_CEILING);
             // The body follows the flying eye, so placing a block still keeps clear of it and
             // switching to walking continues from here.
             self.body = Body::from_eye(self.camera.position().to_array());
@@ -355,29 +369,64 @@ impl App {
         }
     }
 
-    /// One frame of streaming: loads and unloads chunks around the camera and hands the
+    /// One frame of streaming: loads and unloads chunk columns around the camera and hands the
     /// finished meshes to the renderer. Removals come first, so their memory is freed before
-    /// the uploads need it.
+    /// the uploads need it. An unloaded column takes every chunk of it along, also those an
+    /// edit created; a streamed chunk never replaces one already in the world, and neither
+    /// does its mesh.
     fn stream(&mut self) -> Result<(), Box<dyn Error>> {
         let (Some(streamer), Some(renderer)) = (self.streamer.as_mut(), self.renderer.as_mut())
         else {
             return Ok(());
         };
         let changes = streamer.update(area::chunk_of(self.camera.position().to_array()))?;
-        for pos in &changes.removed {
-            renderer.remove_chunk_mesh(*pos);
+        for column in &changes.removed {
+            for pos in column.chunks() {
+                renderer.remove_chunk_mesh(pos);
+            }
         }
-        editing::apply_streamed(&mut self.world, &changes.removed, changes.loaded);
+        let arrived: Vec<_> = changes.loaded.iter().map(|loaded| loaded.column).collect();
+        let kept = editing::apply_streamed(
+            &mut self.world,
+            &mut self.spans,
+            &mut self.edited,
+            &changes.removed,
+            changes.loaded,
+        );
         let uploading = Instant::now();
         let mut uploaded = 0;
         // An upload error is fatal (the caller exits the game), so the streamer's record of
         // what is loaded need not be corrected when one fails halfway.
-        for (pos, mesh) in &changes.uploads {
+        for (pos, mesh) in changes
+            .uploads
+            .iter()
+            .filter(|(pos, _)| !kept.contains(pos))
+        {
             renderer.set_chunk_mesh(*pos, mesh)?;
             uploaded += 1;
         }
         if uploaded > 0 {
             self.fill.add_uploads(uploaded, uploading.elapsed());
+        }
+        // After the uploads, so a remeshed neighbour that arrived in this frame keeps the
+        // remeshed version.
+        let beside = editing::create_chunks_beside_edits(
+            &mut self.world,
+            &self.terrain,
+            &self.spans,
+            &self.edited,
+            &arrived,
+        );
+        for pos in beside {
+            if remesh(
+                &self.terrain,
+                &self.world,
+                &self.spans,
+                pos,
+                &mut self.edit_scratch,
+            ) {
+                renderer.set_chunk_mesh(pos, &self.edit_scratch)?;
+            }
         }
         if let Some(line) = self.fill.line_once(streamer) {
             println!("{line}");
@@ -403,8 +452,9 @@ impl App {
     }
 
     /// Carries out the edit the player asked for since the last frame, if any: casts a ray
-    /// from the eye along the look direction, writes the block the ray picks and rebuilds the
-    /// mesh of every chunk the write made out of date.
+    /// from the eye along the look direction, creates the chunks under the terrain the edit
+    /// needs, writes the block the ray picks and rebuilds the mesh of every chunk the write
+    /// made out of date. An edit that created chunks logs its cost (decision 0015 budgets it).
     ///
     /// The ray is only cast when an edit was asked for, since nothing shows the targeted block.
     fn edit(&mut self) -> Result<(), RenderError> {
@@ -413,24 +463,50 @@ impl App {
         };
         let eye = self.camera.position().to_array();
         let direction = self.camera.forward().to_array();
-        let Some(hit) = raycast(&self.world, eye, direction, REACH) else {
+        // Missing chunks above a loaded column's span are air, so a ray from the flying height
+        // reaches the terrain (decision 0015).
+        let lookup = |block| editing::block_for_ray(&self.world, &self.spans, block);
+        let Some(hit) = raycast_with(lookup, eye, direction, REACH) else {
             return Ok(());
         };
         let Some(edit) = editing::plan(action, &hit, &self.body, self.selection.selected()) else {
             return Ok(());
         };
-        // `None` when the chunk of the cell is not loaded, for example above the terrain layer.
-        let Some(changed) = self.world.set_block(edit.position, edit.block) else {
-            return Ok(());
-        };
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
+        let started = Instant::now();
+        let created = editing::create_chunks_for_edit(
+            &mut self.world,
+            &self.terrain,
+            &self.spans,
+            edit.position,
+        );
+        // `None` when the chunk of the cell is not in the world: its column is not loaded.
+        let Some(changed) = self.world.set_block(edit.position, edit.block) else {
+            return Ok(());
+        };
+        if !changed.is_empty() {
+            self.edited.record(edit.position);
+        }
         for pos in changed.as_slice() {
-            if remesh(&self.terrain, &self.world, *pos, &mut self.edit_scratch) {
+            if remesh(
+                &self.terrain,
+                &self.world,
+                &self.spans,
+                *pos,
+                &mut self.edit_scratch,
+            ) {
                 // An empty mesh removes the chunk's entry, so a chunk that was dug empty vanishes.
                 renderer.set_chunk_mesh(*pos, &self.edit_scratch)?;
             }
+        }
+        if created > 0 {
+            println!(
+                "Edit: {created} chunks created, {} remeshed in {:.3} ms",
+                changed.as_slice().len(),
+                metrics::millis(started.elapsed())
+            );
         }
         Ok(())
     }
@@ -699,7 +775,11 @@ impl App {
             return;
         }
         let body = Body::from_eye(self.camera.position().to_array());
-        if body.is_free(&self.world) {
+        let space = Space {
+            world: &self.world,
+            spans: &self.spans,
+        };
+        if body.is_free(space) {
             self.body = body;
             self.walking = true;
         }

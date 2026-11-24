@@ -7,7 +7,7 @@
 //! chunk columns of [`super::area`]; coarser leaves are the far rings.
 //!
 //! Tiles are horizontal columns: this module works on `(level, x, z)` tiles in the terrain
-//! layer ([`TERRAIN_LAYER`], `y = 0`). Vertical layers are handled by the column span
+//! layer (`TERRAIN_LAYER`, `y = 0`). Vertical layers are handled by the column span
 //! (decision 0015 (a)), not by the selection.
 //!
 //! Two rules keep the selection calm while the camera moves:
@@ -34,7 +34,9 @@ use std::collections::HashSet;
 
 use vox_world::{CHUNK_SIZE, ChunkPos, MAX_LOD_LEVEL, TilePos};
 
-use super::area::TERRAIN_LAYER;
+/// The chunk layer all selected tiles live in: tiles are horizontal columns, the vertical layers
+/// of a column come from its span (decision 0015).
+const TERRAIN_LAYER: i32 = 0;
 
 /// The horizon the game starts with: 2048 blocks (decision 0015, "Answers to the open
 /// questions"). Tiles of level 4 are used only beyond `(view_radius / 2 + 0.375) * 512`
@@ -308,6 +310,7 @@ mod tests {
 
     use super::*;
     use crate::streaming::area::wanted;
+    use crate::streaming::column::Column;
 
     /// The radius the decision's numbers were first given for.
     const RADIUS: i32 = 8;
@@ -496,8 +499,9 @@ mod tests {
                     .filter(|t| t.level() == 0)
                     .map(|t| t.pos())
                     .collect();
-                for column in wanted(camera, radius) {
-                    assert!(level0.contains(&column), "{camera:?} r{radius}: {column:?}");
+                for column in wanted(Column::of(camera), radius) {
+                    let chunk = column.chunk(TERRAIN_LAYER);
+                    assert!(level0.contains(&chunk), "{camera:?} r{radius}: {column:?}");
                 }
                 // The clamped radius is what the selection used.
                 let used = radius.max(MIN_BALANCED_RADIUS);
@@ -518,7 +522,7 @@ mod tests {
 
     #[test]
     fn level_0_leaves_stay_close_to_the_wanted_area_in_number() {
-        let wanted_len = wanted(ChunkPos::ORIGIN, RADIUS).len();
+        let wanted_len = wanted(Column::of(ChunkPos::ORIGIN), RADIUS).len();
         let mut most = 0;
         for camera in cameras() {
             let level0 = select_tiles(camera, RADIUS, DEFAULT_HORIZON_BLOCKS)

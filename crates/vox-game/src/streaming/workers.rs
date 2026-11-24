@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use vox_world::{ChunkMesh, ChunkPos};
+use vox_world::ChunkMesh;
+
+use super::column::Column;
 
 /// Why streaming stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,19 +36,19 @@ impl Error for StreamError {}
 /// A finished job.
 #[derive(Debug)]
 pub struct JobResult<T> {
-    /// The chunk the job was for.
-    pub pos: ChunkPos,
+    /// The column the job was for.
+    pub column: Column,
     /// What the job produced for it.
     pub output: T,
     /// How long the job took on its worker.
     pub took: Duration,
 }
 
-/// A pool of threads that run one function on every position sent to it and return its
+/// A pool of threads that run one function on every column sent to it and return its
 /// output of type `T`.
 pub struct Workers<T> {
     /// Closed on drop, which ends the worker loops. `None` only while dropping.
-    jobs: Option<Sender<ChunkPos>>,
+    jobs: Option<Sender<Column>>,
     results: Receiver<JobResult<T>>,
     /// Set on drop so workers skip the jobs still waiting in the channel.
     stop: Arc<AtomicBool>,
@@ -55,12 +57,12 @@ pub struct Workers<T> {
 
 impl<T: Send + 'static> Workers<T> {
     /// Starts `count` threads (at least 1), each with its own scratch mesh, that run `work`
-    /// on every position sent and report the result and how long it took.
+    /// on every column sent and report the result and how long it took.
     pub fn spawn(
         count: usize,
-        work: impl Fn(ChunkPos, &mut ChunkMesh) -> T + Send + Sync + 'static,
+        work: impl Fn(Column, &mut ChunkMesh) -> T + Send + Sync + 'static,
     ) -> Self {
-        let (job_sender, job_receiver) = mpsc::channel::<ChunkPos>();
+        let (job_sender, job_receiver) = mpsc::channel::<Column>();
         let (result_sender, results) = mpsc::channel::<JobResult<T>>();
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let work = Arc::new(work);
@@ -83,13 +85,13 @@ impl<T: Send + 'static> Workers<T> {
         }
     }
 
-    /// Queues `pos` for the next free worker.
+    /// Queues `column` for the next free worker.
     ///
     /// # Errors
     /// [`StreamError::WorkerStopped`] when no worker is left to take it.
-    pub fn send(&self, pos: ChunkPos) -> Result<(), StreamError> {
+    pub fn send(&self, column: Column) -> Result<(), StreamError> {
         let jobs = self.jobs.as_ref().ok_or(StreamError::WorkerStopped)?;
-        jobs.send(pos).map_err(|_| StreamError::WorkerStopped)
+        jobs.send(column).map_err(|_| StreamError::WorkerStopped)
     }
 
     /// A finished job, if any, without blocking.
@@ -133,9 +135,9 @@ impl<T> Drop for Workers<T> {
 
 /// The loop of one worker thread: take a job, run it, report it, until the pool shuts down.
 fn run_worker<T>(
-    jobs: &Mutex<Receiver<ChunkPos>>,
+    jobs: &Mutex<Receiver<Column>>,
     results: &Sender<JobResult<T>>,
-    work: &(impl Fn(ChunkPos, &mut ChunkMesh) -> T + ?Sized),
+    work: &(impl Fn(Column, &mut ChunkMesh) -> T + ?Sized),
     stop: &AtomicBool,
 ) {
     let mut scratch = ChunkMesh::default();
@@ -146,16 +148,16 @@ fn run_worker<T>(
             Ok(receiver) => receiver.recv(),
             Err(_) => return,
         };
-        let Ok(pos) = job else {
+        let Ok(column) = job else {
             return;
         };
         if stop.load(Ordering::Acquire) {
             return;
         }
         let started = Instant::now();
-        let output = work(pos, &mut scratch);
+        let output = work(column, &mut scratch);
         let result = JobResult {
-            pos,
+            column,
             output,
             took: started.elapsed(),
         };
@@ -176,25 +178,25 @@ mod tests {
     const TIMEOUT: Duration = Duration::from_secs(10);
     /// Pause between two polls of the pool.
     const POLL: Duration = Duration::from_millis(1);
-    /// Positions sent in the throughput tests.
+    /// Columns sent in the throughput tests.
     const JOBS: i32 = 200;
 
-    fn at(x: i32) -> ChunkPos {
-        ChunkPos::new(x, 0, 0)
+    fn at(x: i32) -> Column {
+        Column::new(x, 0)
     }
 
     /// A job whose mesh carries its x coordinate, so a result can be checked.
-    fn marked(pos: ChunkPos, _scratch: &mut ChunkMesh) -> ChunkMesh {
+    fn marked(column: Column, _scratch: &mut ChunkMesh) -> ChunkMesh {
         ChunkMesh {
             vertices: Vec::new(),
-            indices: vec![pos.x.unsigned_abs()],
+            indices: vec![column.x.unsigned_abs()],
             // Less than one quad of indices, so no quad in any direction.
             face_quads: [0; vox_world::Face::COUNT],
         }
     }
 
     #[test]
-    fn every_sent_position_comes_back_exactly_once() {
+    fn every_sent_column_comes_back_exactly_once() {
         let workers = Workers::spawn(3, marked);
         for x in 0..JOBS {
             workers.send(at(x)).expect("workers run");
@@ -205,8 +207,12 @@ mod tests {
             assert!(started.elapsed() < TIMEOUT, "timed out");
             match workers.try_recv().expect("workers run") {
                 Some(result) => {
-                    assert_eq!(result.output.indices, vec![result.pos.x.unsigned_abs()]);
-                    assert!(seen.insert(result.pos), "{:?} came back twice", result.pos);
+                    assert_eq!(result.output.indices, vec![result.column.x.unsigned_abs()]);
+                    assert!(
+                        seen.insert(result.column),
+                        "{:?} came back twice",
+                        result.column
+                    );
                 }
                 None => thread::sleep(POLL),
             }
@@ -229,9 +235,9 @@ mod tests {
 
     #[test]
     fn a_panicking_job_is_reported_by_check() {
-        let workers = Workers::spawn(2, |pos, scratch| {
-            assert!(pos.x != 0, "the test job panics on purpose");
-            marked(pos, scratch)
+        let workers = Workers::spawn(2, |column, scratch| {
+            assert!(column.x != 0, "the test job panics on purpose");
+            marked(column, scratch)
         });
         assert!(workers.check().is_ok());
         workers.send(at(0)).expect("workers run");
@@ -249,10 +255,10 @@ mod tests {
         const JOB_TIME: Duration = Duration::from_millis(20);
         let run = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&run);
-        let workers = Workers::spawn(1, move |pos, scratch| {
+        let workers = Workers::spawn(1, move |column, scratch| {
             counter.fetch_add(1, Ordering::SeqCst);
             thread::sleep(JOB_TIME);
-            marked(pos, scratch)
+            marked(column, scratch)
         });
         for x in 0..JOBS {
             workers.send(at(x)).expect("workers run");
