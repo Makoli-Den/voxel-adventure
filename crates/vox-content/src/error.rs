@@ -71,6 +71,20 @@ pub enum ContentError {
         /// The blocks file.
         file: ResourceId,
     },
+    /// The same blocks file appears twice in the list of files to load.
+    FileListedTwice {
+        /// The repeated file.
+        file: ResourceId,
+    },
+    /// Two different blocks files register the same full block name.
+    DuplicateAcrossFiles {
+        /// The full registry name, `<namespace>:<name>`.
+        name: String,
+        /// The file that registered the name first.
+        first: ResourceId,
+        /// The later file that tried to register it again.
+        second: ResourceId,
+    },
 }
 
 impl fmt::Display for ContentError {
@@ -115,6 +129,17 @@ impl fmt::Display for ContentError {
                     "blocks file `{file}`: more than {MAX_LAYERS} different textures"
                 )
             }
+            Self::FileListedTwice { file } => {
+                write!(f, "blocks file `{file}` is listed twice")
+            }
+            Self::DuplicateAcrossFiles {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "blocks file `{second}`: the block `{name}` is already registered by `{first}`"
+            ),
         }
     }
 }
@@ -129,7 +154,9 @@ impl Error for ContentError {
             Self::UnsupportedFormat { .. }
             | Self::InvalidName { .. }
             | Self::MissingFace { .. }
-            | Self::TooManyTextures { .. } => None,
+            | Self::TooManyTextures { .. }
+            | Self::FileListedTwice { .. }
+            | Self::DuplicateAcrossFiles { .. } => None,
         }
     }
 }

@@ -179,6 +179,19 @@ impl PackStack {
         })
     }
 
+    /// Whether any pack has `id`, without reading it: lets a caller skip an optional file.
+    ///
+    /// # Errors
+    /// [`ResourceError::Io`] when a lookup fails.
+    pub fn contains(&self, id: &ResourceId) -> Result<bool, ResourceError> {
+        for pack in &self.packs {
+            if pack.contains(id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The pack that serves `id`, for messages (`DirPack::root` names it).
     ///
     /// # Errors
@@ -219,6 +232,15 @@ mod tests {
         assert_eq!(pack.read(&id("base:a.txt/inner")).unwrap(), None);
         assert!(pack.contains(&id("base:a.txt")).unwrap());
         assert!(!pack.contains(&id("base:nope.txt")).unwrap());
+    }
+
+    #[test]
+    fn a_stack_contains_what_any_pack_has() {
+        let mut stack = PackStack::new();
+        assert!(!stack.contains(&id("base:a.txt")).unwrap());
+        stack.push(low());
+        assert!(stack.contains(&id("base:a.txt")).unwrap());
+        assert!(!stack.contains(&id("base:nope.txt")).unwrap());
     }
 
     #[test]

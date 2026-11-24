@@ -314,7 +314,7 @@ fn push_scaled(out: &mut Vec<u8>, image: &Image, size: u32) {
 }
 
 /// Builds the texture array for `textures`, the texture id of each layer as returned by
-/// [`blocks::load_blocks`].
+/// [`crate::load_blocks`].
 ///
 /// Entry 0 is the missing texture: whatever id it holds is ignored and layer 0 is always the
 /// generated picture, so an empty list gives an array of just that one layer. Entries past
@@ -381,12 +381,25 @@ pub fn build_textures(stack: &PackStack, textures: &[ResourceId]) -> (BlockTextu
 /// A broken blocks file is an error; a broken texture is only a [`Warning`].
 ///
 /// # Errors
-/// As [`blocks::load_blocks`], which also rejects a file that needs more than [`MAX_LAYERS`]
+/// As [`crate::load_blocks`], which also rejects a file that needs more than [`MAX_LAYERS`]
 /// textures.
 pub fn load_content(
     stack: &PackStack,
 ) -> Result<(BlockRegistry, BlockTextures, Vec<Warning>), ContentError> {
-    let (registry, textures) = blocks::load_blocks(stack)?;
+    load_content_from(stack, &[blocks::base_blocks_file()?])
+}
+
+/// Like [`load_content`] for several blocks files (one per mod, in load order): one registry
+/// and one texture array for all of them. Ids and layers follow [`crate::load_blocks_many`].
+/// The caller passes only files that exist; a missing file is an error.
+///
+/// # Errors
+/// As [`crate::load_blocks_many`].
+pub fn load_content_from(
+    stack: &PackStack,
+    files: &[ResourceId],
+) -> Result<(BlockRegistry, BlockTextures, Vec<Warning>), ContentError> {
+    let (registry, textures) = blocks::load_blocks_many(stack, files)?;
     let (block_textures, warnings) = build_textures(stack, &textures);
     Ok((registry, block_textures, warnings))
 }
@@ -807,6 +820,27 @@ mod tests {
         );
         // Air, grass, dirt, stone, sand, cobblestone, planks, log.
         assert_eq!(registry.len(), 8);
+    }
+
+    #[test]
+    fn load_content_is_the_single_file_case_of_load_content_from() {
+        let files = [blocks::base_blocks_file().unwrap()];
+        let (registry_a, textures_a, _) = load_content(&base_stack()).unwrap();
+        let (registry_b, textures_b, _) = load_content_from(&base_stack(), &files).unwrap();
+        // BlockTextures compares size, layer count and every pixel.
+        assert_eq!(textures_a, textures_b);
+        assert!(!textures_a.pixels.is_empty());
+        for name in ["base:grass", "base:dirt", "base:log"] {
+            let (a, b) = (registry_a.id(name).unwrap(), registry_b.id(name).unwrap());
+            for face in vox_world::Face::ALL {
+                assert_eq!(
+                    registry_a.face_textures().get(a, face),
+                    registry_b.face_textures().get(b, face)
+                );
+            }
+        }
+        assert_eq!(registry_a.len(), registry_b.len());
+        assert_eq!(registry_a.id("base:stone"), registry_b.id("base:stone"));
     }
 
     #[test]
