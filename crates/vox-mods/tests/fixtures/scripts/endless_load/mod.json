@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "id": "endless_load",
+  "version": "0.1.0",
+  "api": "1.0",
+  "entry": "endless_load:scripts/main.lua"
+}

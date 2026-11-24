@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "id": "memory_bomb",
+  "version": "0.1.0",
+  "api": "1.0",
+  "entry": "memory_bomb:scripts/main.lua"
+}

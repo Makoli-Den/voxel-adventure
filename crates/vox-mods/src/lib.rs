@@ -1,24 +1,40 @@
-//! The mod system, first step: reading mod manifests, finding mods on disk and putting them in
-//! load order (decision 0014).
+//! The mod system: reading mod manifests, finding mods on disk, putting them in load order and
+//! running their scripts in a Lua sandbox (decision 0014).
 //!
-//! A mod is a directory `<id>/` with a `mod.json` manifest and an `assets/` pack. This crate
-//! reads only the manifests: it runs no scripts and reads no assets. It knows nothing about
-//! rendering and is not used by the game yet.
+//! A mod is a directory `<id>/` with a `mod.json` manifest and an `assets/` pack, whose entry
+//! script runs in a Lua 5.4 state of its own. This crate knows nothing about rendering and is
+//! not used by the game yet.
 //!
 //! - [`manifest`]: [`ModManifest`], [`ModId`], [`ApiVersion`], [`Capability`] and their rules.
 //! - [`discover()`]: finds the mods of a folder.
 //! - [`resolve()`]: checks versions and dependencies and returns the load order (pure).
+//! - [`ModHost`]: runs the mods' scripts, each in its own sandbox with instruction, memory and
+//!   log limits, and disables a mod whose script fails.
 //! - [`error`]: the error types.
 
+mod api;
+mod budget;
 mod discover;
 pub mod error;
+mod host;
+mod library;
 pub mod manifest;
 mod resolve;
+mod sandbox;
+mod text;
 
+pub use api::BlockEventKind;
+pub use budget::{
+    HOOK_INTERVAL, MAX_CALL_WALL_TIME, MAX_HOST_CALL_DEPTH, MAX_INSTRUCTIONS_AT_LOAD,
+    MAX_INSTRUCTIONS_PER_CALL, MAX_LOAD_WALL_TIME,
+};
 pub use discover::{ASSETS_DIR, DiscoveredMod, MANIFEST_FILE, discover};
-pub use error::{ManifestProblem, ModError, ResolveError};
+pub use error::{MAX_FAILURE_MESSAGE_BYTES, ManifestProblem, ModError, ModFailure, ResolveError};
+pub use host::{MAX_SCRIPT_BYTES, MessageKind, ModHost, ModMessage, ModStatus};
+pub use library::BYTES_PER_INSTRUCTION;
 pub use manifest::{
     ApiVersion, Capability, MANIFEST_FORMAT, MAX_MANIFEST_BYTES, MOD_API_VERSION, ModId,
     ModManifest, RESERVED_MOD_ID,
 };
 pub use resolve::resolve;
+pub use sandbox::{MAX_LOG_LINE_BYTES, MAX_LOG_LINES_PER_CALL, MAX_MOD_MEMORY};
