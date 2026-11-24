@@ -2,7 +2,8 @@
 //!
 //! [`load_blocks`] reads `base:blocks.json` through the pack stack, resolves the texture keys
 //! of every block to one texture per face and fills a [`BlockRegistry`]. Ids follow the order
-//! of the file, so the same file always gives the same ids.
+//! of the file, so the same file always gives the same ids. [`load_blocks_many`] does the same
+//! for one blocks file per mod, into one registry and one texture list.
 
 use std::collections::HashMap;
 
@@ -183,7 +184,13 @@ fn parse_keys(
 /// texture id that is not a valid resource id, leaves a face without a texture, or repeats a
 /// block name.
 pub fn load_blocks(stack: &PackStack) -> Result<(BlockRegistry, Vec<ResourceId>), ContentError> {
-    load_blocks_from(stack, &ResourceId::parse(BLOCKS_FILE)?)
+    load_blocks_from(stack, &base_blocks_file()?)
+}
+
+/// The id of [`BLOCKS_FILE`], the one blocks file of the single-file loaders. The only place
+/// that parses the constant.
+pub(crate) fn base_blocks_file() -> Result<ResourceId, ContentError> {
+    Ok(ResourceId::parse(BLOCKS_FILE)?)
 }
 
 /// Like [`load_blocks`] for the blocks file `file`. The namespace of `file` is the namespace
@@ -195,22 +202,79 @@ pub fn load_blocks_from(
     stack: &PackStack,
     file: &ResourceId,
 ) -> Result<(BlockRegistry, Vec<ResourceId>), ContentError> {
-    let file = file.clone();
-    let text = stack.read_to_string(&file)?;
+    load_blocks_many(stack, std::slice::from_ref(file))
+}
+
+/// Like [`load_blocks_from`] for several blocks files, one per mod, in load order, filling ONE
+/// registry and ONE texture list.
+///
+/// Block ids are handed out in registration order across the files, so the ids depend on the
+/// order of `files`: the first file's blocks come first (after air) and the next file continues
+/// where the previous one stopped. A world stores these numbers, so the caller must pass the
+/// same order every time (the mod loader's dependency order). Each block is registered as
+/// `<namespace of its file>:<name>`. Texture layers are shared by texture id across all files:
+/// one layer per distinct id in order of first use, and [`MAX_LAYERS`] applies to the total.
+///
+/// # Errors
+/// As [`load_blocks`], where every error names the file it came from; additionally
+/// [`ContentError::DuplicateAcrossFiles`] when two different files register the same full
+/// name, and [`ContentError::FileListedTwice`] when `files` repeats a file. Every file must
+/// exist: the caller passes only the files it knows are there (see `PackStack::contains`).
+/// An empty `files` gives only air and the missing texture.
+pub fn load_blocks_many(
+    stack: &PackStack,
+    files: &[ResourceId],
+) -> Result<(BlockRegistry, Vec<ResourceId>), ContentError> {
+    // A repeated file would register every block twice; say so instead of reporting the first
+    // block as a duplicate.
+    for (index, file) in files.iter().enumerate() {
+        if files[..index].contains(file) {
+            return Err(ContentError::FileListedTwice { file: file.clone() });
+        }
+    }
+    let mut registry = BlockRegistry::new();
+    let mut layers = Layers::new()?;
+    // The file that registered each full block name. The registry alone rejects a duplicate;
+    // this map exists only to name the first file in the error.
+    let mut owners: HashMap<String, ResourceId> = HashMap::new();
+    for file in files {
+        register_file(stack, file, &mut registry, &mut layers, &mut owners)?;
+    }
+    Ok((registry, layers.textures))
+}
+
+/// Reads one blocks file and adds its blocks to `registry`, its textures to `layers`.
+fn register_file(
+    stack: &PackStack,
+    file: &ResourceId,
+    registry: &mut BlockRegistry,
+    layers: &mut Layers,
+    owners: &mut HashMap<String, ResourceId>,
+) -> Result<(), ContentError> {
+    let text = stack.read_to_string(file)?;
     let parse_error = |source| ContentError::Parse {
         file: file.clone(),
         source,
     };
     let header: Header = serde_json::from_str(&text).map_err(parse_error)?;
-    check_format(&file, header.format)?;
+    check_format(file, header.format)?;
     let parsed: BlocksFile = serde_json::from_str(&text).map_err(parse_error)?;
-    check_format(&file, parsed.format)?;
+    check_format(file, parsed.format)?;
 
-    let mut registry = BlockRegistry::new();
-    let mut layers = Layers::new()?;
     for block in &parsed.blocks {
-        check_name(&file, &block.name)?;
-        let keys = parse_keys(&file, &block.name, &block.textures)?;
+        check_name(file, &block.name)?;
+        let keys = parse_keys(file, &block.name, &block.textures)?;
+        let name = format!("{}{NAMESPACE_SEPARATOR}{}", file.namespace(), block.name);
+        // Checked before the textures are handed out, so a rejected block takes no layer. A
+        // repeat inside one file is the registry's `Register` error; only a clash between two
+        // files needs both file names.
+        if let Some(first) = owners.get(&name).filter(|first| *first != file) {
+            return Err(ContentError::DuplicateAcrossFiles {
+                name,
+                first: first.clone(),
+                second: file.clone(),
+            });
+        }
         let mut faces = [TextureLayer::MISSING; Face::COUNT];
         for face in Face::ALL {
             let missing_face = || ContentError::MissingFace {
@@ -223,7 +287,6 @@ pub fn load_blocks_from(
                 .layer_of(texture)
                 .ok_or_else(|| ContentError::TooManyTextures { file: file.clone() })?;
         }
-        let name = format!("{}:{}", file.namespace(), block.name);
         registry
             .register(&name, faces)
             .map_err(|source| ContentError::Register {
@@ -231,8 +294,9 @@ pub fn load_blocks_from(
                 block: block.name.clone(),
                 source,
             })?;
+        owners.insert(name, file.clone());
     }
-    Ok((registry, layers.textures))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -269,6 +333,13 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, contents).unwrap();
             Self(dir)
+        }
+
+        /// Adds the file `relative` (under the pack root) with `contents`.
+        fn add(&self, relative: &str, contents: &str) {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
         }
 
         fn pack(&self) -> DirPack {
@@ -564,6 +635,195 @@ mod tests {
             .map(|i| block(&format!("b{i}"), &format!(r#""all": "base:t{i}.png""#)))
             .collect();
         file_of(&blocks)
+    }
+
+    /// A pack with `base/blocks.json` = `base_json` and `mymod/blocks.json` = `mod_json`.
+    fn two_mod_pack(base_json: &str, mod_json: &str) -> TempPack {
+        let pack = TempPack::with_blocks(base_json);
+        pack.add("mymod/blocks.json", mod_json);
+        pack
+    }
+
+    fn two_files() -> [ResourceId; 2] {
+        [id("base:blocks.json"), id("mymod:blocks.json")]
+    }
+
+    #[test]
+    fn two_files_continue_the_ids_and_prefix_the_names() {
+        let pack = two_mod_pack(
+            &file_of(&[
+                block("a", r#""all": "base:x.png""#),
+                block("b", r#""all": "base:y.png""#),
+            ]),
+            &file_of(&[block("a", r#""all": "mymod:z.png""#)]),
+        );
+        let (registry, _) = load_blocks_many(&stack_of(&[&pack]), &two_files()).unwrap();
+        assert_eq!(registry.id("base:a"), Some(BlockId(1)));
+        assert_eq!(registry.id("base:b"), Some(BlockId(2)));
+        // The same local name in another namespace is a different block.
+        assert_eq!(registry.id("mymod:a"), Some(BlockId(3)));
+        assert_eq!(registry.len(), 4);
+    }
+
+    #[test]
+    fn a_single_file_through_load_blocks_many_equals_load_blocks_from() {
+        let pack = TempPack::with_blocks(&file_of(&[block("a", r#""all": "base:x.png""#)]));
+        let stack = stack_of(&[&pack]);
+        let one = load_blocks_many(&stack, &[id(BLOCKS_FILE)]).unwrap();
+        let other = load_blocks_from(&stack, &id(BLOCKS_FILE)).unwrap();
+        assert_eq!(one.1, other.1);
+        assert_eq!(one.0.id("base:a"), other.0.id("base:a"));
+        assert_eq!(one.0.len(), other.0.len());
+    }
+
+    #[test]
+    fn no_files_give_only_air_and_the_missing_texture() {
+        let (registry, textures) = load_blocks_many(&PackStack::new(), &[]).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(textures, [id(MISSING_TEXTURE)]);
+    }
+
+    #[test]
+    fn a_texture_shared_across_files_gets_one_layer() {
+        let pack = two_mod_pack(
+            &file_of(&[block("a", r#""all": "base:shared.png""#)]),
+            &file_of(&[
+                block("b", r#""all": "base:shared.png""#),
+                block("c", r#""all": "mymod:own.png""#),
+            ]),
+        );
+        let (registry, textures) = load_blocks_many(&stack_of(&[&pack]), &two_files()).unwrap();
+        assert_eq!(
+            textures,
+            [
+                id(MISSING_TEXTURE),
+                id("base:shared.png"),
+                id("mymod:own.png")
+            ]
+        );
+        assert_eq!(layers_of(&registry, "base:a"), [TextureLayer(1); 6]);
+        assert_eq!(layers_of(&registry, "mymod:b"), [TextureLayer(1); 6]);
+        assert_eq!(layers_of(&registry, "mymod:c"), [TextureLayer(2); 6]);
+    }
+
+    #[test]
+    fn ids_and_layers_depend_on_the_order_of_the_files() {
+        let pack = two_mod_pack(
+            &file_of(&[block("a", r#""all": "base:x.png""#)]),
+            &file_of(&[block("b", r#""all": "mymod:y.png""#)]),
+        );
+        let stack = stack_of(&[&pack]);
+        let [base, other] = two_files();
+        let (forward, forward_textures) =
+            load_blocks_many(&stack, &[base.clone(), other.clone()]).unwrap();
+        let (reverse, reverse_textures) = load_blocks_many(&stack, &[other, base]).unwrap();
+        assert_eq!(forward.id("base:a"), Some(BlockId(1)));
+        assert_eq!(forward.id("mymod:b"), Some(BlockId(2)));
+        assert_eq!(reverse.id("mymod:b"), Some(BlockId(1)));
+        assert_eq!(reverse.id("base:a"), Some(BlockId(2)));
+        assert_eq!(forward_textures[1], id("base:x.png"));
+        assert_eq!(reverse_textures[1], id("mymod:y.png"));
+    }
+
+    #[test]
+    fn a_name_in_two_files_is_rejected_naming_both() {
+        // `mymod/blocks.json` is read under the namespace `mymod`, so a clash needs the same
+        // namespace: two files of one namespace, as a mod with a second blocks file would have.
+        let pack = TempPack::with_blocks(&file_of(&[block("a", r#""all": "base:x.png""#)]));
+        pack.add(
+            "base/more.json",
+            &file_of(&[block("a", r#""all": "base:y.png""#)]),
+        );
+        let files = [id("base:blocks.json"), id("base:more.json")];
+        let error = load_blocks_many(&stack_of(&[&pack]), &files).unwrap_err();
+        assert!(
+            matches!(&error, ContentError::DuplicateAcrossFiles { name, first, second }
+                if name == "base:a"
+                    && first.to_string() == "base:blocks.json"
+                    && second.to_string() == "base:more.json"),
+            "{error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("base:blocks.json") && text.contains("base:more.json"));
+    }
+
+    #[test]
+    fn the_same_file_listed_twice_is_rejected_naming_it() {
+        let pack = TempPack::with_blocks(&file_of(&[block("a", r#""all": "base:x.png""#)]));
+        let files = [id(BLOCKS_FILE), id(BLOCKS_FILE)];
+        let error = load_blocks_many(&stack_of(&[&pack]), &files).unwrap_err();
+        assert!(
+            matches!(&error, ContentError::FileListedTwice { file } if file.to_string() == BLOCKS_FILE),
+            "{error}"
+        );
+        assert!(error.to_string().contains(BLOCKS_FILE));
+    }
+
+    #[test]
+    fn a_rejected_duplicate_takes_no_texture_layer() {
+        // The clashing block's texture must not be allocated before the clash is found; the
+        // error is the same either way, so this pins the order through a full layer list: the
+        // base file fills every layer, and the clash must be reported, not TooManyTextures.
+        let pack = TempPack::with_blocks(&file_with_textures(MAX_LAYERS - 1));
+        pack.add(
+            "base/more.json",
+            &file_of(&[block("b0", r#""all": "base:extra.png""#)]),
+        );
+        let files = [id("base:blocks.json"), id("base:more.json")];
+        let error = load_blocks_many(&stack_of(&[&pack]), &files).unwrap_err();
+        assert!(
+            matches!(error, ContentError::DuplicateAcrossFiles { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_error_in_a_later_file_names_that_file() {
+        let pack = two_mod_pack(
+            &file_of(&[block("a", r#""all": "base:x.png""#)]),
+            &file_of(&[block("pillar", r#""side": "mymod:s.png""#)]),
+        );
+        let error = load_blocks_many(&stack_of(&[&pack]), &two_files()).unwrap_err();
+        assert!(
+            matches!(&error, ContentError::MissingFace { file, block, .. }
+                if file.to_string() == "mymod:blocks.json" && block == "pillar"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("mymod:blocks.json"));
+    }
+
+    #[test]
+    fn a_missing_later_file_names_the_id() {
+        let pack = TempPack::with_blocks(&file_of(&[]));
+        let error = load_blocks_many(&stack_of(&[&pack]), &two_files()).unwrap_err();
+        assert!(matches!(error, ContentError::Read(_)));
+        assert!(error.to_string().contains("mymod:blocks.json"), "{error}");
+    }
+
+    #[test]
+    fn the_layer_cap_counts_the_textures_of_all_files() {
+        // The first file takes half of the free layers, the second file the other half plus one.
+        let free = MAX_LAYERS - 1;
+        let first = free / 2;
+        let ok_second = free - first;
+        let make = |count: usize| {
+            let blocks: Vec<String> = (0..count)
+                .map(|i| block(&format!("m{i}"), &format!(r#""all": "mymod:t{i}.png""#)))
+                .collect();
+            file_of(&blocks)
+        };
+        let base_json = file_with_textures(first);
+        let pack = two_mod_pack(&base_json, &make(ok_second));
+        let (_, textures) = load_blocks_many(&stack_of(&[&pack]), &two_files()).unwrap();
+        assert_eq!(textures.len(), MAX_LAYERS);
+
+        let pack = two_mod_pack(&base_json, &make(ok_second + 1));
+        let error = load_blocks_many(&stack_of(&[&pack]), &two_files()).unwrap_err();
+        assert!(
+            matches!(&error, ContentError::TooManyTextures { file }
+                if file.to_string() == "mymod:blocks.json"),
+            "{error}"
+        );
     }
 
     #[test]

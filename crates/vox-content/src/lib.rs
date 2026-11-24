@@ -8,9 +8,11 @@ mod blocks;
 mod error;
 mod textures;
 
-pub use blocks::{BLOCKS_FILE, BLOCKS_FORMAT, MISSING_TEXTURE, load_blocks, load_blocks_from};
+pub use blocks::{
+    BLOCKS_FILE, BLOCKS_FORMAT, MISSING_TEXTURE, load_blocks, load_blocks_from, load_blocks_many,
+};
 pub use error::ContentError;
 pub use textures::{
     BYTES_PER_PIXEL, BlockTextures, DEFAULT_TILE_SIZE, MAX_LAYERS, MAX_TEXTURE_FILE_BYTES,
-    MAX_TILE_SIZE, TextureProblem, Warning, build_textures, load_content,
+    MAX_TILE_SIZE, TextureProblem, Warning, build_textures, load_content, load_content_from,
 };
