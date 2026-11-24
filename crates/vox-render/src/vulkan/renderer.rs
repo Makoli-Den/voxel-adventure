@@ -21,11 +21,14 @@ use super::pipeline::{self, Pipeline};
 use super::render_pass::RenderPass;
 use super::retired::{self, Retired};
 use super::swapchain::{self, Swapchain};
+use super::texture::{BlockTextureSet, TextureArray};
 use super::timestamps;
 use crate::frustum::Frustum;
-use crate::interface::chunk::{CHUNK_ORIGIN_OFFSET, PUSH_CONSTANT_SIZE};
+use crate::interface::RESOURCE_SET;
+use crate::interface::chunk::{self, CHUNK_ORIGIN_OFFSET, PUSH_CONSTANT_SIZE};
 use crate::overlay::window_size_bytes;
-use crate::{OverlayRect, RenderError, RenderStats, Renderer, ShaderSources};
+use crate::texture::{missing_texture, missing_texture_pixels};
+use crate::{OverlayRect, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers};
 
 /// The sky: everything the meshes do not cover is cleared to this color.
 const SKY_COLOR: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
@@ -40,7 +43,9 @@ const FAR_DEPTH: f32 = 1.0;
 pub struct VulkanRenderer {
     // Rust drops fields in declaration order, so each object comes before the
     // ones it depends on: buffers, framebuffers (in the swapchain) and the pipelines
-    // before the render pass, everything before the device. Do not reorder.
+    // before the render pass, the pipelines before the texture set (their layout names
+    // its set layout), the set before the texture array it points at, everything before
+    // the device. Do not reorder.
     frames: Frames,
     /// The meshes that are candidates for drawing every frame (those outside the view are
     /// skipped), one per chunk that has something to draw.
@@ -54,6 +59,11 @@ pub struct VulkanRenderer {
     swapchain: Option<Swapchain>,
     chunk_pipeline: Pipeline,
     overlay_pipeline: Pipeline,
+    /// The descriptor set chunk draws sample the block textures through; always points
+    /// at `block_textures`.
+    block_texture_set: BlockTextureSet,
+    /// The block textures: the missing picture until `set_block_textures` is called.
+    block_textures: TextureArray,
     render_pass: RenderPass,
     gpu: Gpu,
     surface: Surface,
@@ -99,7 +109,13 @@ impl VulkanRenderer {
         let format = swapchain::surface_format(&surface, &gpu)?;
         let depth_format = depth::depth_format(&context, &gpu)?;
         let render_pass = RenderPass::new(gpu.device(), format, depth_format)?;
-        let chunk_pipeline = Pipeline::chunk(gpu.device(), &render_pass, shaders)?;
+        let block_texture_set = BlockTextureSet::new(gpu.device(), &chunk::INTERFACE)?;
+        let chunk_pipeline = Pipeline::chunk(
+            gpu.device(),
+            &render_pass,
+            shaders,
+            block_texture_set.layout(),
+        )?;
         let blending_supported = pipeline::supports_blending(&context, &gpu, format.format);
         let overlay_pipeline =
             Pipeline::overlay(gpu.device(), &render_pass, shaders, blending_supported)?;
@@ -111,6 +127,12 @@ impl VulkanRenderer {
             (width, height),
             None,
         )?;
+        let missing_pixels = missing_texture_pixels();
+        let block_textures = TextureArray::upload(&gpu, &missing_texture(&missing_pixels))?;
+        // SAFETY: the set was never bound. The upload finished (fence) and left the view in
+        // the shader-read layout; the array is stored next to the set, which the field
+        // order drops first.
+        unsafe { block_texture_set.point_at(block_textures.view()) };
         let mut frames = Frames::new(&gpu)?;
         if let Some(swapchain) = &swapchain {
             // SAFETY: nothing has been submitted yet, so the GPU is idle.
@@ -126,6 +148,8 @@ impl VulkanRenderer {
             swapchain,
             chunk_pipeline,
             overlay_pipeline,
+            block_texture_set,
+            block_textures,
             render_pass,
             gpu,
             surface,
@@ -174,7 +198,8 @@ impl VulkanRenderer {
     /// has a query pool, a timestamp is written before the first and after the last command.
     ///
     /// Returns the draw counts of the recorded frame (chunk meshes only).
-    // HOT PATH: runs every frame. Everything lives on the stack, nothing is allocated.
+    // HOT PATH: runs every frame. Everything lives on the stack, nothing is allocated; the
+    // texture set is bound once per frame, not per chunk.
     fn record_frame(
         &self,
         slot: FrameSlot,
@@ -213,6 +238,9 @@ impl VulkanRenderer {
         // The framebuffer belongs to the acquired image and was built for this render pass,
         // which both pipelines were built for too. Viewport and scissor are set before the
         // draws; both pipelines declare them dynamic, so binding the second keeps them. The
+        // texture set was allocated with the set layout the chunk layout has at
+        // `RESOURCE_SET`, points at a live array in the shader-read layout, and is only
+        // updated while the device is idle (`set_block_textures`). The
         // matrix push (bytes 0..64, vertex stage) lies inside the chunk layout's only
         // range, and it stays valid for every mesh draw because they all use this
         // pipeline's layout. The meshes live in `self`; a replaced mesh moves to `retired`
@@ -234,6 +262,14 @@ impl VulkanRenderer {
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.chunk_pipeline.handle(),
+                );
+                device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.chunk_pipeline.layout(),
+                    RESOURCE_SET,
+                    &[self.block_texture_set.set()],
+                    &[],
                 );
                 device.cmd_push_constants(
                     command_buffer,
@@ -499,6 +535,26 @@ impl Renderer for VulkanRenderer {
         if let Some(old) = std::mem::replace(&mut self.overlay, new) {
             self.retire(old.into_buffer());
         }
+        Ok(())
+    }
+
+    fn set_block_textures(&mut self, textures: &TextureLayers<'_>) -> Result<(), RenderError> {
+        // Validate and upload first: if either fails, the old textures stay bound and keep
+        // being drawn.
+        let new = TextureArray::upload(&self.gpu, textures)?;
+        // SAFETY: the device is alive. Frames in flight may still sample the old array
+        // through the set, which may not be updated while in use; idle ends that. If the
+        // wait fails, the set is left alone and `new` is dropped: its upload was proven
+        // finished (fence) and nothing else refers to it.
+        unsafe { self.gpu.device().device_wait_idle()? };
+        // Idle means every submitted frame finished, so no retired buffer is in use.
+        self.retired.release(self.frames.submitted());
+        // SAFETY: the device is idle and every command buffer is recorded and submitted in
+        // the same `render_frame` call, so no command buffer uses the set. The new array
+        // finished its upload in the shader-read layout and is stored right below.
+        unsafe { self.block_texture_set.point_at(new.view()) };
+        // The old array is dropped here; the set no longer points at it and the GPU is idle.
+        self.block_textures = new;
         Ok(())
     }
 

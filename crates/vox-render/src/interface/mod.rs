@@ -1,10 +1,11 @@
-//! What each pipeline provides to its shaders: vertex attributes and push constants.
+//! What each pipeline provides to its shaders: vertex attributes, push constants and
+//! descriptor resources.
 //!
 //! Every pipeline has one [`PipelineInterface`], defined in its own module. It is the
 //! single description of that contract: the Vulkan backend builds the pipeline's vertex
-//! input state and push-constant range from it, and the shader loader checks every
-//! shader of that pipeline against it, so a shader pack cannot ask for an input the
-//! pipeline does not feed.
+//! input state, push-constant range and descriptor set layout from it, and the shader
+//! loader checks every shader of that pipeline against it, so a shader pack cannot ask for
+//! an input the pipeline does not feed.
 
 pub(crate) mod chunk;
 pub(crate) mod overlay;
@@ -116,6 +117,39 @@ pub(crate) struct PushConstants {
     pub(crate) size: u32,
 }
 
+/// The kind of a descriptor resource, and therefore what the shader must declare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResourceKind {
+    /// A sampled 2D array image of floats (a `UNORM` format), without a sampler; the shader
+    /// declares a `texture2DArray`.
+    SampledImage2DArray,
+    /// A sampler on its own, without comparison; the shader declares a `sampler`.
+    Sampler,
+}
+
+impl ResourceKind {
+    /// The GLSL type a shader must declare for this resource.
+    pub(crate) const fn glsl_type(self) -> &'static str {
+        match self {
+            Self::SampledImage2DArray => "texture2DArray",
+            Self::Sampler => "sampler",
+        }
+    }
+}
+
+/// One descriptor resource a pipeline provides: `layout(set = ..., binding = ...)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResourceBinding {
+    /// The descriptor set.
+    pub(crate) set: u32,
+    /// The binding inside the set.
+    pub(crate) binding: u32,
+    /// What is bound there.
+    pub(crate) kind: ResourceKind,
+    /// The only shader stage that may use it.
+    pub(crate) stage: Stage,
+}
+
 /// Everything a pipeline provides to its shaders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PipelineInterface {
@@ -125,7 +159,15 @@ pub(crate) struct PipelineInterface {
     pub(crate) attributes: &'static [VertexAttribute],
     /// The push-constant range.
     pub(crate) push_constants: PushConstants,
+    /// Every descriptor resource, each at a distinct binding of set
+    /// [`RESOURCE_SET`]; empty if the pipeline has no descriptor set. A shader may use any
+    /// subset of them and nothing else.
+    pub(crate) resources: &'static [ResourceBinding],
 }
+
+/// The only descriptor set a pipeline has, if it has one. One set is all the pipelines
+/// need, and every Vulkan 1.0 device binds at least four (`maxBoundDescriptorSets`).
+pub(crate) const RESOURCE_SET: u32 = 0;
 
 impl PipelineInterface {
     /// The attribute at `location`, if the pipeline feeds one there.
@@ -134,6 +176,14 @@ impl PipelineInterface {
             .iter()
             .copied()
             .find(|attribute| attribute.location == location)
+    }
+
+    /// The resource at `binding` of descriptor set `set`, if the pipeline provides one there.
+    pub(crate) fn resource(&self, set: u32, binding: u32) -> Option<ResourceBinding> {
+        self.resources
+            .iter()
+            .copied()
+            .find(|resource| resource.set == set && resource.binding == binding)
     }
 }
 
@@ -184,6 +234,27 @@ mod tests {
             // Vulkan requires the size of a push-constant range to be a multiple of 4.
             assert_eq!(interface.push_constants.size % 4, 0);
         }
+    }
+
+    #[test]
+    fn resources_live_in_the_one_set_at_distinct_bindings() {
+        for interface in ALL {
+            for (i, a) in interface.resources.iter().enumerate() {
+                assert_eq!(a.set, RESOURCE_SET, "{a:?}");
+                for b in &interface.resources[i + 1..] {
+                    assert_ne!(a.binding, b.binding);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_chunk_pipeline_has_resources() {
+        assert!(overlay::INTERFACE.resources.is_empty());
+        let chunk = chunk::INTERFACE;
+        assert_eq!(chunk.resource(RESOURCE_SET, 0), Some(chunk.resources[0]));
+        assert_eq!(chunk.resource(RESOURCE_SET, 2), None);
+        assert_eq!(chunk.resource(1, 0), None);
     }
 
     #[test]

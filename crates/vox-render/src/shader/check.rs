@@ -2,11 +2,13 @@
 //!
 //! naga's validator proves a module is well formed, but not that it fits our pipeline.
 //! A shader that declares a larger push-constant block, an unknown vertex input or a
-//! descriptor resource would make pipeline creation invalid, which Vulkan does not
-//! have to report and a driver may crash on. These checks turn that into an error.
+//! descriptor resource the layout lacks would make pipeline creation invalid, which Vulkan
+//! does not have to report and a driver may crash on. These checks turn that into an error.
 //!
 //! Every check compares against the pipeline's own [`PipelineInterface`] from
-//! `crate::interface`. Checked: descriptor resources (none exist), push constants (only
+//! `crate::interface`. Checked: descriptor resources (every buffer, image or sampler the
+//! module declares, used or not, must be one the interface lists, at its set and binding,
+//! of its kind, in its stage), push constants (only
 //! in the interface's stage, at most its size in bytes), vertex inputs (locations and
 //! exact types of the interface's attributes, built-ins limited to vertex and instance
 //! index), and every fragment input location against a vertex output of the same scalar
@@ -16,11 +18,11 @@
 
 use naga::proc::Layouter;
 use naga::{
-    AddressSpace, Binding, BuiltIn, EntryPoint, Handle, Module, Scalar, ShaderStage, Type,
-    TypeInner,
+    AddressSpace, Binding, BuiltIn, EntryPoint, GlobalVariable, Handle, ImageClass, ImageDimension,
+    Module, Scalar, ScalarKind, ShaderStage, Type, TypeInner,
 };
 
-use crate::interface::{PipelineInterface, Stage};
+use crate::interface::{PipelineInterface, ResourceKind, Stage};
 
 /// A scalar or vector type: the only types the checks compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +40,7 @@ pub(super) fn check_stage(
     stage: ShaderStage,
     interface: &PipelineInterface,
 ) -> Result<(), String> {
-    check_no_resources(module)?;
+    check_resources(module, stage, interface)?;
     check_push_constants(module, stage, interface)?;
     if stage == ShaderStage::Vertex {
         check_vertex_inputs(module, interface)?;
@@ -79,21 +81,105 @@ pub(super) fn check_link(vertex: &Module, fragment: &Module) -> Result<(), Strin
     Ok(())
 }
 
-/// The pipeline layout has no descriptor sets, so buffers, textures and samplers do not exist.
-fn check_no_resources(module: &Module) -> Result<(), String> {
-    let uses_resources = module.global_variables.iter().any(|(_, global)| {
-        matches!(
-            global.space,
-            AddressSpace::Uniform | AddressSpace::Storage { .. } | AddressSpace::Handle
-        )
-    });
-    if uses_resources {
-        return Err(String::from(
-            "uniform and storage buffers, textures and samplers are not available: \
-             the pipeline has no descriptor sets",
+/// Every descriptor resource the module declares must be one the interface provides to
+/// this stage, declared with its exact kind. Unused declarations count too: rejecting them
+/// is simpler than proving they are unused, and costs a pack author nothing.
+fn check_resources(
+    module: &Module,
+    stage: ShaderStage,
+    interface: &PipelineInterface,
+) -> Result<(), String> {
+    for (_, global) in module.global_variables.iter() {
+        if is_resource(global.space) {
+            check_resource(module, global, stage, interface)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a global in `space` is a descriptor resource: a buffer, an image or a sampler.
+fn is_resource(space: AddressSpace) -> bool {
+    matches!(
+        space,
+        AddressSpace::Uniform | AddressSpace::Storage { .. } | AddressSpace::Handle
+    )
+}
+
+/// Checks one descriptor resource against the interface.
+fn check_resource(
+    module: &Module,
+    global: &GlobalVariable,
+    stage: ShaderStage,
+    interface: &PipelineInterface,
+) -> Result<(), String> {
+    let name = global.name.as_deref().unwrap_or("(unnamed)");
+    let Some(binding) = &global.binding else {
+        return Err(format!(
+            "descriptor resource `{name}` has no set and binding"
+        ));
+    };
+    let (set, index) = (binding.group, binding.binding);
+    let Some(provided) = interface.resource(set, index) else {
+        return Err(format!(
+            "descriptor resource `{name}` at set {set}, binding {index} does not exist; {}",
+            provided_resources(interface)
+        ));
+    };
+    if pipeline_stage(stage) != Some(provided.stage) {
+        return Err(format!(
+            "descriptor resource `{name}` at set {set}, binding {index} is only available in the {} stage",
+            provided.stage.name()
+        ));
+    }
+    if !is_kind(provided.kind, global.space, &module.types[global.ty].inner) {
+        return Err(format!(
+            "descriptor resource `{name}` at set {set}, binding {index} must be declared as `{}`",
+            provided.kind.glsl_type()
         ));
     }
     Ok(())
+}
+
+/// Lists the interface's resources for an error message.
+fn provided_resources(interface: &PipelineInterface) -> String {
+    if interface.resources.is_empty() {
+        return String::from("the pipeline has no descriptor resources");
+    }
+    let list: Vec<String> = interface
+        .resources
+        .iter()
+        .map(|r| {
+            format!(
+                "set {}, binding {} (`{}`, {} stage)",
+                r.set,
+                r.binding,
+                r.kind.glsl_type(),
+                r.stage.name()
+            )
+        })
+        .collect();
+    format!("the pipeline provides {}", list.join("; "))
+}
+
+/// Whether a global in `space` with type `inner` is exactly a resource of `kind`.
+fn is_kind(kind: ResourceKind, space: AddressSpace, inner: &TypeInner) -> bool {
+    if space != AddressSpace::Handle {
+        return false; // buffers: no pipeline provides one
+    }
+    match kind {
+        ResourceKind::SampledImage2DArray => matches!(
+            inner,
+            TypeInner::Image {
+                dim: ImageDimension::D2,
+                arrayed: true,
+                class: ImageClass::Sampled {
+                    kind: ScalarKind::Float,
+                    multi: false,
+                },
+            }
+        ),
+        ResourceKind::Sampler => matches!(inner, TypeInner::Sampler { comparison: false }),
+    }
 }
 
 /// Push constants exist only in the interface's stage, and only as many bytes as it has.

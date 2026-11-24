@@ -10,6 +10,7 @@ mod interface;
 mod overlay;
 mod shader;
 mod stats;
+mod texture;
 mod vulkan;
 
 use std::sync::Arc;
@@ -20,6 +21,7 @@ pub use error::RenderError;
 pub use overlay::OverlayRect;
 pub use shader::{ShaderSource, ShaderSources};
 pub use stats::RenderStats;
+pub use texture::TextureLayers;
 
 /// What the game needs from a renderer.
 pub trait Renderer {
@@ -92,6 +94,28 @@ pub trait Renderer {
     /// not fit in memory; the whole batch is refused. Another error is returned if the GPU
     /// cannot allocate or fill the buffer. The previous overlay is kept in every case.
     fn set_overlay(&mut self, rects: &[OverlayRect]) -> Result<(), RenderError>;
+
+    /// Replaces the block textures the chunk shaders sample: a 2D array, one layer per
+    /// texture, repeated across each face and filtered with `NEAREST` (no mipmaps yet).
+    ///
+    /// Until this is called, a single-layer magenta and black checker is bound, so drawing
+    /// is always valid. The pixels are copied to the GPU before this returns, so the caller
+    /// may drop them afterwards.
+    ///
+    /// **Waits for the GPU:** the upload waits for its own copy to finish, then for the whole
+    /// device to go idle before the new texture replaces the old one, because frames in
+    /// flight may still sample the old one. Meant for startup and pack reloads, never for
+    /// every frame.
+    ///
+    /// # Errors
+    /// Returns [`RenderError::InvalidTextures`] if the size is not a power of two or above
+    /// [`TextureLayers::MAX_SIZE`], the layer count is zero or above
+    /// [`TextureLayers::MAX_LAYERS`] or the device's limit, or the pixel slice does not have
+    /// exactly the expected length; nothing is allocated then. Another error is returned if
+    /// the GPU cannot allocate or upload the image, or if waiting for the GPU to go idle
+    /// before the swap fails (the new image is then freed and the old one stays bound). The
+    /// previous textures are kept in every case.
+    fn set_block_textures(&mut self, textures: &TextureLayers<'_>) -> Result<(), RenderError>;
 
     /// What the renderer drew and how long the GPU took. Cheap: returns a copy.
     ///

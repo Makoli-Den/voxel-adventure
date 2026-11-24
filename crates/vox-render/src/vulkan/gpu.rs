@@ -5,6 +5,7 @@ use ash::{khr, vk};
 use super::context::{Context, Surface};
 use super::timestamps::TimestampClock;
 use crate::RenderError;
+use crate::texture::TextureLimits;
 
 /// The GPU name shown when the driver reports one that is not valid text.
 const UNKNOWN_GPU_NAME: &str = "unknown GPU";
@@ -22,6 +23,8 @@ pub struct Gpu {
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// How to read the queue's timestamps; `None` if the queue cannot write them.
     timestamp_clock: Option<TimestampClock>,
+    /// How large the block texture array may be on this GPU.
+    texture_limits: TextureLimits,
 }
 
 impl Gpu {
@@ -69,6 +72,10 @@ impl Gpu {
             timestamp_valid_bits(instance, physical, queue_family),
             properties.limits.timestamp_period,
         );
+        let texture_limits = TextureLimits::of_device(
+            properties.limits.max_image_dimension2_d,
+            properties.limits.max_image_array_layers,
+        );
         let name = properties.device_name_as_c_str().map_or_else(
             |_| String::from(UNKNOWN_GPU_NAME),
             |n| n.to_string_lossy().into_owned(),
@@ -82,6 +89,7 @@ impl Gpu {
             name,
             memory_properties,
             timestamp_clock,
+            texture_limits,
         })
     }
 
@@ -118,6 +126,11 @@ impl Gpu {
     /// How to read the queue's timestamps, or `None` if it cannot write them.
     pub fn timestamp_clock(&self) -> Option<TimestampClock> {
         self.timestamp_clock
+    }
+
+    /// How large the block texture array may be on this GPU.
+    pub fn texture_limits(&self) -> TextureLimits {
+        self.texture_limits
     }
 }
 
