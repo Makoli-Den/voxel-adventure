@@ -689,3 +689,17 @@ of 16 blocks the whole tile is nearly flat (rows 0 and 1), so it is 23 to 45 qua
 tiles, and the share is meaningless; it is judged by its absolute cost. For comparison, a full
 chunk of the same terrain is 760 quads. The outward half of the skirts is dropped at draw time
 by the per-direction culling (S2b).
+
+## Tile selection (step S6 of decision 0015)
+
+One `select_tiles` call (the quadtree over the horizon disc, view radius 8), release build,
+averaged over 49 cameras, three quiet runs read 25 to 29 us at 2048 and 51 to 52 us at 4096; one run during other work read 62 and 73 us (negative columns and tile borders included). Run with
+`cargo test -p vox-game --release streaming::lod::tests::selection_cost -- --ignored --nocapture`.
+
+| Horizon | Time per selection | Leaves |
+|---|---|---|
+| 2048 | 26 us | 927 |
+| 4096 | 52 us | 1157 |
+
+Far below the 1 ms the decision expected. The leaf counts are about 45 percent above the
+estimate of the decision (650 and 800); see "S6 as built" in decision 0015.
