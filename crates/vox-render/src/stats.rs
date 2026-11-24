@@ -22,12 +22,17 @@ pub struct RenderStats {
     /// commands. A call that records nothing (minimized window, swapchain being rebuilt,
     /// window image out of date) leaves the previous counts in place. Zero before the
     /// first frame and for a frame without any mesh.
+    ///
+    /// A chunk in view whose faces all look away from the camera (per-direction culling)
+    /// gets no draw and is not counted.
     pub chunks_drawn: usize,
-    /// Draw calls of chunk meshes in that frame (one per chunk today); the overlay's draw
-    /// is not counted.
+    /// Draw calls of chunk meshes in that frame: one to three per chunk, one for each
+    /// contiguous run of the face directions that can face the camera (per-direction
+    /// culling); the overlay's draw is not counted.
     pub draw_calls: usize,
     /// Triangles in that frame: the sum over its draws of the index count divided by
-    /// three (the meshes are triangle lists), saturating at `u64::MAX`.
+    /// three (the meshes are triangle lists), saturating at `u64::MAX`. Only the face
+    /// directions actually drawn count, not the whole mesh.
     pub triangles: u64,
     /// Time the GPU spent on the most recent frame whose result has been read, or `None`
     /// if the device cannot measure it or no frame has finished yet.
@@ -47,11 +52,17 @@ pub struct RenderStats {
 }
 
 impl RenderStats {
-    /// Counts one indexed draw of a chunk mesh with `index_count` indices.
-    // HOT PATH: runs for every chunk every frame; two increments and one saturating add.
-    pub(crate) fn count_chunk_draw(&mut self, index_count: u32) {
-        // Cannot overflow: there is one draw per mesh, and the meshes live in memory.
+    /// Counts one chunk mesh that has at least one draw in the frame.
+    // HOT PATH: runs for every chunk drawn every frame; one increment.
+    pub(crate) fn count_chunk(&mut self) {
+        // Cannot overflow: the meshes live in memory.
         self.chunks_drawn += 1;
+    }
+
+    /// Counts one indexed draw of a chunk mesh with `index_count` indices.
+    // HOT PATH: runs for every draw every frame; one increment and one saturating add.
+    pub(crate) fn count_draw(&mut self, index_count: u32) {
+        // Cannot overflow: a mesh has at most a few draws, and the meshes live in memory.
         self.draw_calls += 1;
         let triangles = u64::from(index_count / INDICES_PER_TRIANGLE);
         self.triangles = self.triangles.saturating_add(triangles);
@@ -73,19 +84,22 @@ mod tests {
     }
 
     #[test]
-    fn each_draw_counts_a_chunk_a_call_and_its_triangles() {
+    fn each_draw_counts_a_call_and_its_triangles_and_chunks_count_apart() {
         let mut stats = RenderStats::default();
-        stats.count_chunk_draw(6); // one quad
-        stats.count_chunk_draw(36); // one cube
+        stats.count_chunk();
+        stats.count_draw(6); // one quad
+        stats.count_chunk();
+        stats.count_draw(12); // two quads of a cube
+        stats.count_draw(6); // a third quad, apart from the other two
         assert_eq!(stats.chunks_drawn, 2);
-        assert_eq!(stats.draw_calls, 2);
-        assert_eq!(stats.triangles, 14);
+        assert_eq!(stats.draw_calls, 3);
+        assert_eq!(stats.triangles, 8);
     }
 
     #[test]
     fn the_largest_mesh_counts_all_its_triangles() {
         let mut stats = RenderStats::default();
-        stats.count_chunk_draw(u32::MAX);
+        stats.count_draw(u32::MAX);
         assert_eq!(stats.triangles, u64::from(u32::MAX / 3));
     }
 
@@ -95,7 +109,7 @@ mod tests {
             triangles: u64::MAX - 1,
             ..RenderStats::default()
         };
-        stats.count_chunk_draw(u32::MAX);
+        stats.count_draw(u32::MAX);
         assert_eq!(stats.triangles, u64::MAX);
     }
 }

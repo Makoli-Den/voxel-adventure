@@ -31,6 +31,12 @@
 //! `chunk_origin + position` with no displacement. A shader pack that moves vertices
 //! (waves, wind) must keep them within the box, or chunks will disappear at the screen edges.
 //!
+//! The renderer also skips, per mesh, the face directions the camera cannot be in front of
+//! (per-direction culling, `crate::face_culling`): it assumes every triangle faces the
+//! direction of its group, as the vertex's face index says. A vertex shader must not turn or
+//! tilt faces (no rotation, no per-vertex displacement that changes a face's orientation), or
+//! faces that should show from the camera's side are not drawn.
+//!
 //! # Push constants
 //! One range for the vertex and the fragment stage, 112 bytes at offset 0. Floats are
 //! little-endian `f32`. Every push names both stages, so either shader may declare the

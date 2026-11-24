@@ -24,7 +24,8 @@ use super::swapchain::{self, Swapchain};
 use super::texture::{BlockTextureSet, TextureArray};
 use super::timestamps;
 use crate::chunk_push::{frame_bytes, origin_bytes};
-use crate::frustum::Frustum;
+use crate::face_culling::{DrawRanges, visible_ranges};
+use crate::frustum::{Frustum, chunk_box_max};
 use crate::interface::RESOURCE_SET;
 use crate::interface::chunk::{self, CHUNK_ORIGIN_OFFSET};
 use crate::overlay::window_size_bytes;
@@ -207,7 +208,9 @@ impl VulkanRenderer {
     /// Returns the draw counts of the recorded frame (chunk meshes only).
     // HOT PATH: runs every frame. Everything lives on the stack, nothing is allocated; the
     // texture set is bound and the matrix and fog pushed once per frame, not per chunk; per
-    // chunk only its offset from the camera is computed (three subtractions).
+    // chunk only its box relative to the camera is computed (three subtractions and three
+    // additions), tested against
+    // the frustum and against the six face directions (per-direction culling).
     fn record_frame(
         &self,
         slot: FrameSlot,
@@ -254,7 +257,8 @@ impl VulkanRenderer {
         // frame push (bytes 0..112, the stages of the range) is exactly the chunk layout's
         // only range, and it stays valid for every mesh draw because they all use this
         // pipeline's layout. The meshes live in `self`; a replaced mesh moves to `retired`
-        // and is freed only after the frames that may use it have finished. The overlay
+        // and is freed only after the frames that may use it have finished. Each mesh's
+        // draws are `visible_ranges` over that same mesh's face groups. The overlay
         // draw follows all mesh draws, see `record_overlay`. The query pool
         // is a timestamp pool with the frame's queries; it exists only if the queue writes
         // timestamps, and the fence wait proved the previous frame in this slot, its last
@@ -288,15 +292,24 @@ impl VulkanRenderer {
                     0,
                     &frame_push,
                 );
-                // Planes and boxes are both camera-relative, so they agree.
+                // Planes, boxes and the camera (at the origin) are all camera-relative, so
+                // they agree.
                 let frustum = Frustum::from_view_projection(&view_projection);
                 for (&pos, mesh) in &self.meshes {
                     let origin = self.camera.relative(pos.origin());
-                    if !frustum.may_see_chunk(origin) {
+                    let far_corner = chunk_box_max(origin);
+                    if !frustum.may_see_box(origin, far_corner) {
                         continue;
                     }
-                    self.record_mesh(command_buffer, origin, mesh);
-                    drawn.count_chunk_draw(mesh.index_count());
+                    let draws = visible_ranges(origin, far_corner, mesh.face_groups());
+                    if draws.as_slice().is_empty() {
+                        continue;
+                    }
+                    self.record_mesh(command_buffer, origin, mesh, &draws);
+                    drawn.count_chunk();
+                    for range in draws.as_slice() {
+                        drawn.count_draw(range.count);
+                    }
                 }
             }
             if let Some(overlay) = &self.overlay {
@@ -311,19 +324,24 @@ impl VulkanRenderer {
         Ok(drawn)
     }
 
-    /// Records the draw of a chunk whose origin lies at `relative_origin` from the camera.
+    /// Records the draws of a chunk whose origin lies at `relative_origin` from the camera:
+    /// one indexed draw per range of `draws`.
     ///
     /// # Safety
     /// `command_buffer` must be recording inside the render pass the pipeline was built
     /// for, with the pipeline bound, the frame's push constants pushed, and viewport and
     /// scissor set. `mesh` must stay alive until the GPU has finished the command buffer.
-    // HOT PATH: runs for every chunk every frame; only two binds, one 16-byte push and
-    // one indexed draw. The matrix and the fog are pushed once per frame, not per chunk.
+    /// `draws` must be the result of `visible_ranges` over `mesh.face_groups()` (of this
+    /// mesh, not another one): only then does every range lie inside its index data.
+    // HOT PATH: runs for every chunk in view every frame; only two binds, one 16-byte push
+    // and at most three indexed draws (one per axis, see `face_culling`). The matrix and the
+    // fog are pushed once per frame, not per chunk.
     unsafe fn record_mesh(
         &self,
         command_buffer: vk::CommandBuffer,
         relative_origin: [f32; 3],
         mesh: &GpuMesh,
+        draws: &DrawRanges,
     ) {
         let device = self.gpu.device();
         // SAFETY: the caller guarantees the recording state and the mesh lifetime. The
@@ -331,7 +349,9 @@ impl VulkanRenderer {
         // stages of the range, offset and size multiples of 4) lie inside the layout's only
         // range. The buffer was created with VERTEX and INDEX usage; the index offset is
         // a multiple of 4 as UINT32 indices require, and every index was checked against
-        // the vertex count.
+        // the vertex count. Every draw range lies inside the mesh's indices: the caller
+        // guarantees the ranges are parts of this mesh's face groups, which were checked at
+        // upload to add up to exactly its index count.
         unsafe {
             device.cmd_push_constants(
                 command_buffer,
@@ -347,7 +367,9 @@ impl VulkanRenderer {
                 mesh.index_offset(),
                 vk::IndexType::UINT32,
             );
-            device.cmd_draw_indexed(command_buffer, mesh.index_count(), 1, 0, 0, 0);
+            for range in draws.as_slice() {
+                device.cmd_draw_indexed(command_buffer, range.count, 1, range.first, 0, 0);
+            }
         }
     }
 

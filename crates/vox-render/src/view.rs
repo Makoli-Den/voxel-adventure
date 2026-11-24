@@ -108,7 +108,7 @@ mod tests {
     use glam::{Mat4, Vec3, Vec4};
 
     use super::*;
-    use crate::frustum::Frustum;
+    use crate::frustum::{Frustum, chunk_box_max};
 
     /// The fraction of a colour the built-in `chunk.frag` replaces by the fog colour, written
     /// the same way from the pushed values, to pin down what the values mean. The shader's
@@ -187,7 +187,10 @@ mod tests {
         let eye = Vec3::new(1_048_576.0, 60.0, -1_048_576.0);
         let camera = camera_at(eye);
         let frustum = Frustum::from_view_projection(&camera.view_projection);
-        let sees = |origin: [i32; 3]| frustum.may_see_chunk(camera.relative(origin));
+        let sees = |origin: [i32; 3]| {
+            let min = camera.relative(origin);
+            frustum.may_see_box(min, chunk_box_max(min))
+        };
         let [x, y, z] = eye.to_array().map(|value| value as i32);
         assert!(sees([x - 16, y - 16, z - 64]), "ahead");
         assert!(!sees([x - 16, y - 16, z + 64]), "behind");
