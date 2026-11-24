@@ -1,5 +1,5 @@
 //! The chunk pipeline's push constants as bytes, laid out as `crate::interface::chunk`
-//! describes: the whole block once per frame, then the origin once per chunk.
+//! describes: the whole block once per frame, then the origin and cell size once per mesh.
 //!
 //! Pure byte packing with no graphics API, so the layout is unit tested.
 
@@ -10,15 +10,16 @@ use crate::interface::chunk::{
 /// Bytes of the whole block, pushed once per frame.
 pub(crate) const FRAME_BYTES: usize = PUSH_CONSTANT_SIZE as usize;
 
-/// Bytes of the origin `vec4`, pushed once per chunk at [`CHUNK_ORIGIN_OFFSET`].
+/// Bytes of the origin `vec4`, pushed once per mesh at [`CHUNK_ORIGIN_OFFSET`].
 pub(crate) const ORIGIN_BYTES: usize = (FOG_OFFSET - CHUNK_ORIGIN_OFFSET) as usize;
 
-/// The cell size pushed in the origin's `w`: the edge of one mesh cell in blocks. Chunk
-/// meshes are made of whole blocks; coarser level-of-detail tiles come with decision 0015 S5.
+/// The cell size in the frame push's origin `w`: one block, that of a chunk. Every mesh
+/// pushes its own origin and cell size before it is drawn, so this value is never used by a
+/// draw; it only keeps the block well defined.
 const BLOCK_CELL_SIZE: f32 = 1.0;
 
 /// The whole block for one frame: the camera-relative view-projection, an origin at the
-/// camera (replaced by every chunk's own push), the fog `vec4` (`crate::Fog::push_values`)
+/// camera (replaced by every mesh's own push), the fog `vec4` (`crate::Fog::push_values`)
 /// and the fog colour. Each float little-endian, matrix columns one after another.
 // HOT PATH: runs once per frame; 28 floats written into a stack array.
 pub(crate) fn frame_bytes(
@@ -29,19 +30,20 @@ pub(crate) fn frame_bytes(
     let mut bytes = [0; FRAME_BYTES];
     write_floats(&mut bytes, view_projection.iter().flatten().copied());
     bytes[CHUNK_ORIGIN_OFFSET as usize..FOG_OFFSET as usize]
-        .copy_from_slice(&origin_bytes([0.0; 3]));
+        .copy_from_slice(&origin_bytes([0.0; 3], BLOCK_CELL_SIZE));
     write_floats(&mut bytes[FOG_OFFSET as usize..], fog);
     write_floats(&mut bytes[FOG_COLOR_OFFSET as usize..], fog_color);
     bytes
 }
 
-/// The origin `vec4` of one chunk: its corner relative to the camera in blocks, and the
-/// cell size in `w`, each float little-endian.
-// HOT PATH: runs for every chunk every frame; 4 floats written into a stack array.
-pub(crate) fn origin_bytes(relative_origin: [f32; 3]) -> [u8; ORIGIN_BYTES] {
+/// The origin `vec4` of one mesh: its tile's corner relative to the camera in blocks, and
+/// in `w` the tile's cell size in blocks (1 for a chunk, `2^level` for a tile), each float
+/// little-endian.
+// HOT PATH: runs for every mesh drawn every frame; 4 floats written into a stack array.
+pub(crate) fn origin_bytes(relative_origin: [f32; 3], cell_size: f32) -> [u8; ORIGIN_BYTES] {
     let [x, y, z] = relative_origin;
     let mut bytes = [0; ORIGIN_BYTES];
-    write_floats(&mut bytes, [x, y, z, BLOCK_CELL_SIZE]);
+    write_floats(&mut bytes, [x, y, z, cell_size]);
     bytes
 }
 
@@ -93,8 +95,22 @@ mod tests {
 
     #[test]
     fn the_origin_push_is_the_relative_corner_and_the_cell_size() {
-        let bytes = origin_bytes([-32.5, 64.0, 96.25]);
+        let bytes = origin_bytes([-32.5, 64.0, 96.25], 1.0);
         assert_eq!(vec4_at(&bytes, 0), [-32.5, 64.0, 96.25, 1.0]);
+    }
+
+    #[test]
+    fn every_level_pushes_its_cell_size_in_w() {
+        use vox_world::{ChunkPos, MAX_LOD_LEVEL, TilePos};
+
+        use crate::tile_box::cell_size_f32;
+        let expected = [1.0, 2.0, 4.0, 8.0, 16.0];
+        for level in 0..=MAX_LOD_LEVEL {
+            let tile = TilePos::new(level, ChunkPos::new(-1, 0, 3));
+            let bytes = origin_bytes([1.0, 2.0, 3.0], cell_size_f32(tile));
+            let pushed = vec4_at(&bytes, 0);
+            assert_eq!(pushed, [1.0, 2.0, 3.0, expected[usize::from(level)]]);
+        }
     }
 
     #[test]

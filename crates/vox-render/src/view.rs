@@ -22,6 +22,13 @@ pub struct CameraView {
     /// `glam::Mat4::to_cols_array_2d()`. It maps an offset from [`Self::position`] in
     /// blocks to Vulkan clip space (Y down, depth 0..1), for example
     /// `projection * look_at(Vec3::ZERO, forward, Vec3::Y)`.
+    ///
+    /// The depth runs the way [`crate::Renderer::depth_mode`] says: with
+    /// [`crate::DepthMode::Standard`] the near plane maps to depth 0 and the far plane to 1;
+    /// with [`crate::DepthMode::Reversed`] the near plane maps to **1** and the far plane to
+    /// **0**, which is the same perspective built with near and far swapped (glam:
+    /// `perspective(fov, aspect, far, near)`). With a matrix of the other mode the depth
+    /// test keeps the farthest face instead of the nearest.
     pub view_projection: [[f32; 4]; 4],
     /// Where the eye is, in blocks: the point offsets for [`Self::view_projection`] are
     /// taken from, and the point fog distances are measured from.
@@ -108,7 +115,9 @@ mod tests {
     use glam::{Mat4, Vec3, Vec4};
 
     use super::*;
-    use crate::frustum::{Frustum, chunk_box_max};
+    use crate::frustum::Frustum;
+    use crate::tile_box::{FULL_HEIGHT, tile_box};
+    use vox_world::{ChunkPos, TilePos};
 
     /// The fraction of a colour the built-in `chunk.frag` replaces by the fog colour, written
     /// the same way from the pushed values, to pin down what the values mean. The shader's
@@ -188,8 +197,9 @@ mod tests {
         let camera = camera_at(eye);
         let frustum = Frustum::from_view_projection(&camera.view_projection);
         let sees = |origin: [i32; 3]| {
-            let min = camera.relative(origin);
-            frustum.may_see_box(min, chunk_box_max(min))
+            let tile = TilePos::chunk(ChunkPos::ORIGIN);
+            let (min, max) = tile_box(camera.relative(origin), tile, FULL_HEIGHT);
+            frustum.may_see_box(min, max)
         };
         let [x, y, z] = eye.to_array().map(|value| value as i32);
         assert!(sees([x - 16, y - 16, z - 64]), "ahead");

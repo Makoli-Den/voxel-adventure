@@ -167,7 +167,7 @@ Caves and cave culling; uniform or palette chunk storage; the two-stage generati
 ## S2b as built
 - **The renderer copies the groups at upload.** `GpuMesh` keeps the seven boundaries of the six direction groups (`FaceGroups` in `vox-render/src/face_culling.rs`, taken from `ChunkMesh::face_index_range`), so the groups are contiguous and in `Face::ALL` order by construction. `set_chunk_mesh` refuses a mesh whose `face_quads` do not add up to its indices (six per quad) with `InvalidMesh`, like an index past the last vertex. A full-range fallback was rejected: the counts are the mesh's contract, and drawing such a mesh whole would hide a broken mesher together with the saving. Only the sum is checked (it keeps every draw inside the index buffer); that each group's quads really face its direction is the mesher's contract.
 - **The test** per direction is one comparison on the chunk's camera-relative box (the same box the frustum test uses): `+X` is drawn when `min.x <= 0`, `-X` when `max.x >= 0`, and so on for Y and Z. The camera on a face plane counts as in front, NaN draws everything. The box comes from the same rounded relative origin the vertex shader adds the positions to, so rounding cannot move a plane across the camera. A shader pack that moves vertices out of the chunk box would break the assumption; the built-in shader does not.
-- **Merging.** Opposite directions are neighbours in `Face::ALL` (pinned by a test), so the directions drawn for one axis are always one contiguous range; drawn groups that touch in the buffer (empty groups between them take no room) become one draw. A mesh needs one to three draws; a camera inside a chunk's box on every axis draws it in one. A mesh with nothing facing the camera is not drawn at all and not counted in `chunks_drawn`.
+- **Merging.** Opposite directions are neighbours in `Face::ALL` (pinned by a test), so the directions drawn for one axis are always one contiguous range; drawn groups that touch in the buffer (empty groups between them take no room) become one draw. A mesh needs one to three draws; a camera inside a chunk's box on every axis draws it in one. A mesh with nothing facing the camera is not drawn at all and not counted in `chunks_drawn` (`meshes_drawn` since S5).
 - **Stats.** `draw_calls` counts the ranged draws, `triangles` only the drawn ranges, so the HUD's "Drawn" line shows the saving.
 - **Measured** (`docs/benchmarks.md`, "Per-direction culling"): the screenshots at the start view are pixel-identical to `main` at radius 8, 12 and 16 outside the HUD panel; drawn triangles drop by 27 to 29 percent (radius 8: 71 k to 52 k; 16: 262 k to 186 k); FPS rises by 2 to 25 percent (radius 16 standing about 1675 to 2090), GPU time at radius 16 by about a third, and the per-frame `work` falls. `work` includes waiting for the GPU, so the culling's CPU cost was timed apart (ignored test `per_chunk_cpu_cost`): about 2.1 ns more per mesh (8.2 instead of 6.1 ns), 0.4 us per frame for about 200 meshes, 0.2 percent of `work` at radius 8. The driver's cost of the extra draw calls (about 40 percent more draws) is not isolated: that part of the CPU criterion is bounded only by the falling `work` here and is deferred to S9.
 
@@ -216,6 +216,55 @@ Caves and cave culling; uniform or palette chunk storage; the two-stage generati
 - **Consequences for the budget (e).** The default radius goes back from 12 to 8 when LOD lands (S7): the horizon replaces the big full-detail radius, and 934 meshes fit the budget of 1500. A radius up to 16 is allowed only with the horizon clamped so that the mesh count stays at most 3000: `max_horizon_for(radius)` does this by code (bisection over steps of 256 blocks, a few selections, run when an option changes). It gives 4096 up to radius 14, 3840 at 15, 3328 at 16, 2048 at 18 and 768 at 27 to 30. GPU mesh memory at 30 KB a tile: about 28 MB at 934 meshes and about 90 MB at 3000; worker time to fill 934 tiles at 0.2 ms is about 12 ms over 15 workers. S7 checks these against the table.
 - **`diff`:** `added` is in load order (nearest first), `removed` is farthest first (unload order). A level change is one tile removed and four added (or the reverse) with no link between them; S8 must derive the replacement from the tile rectangles. One chunk step changes at most 6 leaves inside one level-1 tile (the horizon edge only) and at most 48, 93, 141 and 141 when a border of level 1, 2, 3 and 4 is crossed (radius 8, horizon 2048).
 - **Cost of one selection:** about 26 us at horizon 2048 and 52 us at 4096 (release, `docs/benchmarks.md`).
+
+## S5 as built
+- **API.** `Renderer::set_tile_mesh(TilePos, &ChunkMesh)` and `remove_tile_mesh(TilePos)`
+  replace the chunk calls: one `HashMap<TilePos, GpuMesh>`, one draw loop, one pipeline; the game
+  passes `TilePos::chunk(pos)` at its four call sites. Vertex positions count cells; the
+  renderer places a mesh at `TilePos::origin()` and pushes `cell_size(level)` in the origin's
+  `w`. `chunk.vert` computes `local = position * w` (blocks) and derives both the placement and
+  the texture coordinates from it, so a texture repeats once per block at every level (a level-2
+  quad `w` cells wide shows `4 * w` repeats; pinned by a shader test with the built-in tables).
+  At level 0 `w` is 1.0 and the product is exact, so chunks are placed and textured exactly as
+  before.
+- **Mesh box (`vox-render/src/tile_box.rs`).** X and Z span the tile (`TilePos::extent()`
+  blocks), Y the lowest to highest vertex, taken once at upload (`MeshHeight`) and scaled by the
+  cell size. *Deviation:* (c) asks for this for tiles; it is used for chunks too (one rule, one
+  loop). The picture does not change (the box still holds every face, computed with the same
+  float operations as the shader), and the start view draws 4 to 6 percent fewer triangles.
+  The frustum test and the per-direction culling both use this box.
+- **Reversed Z.** The depth format is chosen as before (`D32_SFLOAT` first); on `D32_SFLOAT` the
+  renderer runs reversed (clear to 0, compare `GREATER`), on the 24-bit formats standard (clear
+  to 1, `LESS`). `Renderer::depth_mode()` reports the `DepthMode`; the game builds the matching
+  projection (`Camera::view_projection(.., depth)`: glam's Vulkan `perspective` with near and far
+  swapped for reversed). The far plane stays the fog end plus a margin. `DepthMode::max_horizon()`
+  is `None` for reversed and `Some(D24_MAX_HORIZON)` (1024 blocks) for standard; today's largest
+  far plane (radius 30, about 920 blocks) is below it, so the game does not read it yet: **S7
+  must clamp the horizon with it.** A device with `D32_SFLOAT` never runs standard depth now.
+- **Frustum planes need no change**: Vulkan clips to `0 <= z <= w` in both modes, so the two
+  depth planes extracted are the same planes of the scene with near and far swapped. Tested:
+  over 3 directions, 3 box sizes and a grid from behind the camera to beyond 2,000 blocks, the
+  reversed and standard matrices cull the same boxes, except within 1 percent of the far plane,
+  where the standard one is about 2 blocks off at 2,000 (f32 cancellation of nearly equal rows)
+  and the reversed one is exact.
+- **Statistics.** `RenderStats::triangles_per_level` (`[u64; LOD_LEVEL_COUNT]`, 5 entries)
+  adds up to `triangles`. `chunks_drawn` is renamed `meshes_drawn` (it counts chunk and tile
+  meshes) and the HUD's "Drawn" line says "meshes"; the run summary ends with the last frame's
+  triangles by level.
+- **Placement in one place.** `tile_box::placement(camera, tile, height)` gives a mesh's
+  camera-relative origin, cell size and box; the renderer calls it once per mesh, and a test
+  pins a level-2 tile at negative coordinates.
+- **Measured** (`docs/benchmarks.md`, "Tiles and reversed Z in the renderer"): at the start view
+  3 of 356,700 pixels outside the HUD differ from `main` at radius 8 and 12, single pixels on
+  face edges; with reversed Z forced off 0 differ, so they are depth ties resolved the other way
+  by the reversed mapping, not a change of the tile path. *Deviation:* the plan said "identical".
+  FPS and GPU time are not lower (radius 12 `--fly 8`: 2494 to 2580 FPS, GPU 0.16 to 0.13 ms).
+  A temporary check (reverted) uploaded 423 level-2 tiles around the full-detail area: no
+  cracks at the borders between chunks and tiles, one texture repeat per block on the tiles,
+  no z-fighting out to about 2,000 blocks.
+- **Not verified:** no Khronos validation layer is installed on the development machine, so
+  no validation run; the standard-depth path on a real 24-bit-only device (the fallback was
+  exercised only by forcing the mode on `D32_SFLOAT`); a low-end GPU (S9).
 
 ## Answers to the open questions
 - The world bounds are -512 and 512 (named parameters, easy to change).

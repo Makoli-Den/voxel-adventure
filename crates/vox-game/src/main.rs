@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 use glam::Vec3;
 use vox_content::BlockTextures;
 use vox_render::{
-    CameraView, Fog, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers,
+    CameraView, DepthMode, Fog, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers,
     create_renderer,
 };
-use vox_world::{ChunkMesh, World, raycast_with};
+use vox_world::{ChunkMesh, TilePos, World, raycast_with};
 use winit::application::ApplicationHandler;
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
@@ -84,7 +84,7 @@ const LOOK_SENSITIVITY: f32 = 0.0025;
 struct FillReport {
     /// When streaming started.
     started: Instant,
-    /// Time spent in `set_chunk_mesh` so far.
+    /// Time spent in `set_tile_mesh` so far.
     upload_time: Duration,
     /// Meshes uploaded so far.
     uploads: u32,
@@ -171,6 +171,9 @@ struct App {
     fog: Fog,
     /// Distance of the camera's far plane in blocks, just beyond the fog end.
     far_plane: f32,
+    /// How the renderer maps depth, so the projection matches it; read from the renderer
+    /// when it is created.
+    depth_mode: DepthMode,
     /// The player's box. While flying it only follows the camera; while walking it moves the
     /// camera.
     body: Body,
@@ -235,6 +238,9 @@ impl App {
             camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
             fog,
             far_plane: view_distance::far_plane(fog),
+            // A placeholder: `start` overwrites it from the renderer before the first
+            // `set_camera`, and no projection is built before the renderer exists.
+            depth_mode: DepthMode::Standard,
             body: Body::from_eye(CAMERA_START.to_array()),
             walking: false,
             controls: Controls::default(),
@@ -277,6 +283,7 @@ impl App {
                 })?;
         }
         renderer.set_fog(self.fog);
+        self.depth_mode = renderer.depth_mode();
         renderer.set_camera(&self.camera_view(size.width, size.height));
 
         // No chunk is loaded here: the first frames stream them in, nearest first.
@@ -361,10 +368,16 @@ impl App {
     }
 
     /// What the renderer needs of the camera for a window of `width` by `height` pixels:
-    /// the matrix around the eye with the far plane just beyond the fog, and the eye.
+    /// the matrix around the eye with the far plane just beyond the fog, in the renderer's
+    /// depth mode, and the eye.
     fn camera_view(&self, width: u32, height: u32) -> CameraView {
         CameraView {
-            view_projection: self.camera.view_projection(width, height, self.far_plane),
+            view_projection: self.camera.view_projection(
+                width,
+                height,
+                self.far_plane,
+                self.depth_mode,
+            ),
             position: self.camera.position().to_array(),
         }
     }
@@ -382,7 +395,7 @@ impl App {
         let changes = streamer.update(area::chunk_of(self.camera.position().to_array()))?;
         for column in &changes.removed {
             for pos in column.chunks() {
-                renderer.remove_chunk_mesh(pos);
+                renderer.remove_tile_mesh(TilePos::chunk(pos));
             }
         }
         let arrived: Vec<_> = changes.loaded.iter().map(|loaded| loaded.column).collect();
@@ -402,7 +415,7 @@ impl App {
             .iter()
             .filter(|(pos, _)| !kept.contains(pos))
         {
-            renderer.set_chunk_mesh(*pos, mesh)?;
+            renderer.set_tile_mesh(TilePos::chunk(*pos), mesh)?;
             uploaded += 1;
         }
         if uploaded > 0 {
@@ -425,7 +438,7 @@ impl App {
                 pos,
                 &mut self.edit_scratch,
             ) {
-                renderer.set_chunk_mesh(pos, &self.edit_scratch)?;
+                renderer.set_tile_mesh(TilePos::chunk(pos), &self.edit_scratch)?;
             }
         }
         if let Some(line) = self.fill.line_once(streamer) {
@@ -498,7 +511,7 @@ impl App {
                 &mut self.edit_scratch,
             ) {
                 // An empty mesh removes the chunk's entry, so a chunk that was dug empty vanishes.
-                renderer.set_chunk_mesh(*pos, &self.edit_scratch)?;
+                renderer.set_tile_mesh(TilePos::chunk(*pos), &self.edit_scratch)?;
             }
         }
         if created > 0 {
@@ -693,12 +706,13 @@ impl App {
         }
     }
 
-    /// The figures of the whole run, for the line printed when the game ends.
+    /// The figures of the whole run, for the line printed when the game ends, and the
+    /// triangles the last frame drew per tile level (decision 0015 budgets them).
     fn run_summary(&self) -> Option<String> {
         let summary = self.run_frames.summary()?;
         Some(format!(
-            "Run summary (frames: {}, play time: {:.1?}): {summary}",
-            summary.frames, summary.covered
+            "Run summary (frames: {}, play time: {:.1?}): {summary} | last frame triangles by level {:?}",
+            summary.frames, summary.covered, self.render_stats.triangles_per_level
         ))
     }
 

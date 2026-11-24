@@ -743,3 +743,52 @@ averaged over 49 cameras, three quiet runs read 25 to 29 us at 2048 and 51 to 52
 
 Far below the 1 ms the decision expected. The leaf counts are about 45 percent above the
 estimate of the decision (650 and 800); see "S6 as built" in decision 0015.
+
+## Tiles and reversed Z in the renderer (2026-11-24, step S5 of decision 0015)
+
+Development machine (RTX 4070 SUPER), release builds of `main` (before, exported with
+`git archive` and built apart) and this step (after), start view, the window as the game opens
+it, alternating runs of 8 s each. The game still streams only full-detail chunks; tiles are
+drawn only by the temporary check below.
+
+**Picture at level 0.** Screenshots at the start view, compared outside the HUD panel (356,700
+pixels): **3 pixels differ** at radius 8 and the same 3 at radius 12, isolated single pixels
+on edges where two faces meet. With reversed Z switched off by a temporary edit (standard depth
+on the same `D32_SFLOAT` buffer, everything else of this step in place) **0 pixels differ**, so
+the tile path (cell size, mesh boxes, one map keyed by `TilePos`) is pixel-identical and the 3
+pixels are depth ties at shared edges that the other depth mapping resolves the other way.
+
+**Drawn at the start view.** The box of every mesh now spans only its vertices on Y (decision
+0015 (c), applied to chunks too), so a few more chunks fail the frustum test and a few more top
+groups fail the per-direction test; the picture does not change:
+
+| Radius | Before | After |
+|---|---|---|
+| 8 | 59 chunks, 51,810 triangles | 56 meshes, 48,638 triangles (-6 percent) |
+| 12 | 132 chunks, 111,650 triangles | 127 meshes, 106,904 triangles (-4 percent) |
+
+**Frame rate** (three runs each, median first; the GPU column is the run summary's average):
+
+| Case | FPS before | FPS after | GPU before | GPU after | `work` before | `work` after |
+|---|---|---|---|---|---|---|
+| radius 8 standing | 3337 (3393, 3337, 3290) | 3443 (3376, 3443, 3451) | 0.06 ms | 0.06 ms | 0.22 ms | 0.22 ms |
+| radius 12 standing | 2618 (2632, 2617, 2618) | 2678 (2650, 2678, 2726) | 0.13 ms | 0.12 ms | 0.30 ms | 0.30 ms |
+| radius 12 `--fly 8` | 2494 (2515, 2494, 2477) | 2580 (2580, 2568, 2581) | 0.16 ms | 0.13 ms | 0.33 ms | 0.31 ms |
+
+Not lower anywhere; at radius 12 slightly higher, in line with the fewer triangles above (a
+hypothesis: the runs do not isolate the cause). The radius-12 FPS of `main` here are lower
+than in the S3b table above (same code), so compare only inside this table.
+
+**Tiles next to chunks (temporary check, reverted).** A local edit uploaded level-2 tiles
+(`generate_lod_chunk` + `build_tile_mesh_into` through `set_tile_mesh`) over every level-2 tile
+around the camera that holds no loaded column, out to about 2,200 blocks, and filled the
+remaining columns of the tiles that hold loaded ones with full-detail chunks, so tiles and
+chunks meet along tile borders; fog off, far plane 4,000 blocks. With 423 tiles at radius 8
+from the start view: 1,629 FPS, GPU 0.36 ms, last frame 77,144 triangles at level 0 and 181,578
+at level 2 (`Run summary ... last frame triangles by level`). The screenshots show no crack
+and no sky between chunks and tiles or between tiles; the 4-block walls of level-2 steps show
+four texture repeats each (one per block), lined up with the chunks beside them; terrain up
+to about 2,000 blocks away shows no z-fighting with reversed Z. The same far view with standard
+depth forced differs in 884 pixels of the whole image and shows no visible fighting either:
+level-2 faces are at least 4 blocks apart, more than the computed 2.5-block step at 2048, so
+this scene does not provoke it.

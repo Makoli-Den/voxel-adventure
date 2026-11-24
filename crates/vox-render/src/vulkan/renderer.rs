@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use vox_world::{ChunkMesh, ChunkPos};
+use vox_world::{ChunkMesh, TilePos};
 
 use super::NO_TIMEOUT;
 use super::buffer::Buffer;
@@ -25,22 +25,24 @@ use super::texture::{BlockTextureSet, TextureArray};
 use super::timestamps;
 use crate::chunk_push::{frame_bytes, origin_bytes};
 use crate::face_culling::{DrawRanges, visible_ranges};
-use crate::frustum::{Frustum, chunk_box_max};
+use crate::frustum::Frustum;
 use crate::interface::RESOURCE_SET;
 use crate::interface::chunk::{self, CHUNK_ORIGIN_OFFSET};
 use crate::overlay::window_size_bytes;
 use crate::texture::{missing_texture, missing_texture_pixels};
+use crate::tile_box::{Placement, placement};
 use crate::{
-    CameraView, Fog, OverlayRect, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers,
+    CameraView, DepthMode, Fog, OverlayRect, RenderError, RenderStats, Renderer, ShaderSources,
+    TextureLayers,
 };
 
 /// The sky: everything the meshes do not cover is cleared to this color, and it is the fog
 /// color too, so a fully fogged face looks exactly like the sky behind it.
 const SKY_COLOR: [f32; 4] = [0.53, 0.81, 0.92, 1.0];
 
-/// The farthest depth: the depth buffer is cleared to it and the viewport's depth range
-/// ends at it, so the chunk pipeline's LESS test passes for anything drawn.
-const FAR_DEPTH: f32 = 1.0;
+/// Where the viewport's depth range ends, in both depth modes: the projection maps the view
+/// volume to depths 0 to 1, and which end is near is up to `DepthMode`.
+const MAX_DEPTH: f32 = 1.0;
 
 /// Draws into a window with Vulkan.
 ///
@@ -53,8 +55,8 @@ pub struct VulkanRenderer {
     // the device. Do not reorder.
     frames: Frames,
     /// The meshes that are candidates for drawing every frame (those outside the view are
-    /// skipped), one per chunk that has something to draw.
-    meshes: HashMap<ChunkPos, GpuMesh>,
+    /// skipped), one per chunk or tile that has something to draw.
+    meshes: HashMap<TilePos, GpuMesh>,
     /// The overlay drawn over every frame, `None` while there is none.
     overlay: Option<GpuOverlay>,
     /// Buffers of replaced and removed meshes and overlays that frames in flight may
@@ -79,6 +81,9 @@ pub struct VulkanRenderer {
     size: (u32, u32),
     /// Set when the swapchain no longer matches the window and must be rebuilt.
     needs_recreate: bool,
+    /// How the depth buffer maps distance, chosen with its format; fixed for the renderer's
+    /// life, so the pipeline's compare op and the clear value always match it.
+    depth_mode: DepthMode,
     /// The camera, as given to [`Renderer::set_camera`].
     camera: CameraView,
     /// The fog, as given to [`Renderer::set_fog`].
@@ -114,7 +119,7 @@ impl VulkanRenderer {
         let surface = unsafe { Surface::new(&context, display, window_handle)? };
         let gpu = Gpu::new(&context, &surface)?;
         let format = swapchain::surface_format(&surface, &gpu)?;
-        let depth_format = depth::depth_format(&context, &gpu)?;
+        let (depth_format, depth_mode) = depth::depth_setup(&context, &gpu)?;
         let render_pass = RenderPass::new(gpu.device(), format, depth_format)?;
         let block_texture_set = BlockTextureSet::new(gpu.device(), &chunk::INTERFACE)?;
         let chunk_pipeline = Pipeline::chunk(
@@ -122,6 +127,7 @@ impl VulkanRenderer {
             &render_pass,
             shaders,
             block_texture_set.layout(),
+            depth_mode,
         )?;
         let blending_supported = pipeline::supports_blending(&context, &gpu, format.format);
         let overlay_pipeline =
@@ -152,6 +158,7 @@ impl VulkanRenderer {
             overlay: None,
             retired: Retired::new(),
             needs_recreate: swapchain.is_none(),
+            depth_mode,
             swapchain,
             chunk_pipeline,
             overlay_pipeline,
@@ -201,16 +208,16 @@ impl VulkanRenderer {
 
     /// Records one frame into the command buffer of `slot`: the render pass clears the
     /// swapchain image `image_index` to the sky color and the depth buffer to the far
-    /// plane, then the chunk meshes are drawn, then the overlay over them. The render pass
+    /// plane of the depth mode, then the chunk and tile meshes are drawn, then the overlay over them. The render pass
     /// also moves the image to the present layout, so no barriers are needed. If the slot
     /// has a query pool, a timestamp is written before the first and after the last command.
     ///
-    /// Returns the draw counts of the recorded frame (chunk meshes only).
+    /// Returns the draw counts of the recorded frame (meshes only, not the overlay).
     // HOT PATH: runs every frame. Everything lives on the stack, nothing is allocated; the
-    // texture set is bound and the matrix and fog pushed once per frame, not per chunk; per
-    // chunk only its box relative to the camera is computed (three subtractions and three
-    // additions), tested against
-    // the frustum and against the six face directions (per-direction culling).
+    // texture set is bound and the matrix and fog pushed once per frame, not per mesh; per
+    // mesh only its box relative to the camera is computed (three subtractions, a few
+    // multiplications and additions), tested against the frustum and against the six face
+    // directions (per-direction culling).
     fn record_frame(
         &self,
         slot: FrameSlot,
@@ -231,7 +238,7 @@ impl VulkanRenderer {
             },
             vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
-                    depth: FAR_DEPTH,
+                    depth: self.depth_mode.far_depth(),
                     stencil: 0,
                 },
             },
@@ -295,20 +302,19 @@ impl VulkanRenderer {
                 // Planes, boxes and the camera (at the origin) are all camera-relative, so
                 // they agree.
                 let frustum = Frustum::from_view_projection(&view_projection);
-                for (&pos, mesh) in &self.meshes {
-                    let origin = self.camera.relative(pos.origin());
-                    let far_corner = chunk_box_max(origin);
-                    if !frustum.may_see_box(origin, far_corner) {
+                for (&tile, mesh) in &self.meshes {
+                    let placed = placement(&self.camera, tile, mesh.height());
+                    if !frustum.may_see_box(placed.min, placed.max) {
                         continue;
                     }
-                    let draws = visible_ranges(origin, far_corner, mesh.face_groups());
+                    let draws = visible_ranges(placed.min, placed.max, mesh.face_groups());
                     if draws.as_slice().is_empty() {
                         continue;
                     }
-                    self.record_mesh(command_buffer, origin, mesh, &draws);
-                    drawn.count_chunk();
+                    self.record_mesh(command_buffer, &placed, mesh, &draws);
+                    drawn.count_mesh();
                     for range in draws.as_slice() {
-                        drawn.count_draw(range.count);
+                        drawn.count_draw(tile.level(), range.count);
                     }
                 }
             }
@@ -324,8 +330,8 @@ impl VulkanRenderer {
         Ok(drawn)
     }
 
-    /// Records the draws of a chunk whose origin lies at `relative_origin` from the camera:
-    /// one indexed draw per range of `draws`.
+    /// Records the draws of a mesh placed at `placed` (its tile's origin relative to the
+    /// camera and its cell size): one indexed draw per range of `draws`.
     ///
     /// # Safety
     /// `command_buffer` must be recording inside the render pass the pipeline was built
@@ -333,13 +339,13 @@ impl VulkanRenderer {
     /// scissor set. `mesh` must stay alive until the GPU has finished the command buffer.
     /// `draws` must be the result of `visible_ranges` over `mesh.face_groups()` (of this
     /// mesh, not another one): only then does every range lie inside its index data.
-    // HOT PATH: runs for every chunk in view every frame; only two binds, one 16-byte push
+    // HOT PATH: runs for every mesh in view every frame; only two binds, one 16-byte push
     // and at most three indexed draws (one per axis, see `face_culling`). The matrix and the
-    // fog are pushed once per frame, not per chunk.
+    // fog are pushed once per frame, not per mesh.
     unsafe fn record_mesh(
         &self,
         command_buffer: vk::CommandBuffer,
-        relative_origin: [f32; 3],
+        placed: &Placement,
         mesh: &GpuMesh,
         draws: &DrawRanges,
     ) {
@@ -358,7 +364,7 @@ impl VulkanRenderer {
                 self.chunk_pipeline.layout(),
                 self.chunk_pipeline.push_constant_stages(),
                 CHUNK_ORIGIN_OFFSET,
-                &origin_bytes(relative_origin),
+                &origin_bytes(placed.origin, placed.cell_size),
             );
             device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.buffer()], &[0]);
             device.cmd_bind_index_buffer(
@@ -550,11 +556,11 @@ impl Renderer for VulkanRenderer {
         self.gpu.name()
     }
 
-    fn set_chunk_mesh(&mut self, pos: ChunkPos, mesh: &ChunkMesh) -> Result<(), RenderError> {
+    fn set_tile_mesh(&mut self, tile: TilePos, mesh: &ChunkMesh) -> Result<(), RenderError> {
         // Upload first: if it fails, the old mesh stays and keeps being drawn.
         let old = match GpuMesh::new(&self.gpu, mesh)? {
-            Some(new) => self.meshes.insert(pos, new),
-            None => self.meshes.remove(&pos),
+            Some(new) => self.meshes.insert(tile, new),
+            None => self.meshes.remove(&tile),
         };
         if let Some(old) = old {
             self.retire(old.into_buffer());
@@ -562,8 +568,8 @@ impl Renderer for VulkanRenderer {
         Ok(())
     }
 
-    fn remove_chunk_mesh(&mut self, pos: ChunkPos) {
-        if let Some(old) = self.meshes.remove(&pos) {
+    fn remove_tile_mesh(&mut self, tile: TilePos) {
+        if let Some(old) = self.meshes.remove(&tile) {
             self.retire(old.into_buffer());
         }
     }
@@ -605,6 +611,10 @@ impl Renderer for VulkanRenderer {
         self.fog = fog;
     }
 
+    fn depth_mode(&self) -> DepthMode {
+        self.depth_mode
+    }
+
     fn stats(&self) -> RenderStats {
         RenderStats {
             gpu_time: self.last_gpu_time,
@@ -624,7 +634,7 @@ impl Drop for VulkanRenderer {
     }
 }
 
-/// A viewport covering the whole image, with the standard `0..1` depth range.
+/// A viewport covering the whole image, with the full `0..1` depth range (both depth modes).
 fn full_viewport(extent: vk::Extent2D) -> vk::Viewport {
     vk::Viewport {
         x: 0.0,
@@ -633,7 +643,7 @@ fn full_viewport(extent: vk::Extent2D) -> vk::Viewport {
         width: extent.width as f32,
         height: extent.height as f32,
         min_depth: 0.0,
-        max_depth: FAR_DEPTH,
+        max_depth: MAX_DEPTH,
     }
 }
 

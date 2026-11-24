@@ -349,6 +349,64 @@ void main() { broken }
         }
     }
 
+    /// The built-in `chunk.vert` places and textures a vertex exactly as `interface/chunk.rs`
+    /// documents: the position in cells times the pushed cell size gives blocks, the vertex
+    /// lies at the origin plus that, and the texture coordinates come from the blocks.
+    /// Compared with all whitespace removed, so formatting does not matter.
+    #[test]
+    fn built_in_chunk_placement_and_uvs_match_the_documented_formula() {
+        let source: String = built_in("chunk.vert")
+            .text
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for expression in [
+            "vec3local=vec3(in_pos_face.xyz)*draw.chunk_origin.w;",
+            "vec3offset=local+draw.chunk_origin.xyz;",
+            "v_uv=vec2(dot(local,FACE_U[face]),dot(local,FACE_V[face]));",
+        ] {
+            assert!(source.contains(expression), "chunk.vert lacks {expression}");
+        }
+    }
+
+    /// The documented formula, with the built-in tables, repeats the texture once per block on
+    /// a level-2 tile: a greedy quad of 3 x 2 cells (12 x 8 blocks) spans 12 x 8 repeats, and
+    /// its corners land on whole numbers, as on a full-detail chunk.
+    #[test]
+    fn a_level_2_quad_repeats_its_texture_once_per_block() {
+        use vox_world::{ChunkPos, Face, TilePos};
+
+        use crate::tile_box::cell_size_f32;
+        let source = built_in("chunk.vert").text;
+        let (u_axes, v_axes) = (vec3_table(&source, "FACE_U"), vec3_table(&source, "FACE_V"));
+        let cell = cell_size_f32(TilePos::new(2, ChunkPos::ORIGIN));
+        assert_eq!(cell, 4.0);
+        // The Rust copy of the two lines pinned above.
+        let uv = |cells: [u8; 3], face: Face| {
+            let local = cells.map(|c| f32::from(c) * cell);
+            let i = usize::from(face.index());
+            let dot = |axis: [f32; 3]| (0..3).map(|k| local[k] * axis[k]).sum::<f32>();
+            [dot(u_axes[i]), dot(v_axes[i])]
+        };
+        // A top face (+Y) at cell row 5 from cell (7, 9) to (10, 11): 3 x 2 cells.
+        let low = uv([7, 5, 9], Face::PosY);
+        let high = uv([10, 5, 11], Face::PosY);
+        assert_eq!([high[0] - low[0], high[1] - low[1]], [12.0, 8.0]);
+        // A side face (+X) at cell column 4 from row 2 to 5, cells 1 to 3 along Z.
+        let low = uv([4, 2, 1], Face::PosX);
+        let high = uv([4, 5, 3], Face::PosX);
+        assert_eq!(
+            [(high[0] - low[0]).abs(), (high[1] - low[1]).abs()],
+            [8.0, 12.0]
+        );
+        for corner in [low, high, uv([31, 32, 0], Face::NegZ)] {
+            assert!(
+                corner.iter().all(|value| value.fract() == 0.0),
+                "{corner:?}"
+            );
+        }
+    }
+
     #[test]
     fn built_in_chunk_shaders_declare_the_documented_push_block() {
         use crate::interface::chunk::{
