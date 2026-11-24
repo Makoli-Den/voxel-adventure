@@ -1,5 +1,5 @@
-//! The real `assets/base/blocks.json` loads and keeps the ids the terrain fingerprints depend
-//! on.
+//! The real `mods/base/assets/base/blocks.json` loads and keeps the ids the terrain
+//! fingerprints depend on.
 
 #![allow(clippy::unwrap_used)]
 
@@ -12,7 +12,7 @@ use vox_world::{BlockId, Face, TextureLayer};
 fn built_in() -> PackStack {
     let mut stack = PackStack::new();
     stack.push(DirPack::new(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mods/base/assets"),
     ));
     stack
 }

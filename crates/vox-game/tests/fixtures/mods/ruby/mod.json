@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "id": "ruby",
+  "version": "1.0.0",
+  "api": "1.0",
+  "dependencies": { "base": "^0.1" }
+}

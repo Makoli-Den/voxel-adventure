@@ -1809,6 +1809,7 @@ dependencies = [
  "font8x8",
  "glam",
  "vox-content",
+ "vox-mods",
  "vox-render",
  "vox-resources",
  "vox-world",

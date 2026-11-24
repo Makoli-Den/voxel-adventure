@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "id": "lonely",
+  "version": "1.0.0",
+  "api": "1.0",
+  "dependencies": { "gem": "^1.0" }
+}

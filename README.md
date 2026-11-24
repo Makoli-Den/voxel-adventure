@@ -13,15 +13,17 @@ A voxel game: the open world, freedom of action and world generation of Minecraf
 
 ## Repository layout
 ```
-assets/          the built-in resource pack; a file `assets/<namespace>/<path>` is the resource `namespace:path`
-  base/blocks.json  the base game's block definitions (`base:blocks.json`), read when the game starts
-  base/textures/block/  16x16 PNG textures of the base blocks (placeholders), decoded when the game starts and drawn on the terrain
+assets/          the engine's own resource pack; a file `assets/<namespace>/<path>` is the resource `namespace:path`
   core/shaders/  built-in GLSL shaders (`core:shaders/chunk.vert`, `chunk.frag`, `overlay.vert`, `overlay.frag`), read and compiled when the game starts
+mods/            the built-in mods folder; every mod is a folder `mods/<id>/` with a `mod.json` manifest and an `assets/` pack laid out like `assets/`
+  base/mod.json  the manifest of the base game, which is itself a mod
+  base/assets/base/blocks.json  the base game's block definitions (`base:blocks.json`), read when the game starts
+  base/assets/base/textures/block/  16x16 PNG textures of the base blocks (placeholders), decoded when the game starts and drawn on the terrain
 crates/
   vox-world/     blocks and the block registry, chunks, the world of chunks, meshing and demo terrain; knows nothing about rendering, mods or networking
   vox-resources/ virtual resource file system: `namespace:path` ids and layered packs; no dependencies
   vox-content/   content read from resource packs: the blocks file and block textures (PNG decoding, tile size, the generated missing texture); depends on `vox-resources`, `vox-world`, `serde`, `serde_json`, `png`
-  vox-mods/      the mod system, first step: the `mod.json` manifest, finding mods in a folder and dependency resolution into a load order; no scripting yet, not used by the game yet; depends on `vox-resources`, `serde`, `serde_json`, `semver`
+  vox-mods/      the mod system, first steps: the `mod.json` manifest, finding mods in a folder and dependency resolution into a load order, used by the game at startup; no scripting yet; depends on `vox-resources`, `serde`, `serde_json`, `semver`
   vox-render/    rendering behind the `Renderer` trait; the only crate that touches Vulkan
   vox-game/      the executable: window, event loop, wires the layers together
 docs/
@@ -59,7 +61,7 @@ Fly over the generated terrain:
 
 Edits are not saved: a chunk that streams out of range and back in is generated again (decision 0011). Blocks can only be placed in the loaded terrain layer.
 
-Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--pack DIR` layers a resource pack laid out like `assets/` over the built-in one (repeatable, a later pack wins; for example `DIR/base/textures/block/stone.png` replaces the stone texture and `DIR/core/shaders/chunk.frag` the terrain fragment shader; a texture that is missing or cannot be used shows a magenta and black checker and prints a warning), `--help` lists the options.
+Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--pack DIR` layers a resource pack laid out like `assets/` over the built-in one (repeatable, a later pack wins; for example `DIR/base/textures/block/stone.png` replaces the stone texture and `DIR/core/shaders/chunk.frag` the terrain fragment shader; a texture that is missing or cannot be used shows a magenta and black checker and prints a warning), `--mods DIR` loads the mods found in `DIR` instead of the built-in `mods/` folder (repeatable; it replaces the built-in folder, so leave out the `base` mod and the game stops; a mod id may appear in only one folder; the mods load in dependency order and their assets sit between the engine's `assets/` and the `--pack` directories; the load order is printed at startup, and a missing dependency, a cycle or a broken manifest stops the game with every problem listed), `--help` lists the options.
 
 ## Frame metrics
 A translucent panel in the top-left corner of the window shows live figures over the last ten seconds, refreshed twice a second: average FPS, the 1% and 0.1% lows (the average FPS of the slowest 1% and 0.1% of the frames, so they show stutter), the frame time, the time the game spent producing a frame, the GPU time (an upper bound, measured with timestamp queries) and how many chunks and triangles are drawn, plus a `Place` line with the selected block. F3 hides it, and with it the selected block: there is no other display of it yet. A summary of the whole run is printed when the game exits. The definitions are in `crates/vox-game/src/metrics.rs` and decision 0008.

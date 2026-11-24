@@ -1,0 +1,6 @@
+{
+  "format": 1,
+  "blocks": [
+    { "name": "ruby_block", "textures": { "all": "ruby:textures/block/ruby.png" } }
+  ]
+}

@@ -96,10 +96,16 @@ pub fn discover(dir: &Path) -> Result<Vec<DiscoveredMod>, Vec<ModError>> {
                 .then(|| read_manifest(&manifest_path, &name))
                 .transpose()
         }) {
-            Ok(Some(manifest)) => found.push(DiscoveredMod {
-                manifest,
-                dir: folder,
-            }),
+            Ok(Some(manifest)) => {
+                let assets = folder.join(ASSETS_DIR);
+                match check_assets_dir(&assets) {
+                    Ok(()) => found.push(DiscoveredMod {
+                        manifest,
+                        dir: folder,
+                    }),
+                    Err(error) => errors.push(error),
+                }
+            }
             Ok(None) => {} // No `mod.json`: not a mod.
             Err(error) => errors.push(error),
         }
@@ -123,6 +129,25 @@ fn check_manifest_file(path: &Path) -> Result<bool, ModError> {
             path: path.to_owned(),
         }),
         Err(source) if source.kind() == ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ModError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+/// Checks the mod's `assets` entry: absent is fine, a real directory is fine, a link (which
+/// would let a mod's pack read outside its folder) or anything else is an error.
+fn check_assets_dir(path: &Path) -> Result<(), ModError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(ModError::Symlink {
+            path: path.to_owned(),
+        }),
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(ModError::NotADirectory {
+            path: path.to_owned(),
+        }),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
         Err(source) => Err(ModError::Io {
             path: path.to_owned(),
             source,
