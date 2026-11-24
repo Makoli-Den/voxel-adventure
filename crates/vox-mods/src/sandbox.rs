@@ -73,8 +73,7 @@ impl CallLimits {
         wall_time: MAX_LOAD_WALL_TIME,
     };
 
-    /// One event handler call. Only the test dispatch calls handlers until step S5.
-    #[cfg(test)]
+    /// One event handler call.
     pub(crate) const HANDLER: Self = Self {
         instructions: crate::budget::MAX_INSTRUCTIONS_PER_CALL,
         wall_time: crate::budget::MAX_CALL_WALL_TIME,
@@ -224,6 +223,11 @@ impl Sandbox {
             return Err(limits.failure(spent));
         }
         result.map_err(|error| ModFailure::from_lua(&error))
+    }
+
+    /// The budget the host functions of this state charge, for the world handle of a call.
+    pub(crate) fn budget(&self) -> &Rc<Budget> {
+        &self.budget
     }
 
     /// The handlers the script registered.

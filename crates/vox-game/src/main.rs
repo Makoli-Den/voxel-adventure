@@ -1,9 +1,9 @@
 //! Game entry point.
 //!
 //! This is where the layers are wired together: it stacks the resource packs, opens the
-//! window, creates the renderer with the shaders from the packs, streams terrain chunks in
-//! around the camera and runs the event loop, flying a camera over the terrain. Mods and
-//! networking will join later.
+//! window, creates the renderer with the shaders from the packs, starts the mods' scripts,
+//! streams terrain chunks in around the camera and runs the event loop, flying a camera over
+//! the terrain and sending the player's block edits to the mods. Networking will join later.
 //!
 //! The mouse is captured while the player plays; Esc, losing the window focus or the menu's
 //! buttons switch the input mode (the rules live in `input_mode`, this file only applies them
@@ -17,6 +17,7 @@ mod editing;
 mod hud;
 mod input_mode;
 mod metrics;
+mod mod_scripts;
 mod pacing;
 mod packs;
 mod physics;
@@ -35,11 +36,12 @@ use std::time::{Duration, Instant};
 
 use glam::Vec3;
 use vox_content::BlockTextures;
+use vox_mods::{DiscoveredMod, ModHost, ModStatus};
 use vox_render::{
     CameraView, DepthMode, Fog, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers,
     create_renderer,
 };
-use vox_world::{ChunkMesh, TilePos, World, raycast_with};
+use vox_world::{BlockRegistry, ChunkMesh, TilePos, World, raycast_with};
 use winit::application::ApplicationHandler;
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
@@ -52,7 +54,7 @@ use camera::{Camera, Movement};
 use cli::{Command, Options};
 use content::Content;
 use controls::Controls;
-use editing::{EditAction, EditedChunks, REACH};
+use editing::{Edit, EditAction, EditedChunks, REACH};
 use input_mode::{InputMode, MenuButton, Outcome};
 use metrics::FrameHistory;
 use pacing::MAX_FRAME_TIME;
@@ -193,6 +195,10 @@ struct App {
     terrain: Arc<Terrain>,
     /// The blocks the player may place and the one the place key puts down.
     selection: Selection,
+    /// Every registered block, so the mods can name the blocks of the world.
+    registry: BlockRegistry,
+    /// The running mod scripts; the player's block edits are sent to them.
+    mods: ModHost,
     /// Loads and unloads the terrain around the camera; set up with the renderer.
     streamer: Option<ChunkStreamer>,
     /// Progress of the first fill, for the log line.
@@ -260,7 +266,7 @@ struct App {
 }
 
 impl App {
-    fn new(options: Options, shaders: ShaderSources, content: Content) -> Self {
+    fn new(options: Options, shaders: ShaderSources, content: Content, mods: ModHost) -> Self {
         let input_mode = InputMode::new(input_mode::starts_awaiting(&options));
         // Without tiles until `start` knows what the renderer's depth buffer allows.
         let fog = view_distance::fog(options.view_radius, 0);
@@ -271,6 +277,8 @@ impl App {
                 content.face_textures(),
             )),
             selection: content.selection,
+            registry: content.registry,
+            mods,
             options,
             shaders,
             block_textures: Some(content.textures),
@@ -537,9 +545,7 @@ impl App {
     }
 
     /// Carries out the edit the player asked for since the last frame, if any: casts a ray
-    /// from the eye along the look direction, creates the chunks under the terrain the edit
-    /// needs, writes the block the ray picks and rebuilds the mesh of every chunk the write
-    /// made out of date. An edit that created chunks logs its cost (decision 0015 budgets it).
+    /// from the eye along the look direction and applies the edit the ray picks.
     ///
     /// The ray is only cast when an edit was asked for, since nothing shows the targeted block.
     fn edit(&mut self) -> Result<(), RenderError> {
@@ -557,24 +563,45 @@ impl App {
         let Some(edit) = editing::plan(action, &hit, &self.body, self.selection.selected()) else {
             return Ok(());
         };
-        let Some(renderer) = self.renderer.as_mut() else {
+        self.apply_edit(action, edit)
+    }
+
+    /// Writes the player's `edit` (after creating the chunks under the terrain it needs), sends
+    /// the event to the mods, writes what they asked for and rebuilds the mesh of every chunk
+    /// the writes made out of date, each once (decisions 0014 and 0015). The mods see the world
+    /// after the player's write and cannot undo it. An edit that created chunks logs its cost
+    /// (decision 0015 budgets it).
+    fn apply_edit(&mut self, action: EditAction, edit: Edit) -> Result<(), RenderError> {
+        if self.renderer.is_none() {
             return Ok(());
-        };
+        }
         let started = Instant::now();
-        let created = editing::create_chunks_for_edit(
+        let Some(done) = editing::player_edit(
             &mut self.world,
             &self.terrain,
             &self.spans,
-            edit.position,
-        );
-        // `None` when the chunk of the cell is not in the world: its column is not loaded.
-        let Some(changed) = self.world.set_block(edit.position, edit.block) else {
+            &mut self.edited,
+            action,
+            &edit,
+        ) else {
             return Ok(());
         };
-        if !changed.is_empty() {
-            self.edited.record(edit.position);
-        }
-        for pos in changed.as_slice() {
+        let mut stale = done.stale;
+        let mod_edits = self
+            .mods
+            .block_event(&done.event, &self.world, &self.registry);
+        let mod_created = editing::apply_mod_edits(
+            &mut self.world,
+            &self.terrain,
+            &self.spans,
+            &mut self.edited,
+            &mod_edits,
+            &mut stale,
+        );
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        for pos in stale.as_slice() {
             if remesh(
                 &self.terrain,
                 &self.world,
@@ -586,10 +613,11 @@ impl App {
                 renderer.set_tile_mesh(TilePos::chunk(*pos), &self.edit_scratch)?;
             }
         }
+        let created = done.created + mod_created;
         if created > 0 {
             println!(
                 "Edit: {created} chunks created, {} remeshed in {:.3} ms",
-                changed.as_slice().len(),
+                stale.as_slice().len(),
                 metrics::millis(started.elapsed())
             );
         }
@@ -627,6 +655,7 @@ impl App {
             self.fail(event_loop, error);
             return;
         }
+        print_mod_messages(&mut self.mods);
         let result = self
             .renderer
             .as_mut()
@@ -1018,6 +1047,31 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Prints the messages waiting in `mods` to the error output, each tagged with its mod's id.
+/// A closed error output is not a reason to stop the game (`eprintln!` would panic), so a
+/// write error is ignored.
+fn print_mod_messages(mods: &mut ModHost) {
+    let mut output = io::stderr().lock();
+    for message in mods.take_messages() {
+        let _ = writeln!(output, "{}", mod_scripts::message_line(&message));
+    }
+}
+
+/// Starts the scripts of `mods` (in load order), prints how each start ended, then what the
+/// scripts printed while they ran. A failing script only disables its own mod.
+fn start_mods(mods: &[DiscoveredMod]) -> ModHost {
+    let (mut host, statuses) = ModHost::start(mods);
+    for status in &statuses {
+        let line = mod_scripts::status_line(status, mods);
+        match status {
+            ModStatus::Loaded { .. } => println!("{line}"),
+            ModStatus::Disabled { .. } => eprintln!("warning: {line}"),
+        }
+    }
+    print_mod_messages(&mut host);
+    host
+}
+
 /// The renderer's borrowed view of the block textures the content loader built.
 fn texture_layers(textures: &BlockTextures) -> TextureLayers<'_> {
     TextureLayers {
@@ -1092,7 +1146,8 @@ fn main() -> ExitCode {
     };
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(options, shaders, content);
+    let mods = start_mods(&startup.mods);
+    let mut app = App::new(options, shaders, content, mods);
     let result = event_loop.run_app(&mut app);
     // The summary is printed however the loop ended. A closed standard output is not a
     // reason to fail (`println!` would panic), so a write error is ignored.

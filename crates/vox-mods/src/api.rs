@@ -1,9 +1,9 @@
 //! The mod API v1 as scripts see it: the `vox` table and `print` (decision 0014, section c).
 //!
-//! In this step the API has no world access: `vox.on(event, handler)` registers a handler,
-//! `vox.api_version` is the API version as text, and `print` queues a line into the mod's
-//! bounded log. Every change here is an API change and updates `docs/mod-api.md` and
-//! [`MOD_API_VERSION`].
+//! `vox.on(event, handler)` registers a handler, `vox.api_version` is the API version as text,
+//! and `print` queues a line into the mod's bounded log. Handlers get the event table and the
+//! world handle of `world_handle`. Every change here or there is an API change and updates
+//! `docs/mod-api.md` and [`MOD_API_VERSION`].
 
 use std::cell::RefCell;
 use std::fmt;
@@ -116,7 +116,6 @@ impl Handlers {
     }
 
     /// The handler for `kind`, if one is registered.
-    #[cfg(test)]
     pub(crate) fn get(&self, kind: BlockEventKind) -> Option<Function> {
         self.by_kind[kind.index()].clone()
     }

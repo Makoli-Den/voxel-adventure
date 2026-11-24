@@ -3,14 +3,17 @@
 //! Pure code with no window, renderer or threads: given what the ray hit and what the player
 //! asked for, [`plan`] says which block to write where, [`create_chunks_for_edit`] puts the
 //! chunks under the terrain that the edit needs into the world, and [`apply_streamed`] keeps
-//! the game's world in step with the chunk streaming. The game (`main.rs`) casts the ray,
-//! writes the block with `World::set_block` and rebuilds the meshes (decisions 0011 and 0015).
+//! the game's world in step with the chunk streaming. [`player_edit`] writes the player's
+//! block and makes the event the mods hear of it, [`apply_mod_edits`] writes what they asked
+//! for, and both collect the chunks to rebuild in [`StaleChunks`], each once. The game
+//! (`main.rs`) casts the ray and rebuilds the meshes (decisions 0011, 0014 and 0015).
 
 use std::collections::HashSet;
 
+use vox_mods::{BlockEdit, BlockEvent, BlockEventKind};
 use vox_world::{
-    BlockId, ChunkPos, LOWEST_CHUNK_LAYER, RayHit, WORLD_FLOOR_Y, World, chunks_touching,
-    contains_block_y, contains_chunk_layer,
+    BlockId, ChangedChunks, ChunkPos, LOWEST_CHUNK_LAYER, RayHit, WORLD_FLOOR_Y, World,
+    chunks_touching, contains_block_y, contains_chunk_layer,
 };
 
 use crate::physics::Body;
@@ -40,6 +43,14 @@ pub struct Edit {
     pub block: BlockId,
 }
 
+/// Whether the engine forbids writing the block at `position`: the bedrock row at
+/// [`WORLD_FLOOR_Y`] is the floor of the world and never changes (decision 0015). One rule for
+/// the player's break ([`plan`]) and for every write of a mod ([`apply_mod_edits`]), so the two
+/// cannot disagree. A mod may not even place into the row: it is bedrock already.
+pub fn is_protected(position: [i32; 3]) -> bool {
+    position[1] == WORLD_FLOOR_Y
+}
+
 /// Decides what `action` does when the player `body` looks at `hit`, or `None` if nothing may
 /// happen.
 ///
@@ -52,7 +63,7 @@ pub struct Edit {
 ///   a solid block (`distance` is zero: there is no face in front of which to place anything).
 pub fn plan(action: EditAction, hit: &RayHit, body: &Body, block: BlockId) -> Option<Edit> {
     match action {
-        EditAction::Break => (hit.block[1] != WORLD_FLOOR_Y).then_some(Edit {
+        EditAction::Break => (!is_protected(hit.block)).then_some(Edit {
             position: hit.block,
             block: BlockId::AIR,
         }),
@@ -187,6 +198,122 @@ pub fn create_chunks_beside_edits(
         }
     }
     to_remesh
+}
+
+/// The chunks whose mesh is out of date after one player edit and the mods' writes it caused,
+/// each listed once, so every chunk is rebuilt once however many writes touched it.
+///
+/// A `Vec` searched linearly: it holds at most the chunks of one player edit and
+/// `MAX_EDITS_PER_CALL` writes per mod, a few hundred positions at worst, and edits are rare.
+#[derive(Debug, Default)]
+pub struct StaleChunks {
+    chunks: Vec<ChunkPos>,
+}
+
+impl StaleChunks {
+    /// Adds the chunks one write changed, skipping those already listed.
+    pub fn add(&mut self, changed: &ChangedChunks) {
+        for pos in changed.as_slice() {
+            if !self.chunks.contains(pos) {
+                self.chunks.push(*pos);
+            }
+        }
+    }
+
+    /// The listed chunks, in the order they were first added.
+    pub fn as_slice(&self) -> &[ChunkPos] {
+        &self.chunks
+    }
+}
+
+/// What one player edit did: the event for the mods and the chunks to rebuild.
+#[derive(Debug)]
+pub struct PlayerEdit {
+    /// What the mods hear of the edit.
+    pub event: BlockEvent,
+    /// The chunks the player's write made out of date.
+    pub stale: StaleChunks,
+    /// How many chunks the edit created under the terrain ([`create_chunks_for_edit`]).
+    pub created: usize,
+}
+
+/// The event the mods get after the player's `edit`, made by `action`; `previous` is the block
+/// that was in the cell before the write. A broken block is reported as the block that was
+/// there, a placed one as the block that is there now.
+fn block_event(action: EditAction, edit: &Edit, previous: BlockId) -> BlockEvent {
+    let (kind, block) = match action {
+        EditAction::Break => (BlockEventKind::BlockBroken, previous),
+        EditAction::Place => (BlockEventKind::BlockPlaced, edit.block),
+    };
+    BlockEvent {
+        kind,
+        position: edit.position,
+        block,
+    }
+}
+
+/// Carries out the player's `edit` (already approved by [`plan`], which refuses bedrock and
+/// cells outside the world) and returns the event for the mods, made after the write, or
+/// `None` when nothing happened: the chunk of the cell is not loaded, or the cell already held
+/// the block. The chunks the edit needs under the terrain are created first
+/// ([`create_chunks_for_edit`]) and a changed chunk is recorded in `edited`.
+pub fn player_edit(
+    world: &mut World,
+    terrain: &Terrain,
+    spans: &ColumnSpans,
+    edited: &mut EditedChunks,
+    action: EditAction,
+    edit: &Edit,
+) -> Option<PlayerEdit> {
+    let created = create_chunks_for_edit(world, terrain, spans, edit.position);
+    let previous = world.block_at(edit.position)?;
+    let changed = world.set_block(edit.position, edit.block)?;
+    if changed.is_empty() {
+        return None;
+    }
+    edited.record(edit.position);
+    let mut stale = StaleChunks::default();
+    stale.add(&changed);
+    Some(PlayerEdit {
+        event: block_event(action, edit, previous),
+        stale,
+        created,
+    })
+}
+
+/// Writes the mods' `edits` into `world` in their order, so a later write to the same cell
+/// wins, adds the chunks they changed to `stale` and records them in `edited`: a mod's write
+/// is an edit like the player's, so it must survive a neighbouring column's reload the same
+/// way. A write to a protected cell ([`is_protected`]) is skipped, and so is one that would
+/// not change the block (nothing is created or remeshed for it). Chunks under the terrain are
+/// created as for the player ([`create_chunks_for_edit`]); a write into a column that is not
+/// loaded or outside the world is skipped. No event is sent for these writes: mods do not
+/// trigger each other (decision 0014). Returns how many chunks were created.
+pub fn apply_mod_edits(
+    world: &mut World,
+    terrain: &Terrain,
+    spans: &ColumnSpans,
+    edited: &mut EditedChunks,
+    edits: &[BlockEdit],
+    stale: &mut StaleChunks,
+) -> usize {
+    let mut created = 0;
+    for edit in edits {
+        if is_protected(edit.position)
+            || block_for_ray(world, spans, edit.position) == Some(edit.block)
+        {
+            continue;
+        }
+        created += create_chunks_for_edit(world, terrain, spans, edit.position);
+        let Some(changed) = world.set_block(edit.position, edit.block) else {
+            continue;
+        };
+        if !changed.is_empty() {
+            edited.record(edit.position);
+            stale.add(&changed);
+        }
+    }
+    created
 }
 
 /// Brings `world`, `spans` and `edited` in step with one frame of streaming: drops every chunk
@@ -992,5 +1119,319 @@ mod tests {
             times[RUNS / 2],
             times[RUNS - 1]
         );
+    }
+
+    /// A world of the chunks at `positions`, all air, and spans of `0..=top_layer` for the
+    /// columns (0, 0) and (1, 0).
+    fn empty_world(positions: &[ChunkPos], top_layer: i32) -> (World, ColumnSpans) {
+        let mut world = World::new();
+        for pos in positions {
+            world.insert(*pos, Chunk::new());
+        }
+        let mut spans = ColumnSpans::default();
+        spans.insert(Column::new(0, 0), 0..=top_layer);
+        spans.insert(Column::new(1, 0), 0..=top_layer);
+        (world, spans)
+    }
+
+    /// The edit writing `block` at `position`.
+    fn edit_at(position: [i32; 3], block: BlockId) -> Edit {
+        Edit { position, block }
+    }
+
+    #[test]
+    fn breaking_reports_the_old_block_and_records_the_edit() {
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 0);
+        world.set_block([4, 4, 4], BlockId(9));
+        let mut edited = EditedChunks::default();
+        let edit = edit_at([4, 4, 4], BlockId::AIR);
+        let done = player_edit(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            EditAction::Break,
+            &edit,
+        )
+        .unwrap();
+        assert_eq!(
+            done.event,
+            BlockEvent {
+                kind: BlockEventKind::BlockBroken,
+                position: [4, 4, 4],
+                block: BlockId(9)
+            }
+        );
+        assert_eq!(done.stale.as_slice(), [ChunkPos::ORIGIN]);
+        assert!(edited.contains(ChunkPos::ORIGIN));
+        // The event is made after the write.
+        assert_eq!(world.block_at([4, 4, 4]), Some(BlockId::AIR));
+    }
+
+    #[test]
+    fn placing_reports_the_new_block() {
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 0);
+        let mut edited = EditedChunks::default();
+        let edit = edit_at([4, 4, 4], PLACE_BLOCK);
+        let done = player_edit(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            EditAction::Place,
+            &edit,
+        )
+        .unwrap();
+        assert_eq!(
+            done.event,
+            BlockEvent {
+                kind: BlockEventKind::BlockPlaced,
+                position: [4, 4, 4],
+                block: PLACE_BLOCK
+            }
+        );
+        assert_eq!(world.block_at([4, 4, 4]), Some(PLACE_BLOCK));
+    }
+
+    #[test]
+    fn a_write_that_changes_nothing_sends_no_event_and_records_no_edit() {
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 0);
+        let mut edited = EditedChunks::default();
+        let edit = edit_at([4, 4, 4], BlockId::AIR);
+        let done = player_edit(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            EditAction::Break,
+            &edit,
+        );
+        assert!(done.is_none());
+        assert!(!edited.contains(ChunkPos::ORIGIN));
+    }
+
+    #[test]
+    fn an_edit_in_a_column_that_is_not_loaded_sends_no_event() {
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 0);
+        let mut edited = EditedChunks::default();
+        let far = CHUNK_SIZE as i32 * 5;
+        let edit = edit_at([far, 4, 4], PLACE_BLOCK);
+        let done = player_edit(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            EditAction::Place,
+            &edit,
+        );
+        assert!(done.is_none());
+        assert_eq!(world.len(), 1);
+    }
+
+    #[test]
+    fn a_refused_plan_sends_no_event() {
+        // The bedrock row cannot be broken and the cell above the ceiling cannot be built in:
+        // `plan` refuses, so no edit exists to hand to `player_edit` and nothing is written.
+        let floor = hit([0, WORLD_FLOOR_Y, 0], Face::PosY, 2.0);
+        assert!(plan(EditAction::Break, &floor, &body(EYE), PLACE_BLOCK).is_none());
+        let top = hit([0, WORLD_CEILING_Y - 1, 0], Face::PosY, 2.0);
+        assert!(plan(EditAction::Place, &top, &body(EYE), PLACE_BLOCK).is_none());
+        // An edit outside the world that reaches `player_edit` anyway is refused by the world.
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 0);
+        let mut edited = EditedChunks::default();
+        let outside = edit_at([0, WORLD_CEILING_Y, 0], PLACE_BLOCK);
+        let done = player_edit(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            EditAction::Place,
+            &outside,
+        );
+        assert!(done.is_none());
+    }
+
+    #[test]
+    fn the_player_edit_and_the_mod_edits_remesh_each_chunk_once() {
+        let terrain = terrain();
+        let origin = ChunkPos::ORIGIN;
+        let east = ChunkPos::new(1, 0, 0);
+        let up = ChunkPos::new(0, 1, 0);
+        let (mut world, spans) = empty_world(&[origin, east, up], 1);
+        let mut edited = EditedChunks::default();
+        let last = CHUNK_SIZE as i32 - 1;
+        // The player's write in the middle of the origin chunk.
+        let player = edit_at([4, 4, 4], PLACE_BLOCK);
+        let mut stale = player_edit(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            EditAction::Place,
+            &player,
+        )
+        .unwrap()
+        .stale;
+        let write = |position, block| BlockEdit { position, block };
+        let edits = [
+            // Same chunk again, twice on one cell.
+            write([5, 4, 4], PLACE_BLOCK),
+            write([5, 4, 4], BlockId(7)),
+            // On the east border: the origin chunk and its east neighbour.
+            write([last, 4, 4], PLACE_BLOCK),
+            // Inside the east chunk.
+            write([last + 2, 4, 4], PLACE_BLOCK),
+            // Inside the chunk above.
+            write([4, last + 3, 4], PLACE_BLOCK),
+            // A column that is not loaded: skipped.
+            write([-4, 4, 4], PLACE_BLOCK),
+        ];
+        apply_mod_edits(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            &edits,
+            &mut stale,
+        );
+        assert_eq!(stale.as_slice(), [origin, east, up]);
+        // Applied in order: the later write to (5, 4, 4) won.
+        assert_eq!(world.block_at([5, 4, 4]), Some(BlockId(7)));
+        assert_eq!(world.block_at([last + 2, 4, 4]), Some(PLACE_BLOCK));
+        assert_eq!(world.block_at([-4, 4, 4]), None);
+        // Mod writes are edits: the chunks they wrote into are recorded.
+        for pos in [origin, east, up] {
+            assert!(edited.contains(pos), "{pos:?}");
+        }
+        assert!(!edited.contains(ChunkPos::new(-1, 0, 0)));
+    }
+
+    #[test]
+    fn a_mod_write_into_a_missing_layer_under_the_span_creates_it() {
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 0);
+        let mut edited = EditedChunks::default();
+        let mut stale = StaleChunks::default();
+        let below = ChunkPos::new(0, -1, 0);
+        let edits = [BlockEdit {
+            position: [4, -4, 4],
+            block: BlockId::AIR,
+        }];
+        let created = apply_mod_edits(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            &edits,
+            &mut stale,
+        );
+        assert_eq!(created, 1);
+        // The generated rock there was solid, so the air write changed it.
+        assert!(world.contains(below));
+        assert_eq!(world.block_at([4, -4, 4]), Some(BlockId::AIR));
+        assert!(stale.as_slice().contains(&below));
+        assert!(edited.contains(below));
+    }
+
+    #[test]
+    fn a_mod_write_that_changes_nothing_remeshes_and_records_nothing() {
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 0);
+        let mut edited = EditedChunks::default();
+        let mut stale = StaleChunks::default();
+        let air = BlockEdit {
+            position: [1, 1, 1],
+            block: BlockId::AIR,
+        };
+        apply_mod_edits(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            &[air],
+            &mut stale,
+        );
+        assert!(stale.as_slice().is_empty());
+        assert!(!edited.contains(ChunkPos::ORIGIN));
+    }
+
+    #[test]
+    fn a_mod_cannot_write_the_bedrock_row() {
+        let terrain = terrain();
+        let mut spans = ColumnSpans::default();
+        spans.insert(Column::new(0, 0), 0..=0);
+        let mut world = World::new();
+        let floor_chunk = ChunkPos::new(0, LOWEST_CHUNK_LAYER, 0);
+        world.insert(floor_chunk, terrain.generate(floor_chunk));
+        let floor = [4, WORLD_FLOOR_Y, 4];
+        let bedrock = world.block_at(floor);
+        assert_eq!(bedrock, Some(BLOCKS.bedrock));
+        let mut edited = EditedChunks::default();
+        let mut stale = StaleChunks::default();
+        let edits = [
+            BlockEdit {
+                position: floor,
+                block: BlockId::AIR,
+            },
+            BlockEdit {
+                position: floor,
+                block: PLACE_BLOCK,
+            },
+        ];
+        let created = apply_mod_edits(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            &edits,
+            &mut stale,
+        );
+        assert_eq!(created, 0);
+        assert_eq!(world.block_at(floor), bedrock);
+        assert!(stale.as_slice().is_empty());
+        assert!(!edited.contains(floor_chunk));
+        // The row above it is not protected.
+        assert!(!is_protected([4, WORLD_FLOOR_Y + 1, 4]));
+    }
+
+    #[test]
+    fn a_mod_write_that_would_not_change_the_block_creates_nothing() {
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 1);
+        let mut edited = EditedChunks::default();
+        let mut stale = StaleChunks::default();
+        // Air into the air of the present chunk and of the missing chunk above the span.
+        let edits = [
+            BlockEdit {
+                position: [1, 1, 1],
+                block: BlockId::AIR,
+            },
+            BlockEdit {
+                position: [1, CHUNK_SIZE as i32 * 4, 1],
+                block: BlockId::AIR,
+            },
+        ];
+        let created = apply_mod_edits(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            &edits,
+            &mut stale,
+        );
+        assert_eq!(created, 0);
+        assert_eq!(world.len(), 1);
+    }
+
+    #[test]
+    fn the_documented_write_limits_match_the_constants() {
+        // `docs/mod-api.md` and decision 0014 say 64 per call and 256 per event.
+        assert_eq!(vox_mods::MAX_EDITS_PER_CALL, 64);
+        assert_eq!(vox_mods::MAX_EDITS_PER_EVENT, 256);
     }
 }
