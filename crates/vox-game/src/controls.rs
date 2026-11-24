@@ -1,11 +1,13 @@
 //! Keyboard and mouse state, turned into a [`Movement`] for the camera.
 //!
-//! W, A, S, D move, Space goes up, Shift goes down. Holding the right mouse button
-//! turns mouse motion into looking around, so the cursor never has to be captured.
-//! Clicking the left mouse button and pressing F ask for an edit (break or place a block);
-//! each press is remembered until the game takes it, so a quick click is never lost between
-//! two frames. The number keys 1 to 9 (the row above the letters or the numpad) and the mouse wheel choose the block to place, and are
-//! remembered the same way.
+//! W, A, S, D move, Space goes up, Shift goes down. Looking around needs no state here: the
+//! cursor is captured while playing (see `input_mode`), so raw mouse motion always turns the
+//! camera. When the menu opens or the window loses focus, [`Controls::release_all`] forgets
+//! every held key and pending request. Clicking the left mouse button and pressing F ask for
+//! an edit (break or place a block); each press is remembered until the game takes it, so a
+//! quick click is never lost between two frames. The number keys 1 to 9 (the row above the
+//! letters or the numpad) and the mouse wheel choose the block to place, and are remembered
+//! the same way.
 
 use winit::keyboard::KeyCode;
 
@@ -13,7 +15,7 @@ use crate::camera::Movement;
 use crate::editing::EditAction;
 use crate::selection::SLOT_KEYS;
 
-/// Which movement keys are held, and whether the player is looking around.
+/// Which movement keys are held, and which requests are waiting for the next frame.
 #[derive(Debug, Default)]
 pub struct Controls {
     forward: bool,
@@ -25,7 +27,6 @@ pub struct Controls {
     /// held does not stop the descent.
     shift_left: bool,
     shift_right: bool,
-    looking: bool,
     /// Edit requests since the last [`Controls::take_edit`]: break first, then place.
     break_requested: bool,
     place_requested: bool,
@@ -116,11 +117,6 @@ impl Controls {
         }
     }
 
-    /// Records that the look button (the right mouse button) was pressed or released.
-    pub fn set_looking(&mut self, looking: bool) {
-        self.looking = looking;
-    }
-
     /// Records a press (not a release, not a key repeat) of an edit button.
     pub fn request_edit(&mut self, action: EditAction) {
         match action {
@@ -132,6 +128,12 @@ impl Controls {
     /// The window gained focus.
     pub fn focus_gained(&mut self) {
         self.just_focused = true;
+    }
+
+    /// Whether the window gained focus in the current batch of events: a click now is the one
+    /// that focused it.
+    pub fn just_focused(&self) -> bool {
+        self.just_focused
     }
 
     /// Called when the current batch of window events is handled, which ends the moment in
@@ -201,13 +203,8 @@ impl Controls {
         self.slot_requested.take()
     }
 
-    /// Whether mouse motion should turn the camera right now.
-    pub fn is_looking(&self) -> bool {
-        self.looking
-    }
-
-    /// Forgets everything that is held, for example when the window loses focus and the
-    /// release events would never arrive.
+    /// Forgets everything that is held or requested, for example when the menu opens or the
+    /// window loses focus, and the release events would never arrive.
     pub fn release_all(&mut self) {
         *self = Self::default();
     }
@@ -505,12 +502,12 @@ mod tests {
     }
 
     #[test]
-    fn release_all_clears_keys_and_looking() {
+    fn release_all_clears_held_keys() {
         let mut controls = Controls::default();
         controls.set_key(KeyCode::KeyW, true);
-        controls.set_looking(true);
+        controls.set_key(KeyCode::ShiftLeft, true);
+        controls.set_key(KeyCode::Space, true);
         controls.release_all();
         assert_eq!(controls.movement(), Movement::default());
-        assert!(!controls.is_looking());
     }
 }
