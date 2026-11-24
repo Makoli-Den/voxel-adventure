@@ -43,6 +43,14 @@ pub struct Edit {
     pub block: BlockId,
 }
 
+/// Whether the engine forbids writing the block at `position`: the bedrock row at
+/// [`WORLD_FLOOR_Y`] is the floor of the world and never changes (decision 0015). One rule for
+/// the player's break ([`plan`]) and for every write of a mod ([`apply_mod_edits`]), so the two
+/// cannot disagree. A mod may not even place into the row: it is bedrock already.
+pub fn is_protected(position: [i32; 3]) -> bool {
+    position[1] == WORLD_FLOOR_Y
+}
+
 /// Decides what `action` does when the player `body` looks at `hit`, or `None` if nothing may
 /// happen.
 ///
@@ -55,7 +63,7 @@ pub struct Edit {
 ///   a solid block (`distance` is zero: there is no face in front of which to place anything).
 pub fn plan(action: EditAction, hit: &RayHit, body: &Body, block: BlockId) -> Option<Edit> {
     match action {
-        EditAction::Break => (hit.block[1] != WORLD_FLOOR_Y).then_some(Edit {
+        EditAction::Break => (!is_protected(hit.block)).then_some(Edit {
             position: hit.block,
             block: BlockId::AIR,
         }),
@@ -276,9 +284,11 @@ pub fn player_edit(
 /// Writes the mods' `edits` into `world` in their order, so a later write to the same cell
 /// wins, adds the chunks they changed to `stale` and records them in `edited`: a mod's write
 /// is an edit like the player's, so it must survive a neighbouring column's reload the same
-/// way. Chunks under the terrain are created as for the player ([`create_chunks_for_edit`]);
-/// a write into a column that is not loaded or outside the world is skipped. No event is sent
-/// for these writes: mods do not trigger each other (decision 0014).
+/// way. A write to a protected cell ([`is_protected`]) is skipped, and so is one that would
+/// not change the block (nothing is created or remeshed for it). Chunks under the terrain are
+/// created as for the player ([`create_chunks_for_edit`]); a write into a column that is not
+/// loaded or outside the world is skipped. No event is sent for these writes: mods do not
+/// trigger each other (decision 0014). Returns how many chunks were created.
 pub fn apply_mod_edits(
     world: &mut World,
     terrain: &Terrain,
@@ -286,9 +296,15 @@ pub fn apply_mod_edits(
     edited: &mut EditedChunks,
     edits: &[BlockEdit],
     stale: &mut StaleChunks,
-) {
+) -> usize {
+    let mut created = 0;
     for edit in edits {
-        create_chunks_for_edit(world, terrain, spans, edit.position);
+        if is_protected(edit.position)
+            || block_for_ray(world, spans, edit.position) == Some(edit.block)
+        {
+            continue;
+        }
+        created += create_chunks_for_edit(world, terrain, spans, edit.position);
         let Some(changed) = world.set_block(edit.position, edit.block) else {
             continue;
         };
@@ -297,6 +313,7 @@ pub fn apply_mod_edits(
             stale.add(&changed);
         }
     }
+    created
 }
 
 /// Brings `world`, `spans` and `edited` in step with one frame of streaming: drops every chunk
@@ -1305,7 +1322,7 @@ mod tests {
             position: [4, -4, 4],
             block: BlockId::AIR,
         }];
-        apply_mod_edits(
+        let created = apply_mod_edits(
             &mut world,
             &terrain,
             &spans,
@@ -1313,6 +1330,7 @@ mod tests {
             &edits,
             &mut stale,
         );
+        assert_eq!(created, 1);
         // The generated rock there was solid, so the air write changed it.
         assert!(world.contains(below));
         assert_eq!(world.block_at([4, -4, 4]), Some(BlockId::AIR));
@@ -1340,5 +1358,80 @@ mod tests {
         );
         assert!(stale.as_slice().is_empty());
         assert!(!edited.contains(ChunkPos::ORIGIN));
+    }
+
+    #[test]
+    fn a_mod_cannot_write_the_bedrock_row() {
+        let terrain = terrain();
+        let mut spans = ColumnSpans::default();
+        spans.insert(Column::new(0, 0), 0..=0);
+        let mut world = World::new();
+        let floor_chunk = ChunkPos::new(0, LOWEST_CHUNK_LAYER, 0);
+        world.insert(floor_chunk, terrain.generate(floor_chunk));
+        let floor = [4, WORLD_FLOOR_Y, 4];
+        let bedrock = world.block_at(floor);
+        assert_eq!(bedrock, Some(BLOCKS.bedrock));
+        let mut edited = EditedChunks::default();
+        let mut stale = StaleChunks::default();
+        let edits = [
+            BlockEdit {
+                position: floor,
+                block: BlockId::AIR,
+            },
+            BlockEdit {
+                position: floor,
+                block: PLACE_BLOCK,
+            },
+        ];
+        let created = apply_mod_edits(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            &edits,
+            &mut stale,
+        );
+        assert_eq!(created, 0);
+        assert_eq!(world.block_at(floor), bedrock);
+        assert!(stale.as_slice().is_empty());
+        assert!(!edited.contains(floor_chunk));
+        // The row above it is not protected.
+        assert!(!is_protected([4, WORLD_FLOOR_Y + 1, 4]));
+    }
+
+    #[test]
+    fn a_mod_write_that_would_not_change_the_block_creates_nothing() {
+        let terrain = terrain();
+        let (mut world, spans) = empty_world(&[ChunkPos::ORIGIN], 1);
+        let mut edited = EditedChunks::default();
+        let mut stale = StaleChunks::default();
+        // Air into the air of the present chunk and of the missing chunk above the span.
+        let edits = [
+            BlockEdit {
+                position: [1, 1, 1],
+                block: BlockId::AIR,
+            },
+            BlockEdit {
+                position: [1, CHUNK_SIZE as i32 * 4, 1],
+                block: BlockId::AIR,
+            },
+        ];
+        let created = apply_mod_edits(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            &edits,
+            &mut stale,
+        );
+        assert_eq!(created, 0);
+        assert_eq!(world.len(), 1);
+    }
+
+    #[test]
+    fn the_documented_write_limits_match_the_constants() {
+        // `docs/mod-api.md` and decision 0014 say 64 per call and 256 per event.
+        assert_eq!(vox_mods::MAX_EDITS_PER_CALL, 64);
+        assert_eq!(vox_mods::MAX_EDITS_PER_EVENT, 256);
     }
 }

@@ -139,7 +139,7 @@ mod tests {
         let mut spans = ColumnSpans::default();
         spans.insert(Column::new(0, 0), 0..=0);
         let mut edited = EditedChunks::default();
-        apply_mod_edits(
+        let created = apply_mod_edits(
             &mut world,
             &terrain,
             &spans,
@@ -147,6 +147,7 @@ mod tests {
             &edits,
             &mut stale,
         );
+        assert_eq!(created, 0);
         assert!(edited.contains(ChunkPos::ORIGIN));
         assert_eq!(stale.as_slice(), [ChunkPos::ORIGIN]);
 

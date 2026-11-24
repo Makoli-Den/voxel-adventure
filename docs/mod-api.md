@@ -69,6 +69,10 @@ block position of the cell and a block name. Changing it does not change what ot
 - Writes by mods **raise no events**, so mods never call each other through the world.
 - At most 256 writes of all mods together are applied per event; the rest are dropped (the mod
   keeps running) and the console says how many.
+- **The bedrock floor cannot be written:** a write at the world's lowest row (`y` equal to the
+  floor, the bedrock row) is ignored, whatever the block: breaking it would open the world,
+  and it already is bedrock. The same rule stops the player's break there. A write that would
+  not change the block is ignored too.
 - Every chunk the edit and the writes changed is rebuilt once.
 - **Seams at the edge of the loaded area:** a write in a chunk at the edge of the loaded world
   is applied and remeshed with what is loaded; the neighbour that is not loaded yet is built

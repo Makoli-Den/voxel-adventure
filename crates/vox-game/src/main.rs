@@ -590,7 +590,7 @@ impl App {
         let mod_edits = self
             .mods
             .block_event(&done.event, &self.world, &self.registry);
-        editing::apply_mod_edits(
+        let mod_created = editing::apply_mod_edits(
             &mut self.world,
             &self.terrain,
             &self.spans,
@@ -613,10 +613,10 @@ impl App {
                 renderer.set_tile_mesh(TilePos::chunk(*pos), &self.edit_scratch)?;
             }
         }
-        if done.created > 0 {
+        let created = done.created + mod_created;
+        if created > 0 {
             println!(
-                "Edit: {} chunks created, {} remeshed in {:.3} ms",
-                done.created,
+                "Edit: {created} chunks created, {} remeshed in {:.3} ms",
                 stale.as_slice().len(),
                 metrics::millis(started.elapsed())
             );
