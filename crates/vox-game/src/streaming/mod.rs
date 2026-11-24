@@ -131,28 +131,45 @@ impl ChunkStreamer {
     }
 }
 
+/// The blocks every streaming test uses, in one place.
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-    use std::time::Instant;
-
+mod test_blocks {
     use vox_world::{BlockId, TerrainBlocks};
 
-    use super::*;
-
-    /// A small radius keeps the test fast: 13 columns.
-    const RADIUS: i32 = 2;
-    /// The seed of the tests' terrain.
-    const SEED: u32 = 1;
     /// The ids of the tests' blocks: the ones the game's registry hands out.
-    const BLOCKS: TerrainBlocks = TerrainBlocks {
+    pub const BLOCKS: TerrainBlocks = TerrainBlocks {
         grass: BlockId(1),
         dirt: BlockId(2),
         stone: BlockId(3),
     };
 
+    /// Blocks the tests' texture table covers: air and every id up to the highest terrain
+    /// block (stone, checked below).
+    pub const BLOCK_COUNT: usize = BLOCKS.stone.0 as usize + 1;
+
+    const _: () = assert!(BLOCKS.grass.0 < BLOCKS.stone.0 && BLOCKS.dirt.0 < BLOCKS.stone.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::content::identity_face_textures;
+
+    /// A small radius keeps the test fast: 13 columns.
+    const RADIUS: i32 = 2;
+    /// The seed of the tests' terrain.
+    const SEED: u32 = 1;
+    use super::test_blocks::{BLOCK_COUNT, BLOCKS};
+
     fn terrain() -> Arc<Terrain> {
-        Arc::new(Terrain::new(SEED, BLOCKS))
+        Arc::new(Terrain::new(
+            SEED,
+            BLOCKS,
+            identity_face_textures(BLOCK_COUNT),
+        ))
     }
     /// How long the test waits for the workers before it fails.
     const TIMEOUT: Duration = Duration::from_secs(10);

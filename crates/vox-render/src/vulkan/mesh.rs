@@ -121,8 +121,8 @@ fn write_vertices(bytes: &mut Vec<u8>, vertices: &[ChunkVertex]) {
     // lays out `ChunkVertex`.
     for vertex in vertices {
         let [x, y, z] = vertex.position;
-        let [block_lo, block_hi] = vertex.block.0.to_le_bytes();
-        bytes.extend_from_slice(&[x, y, z, vertex.face, block_lo, block_hi]);
+        let [layer_lo, layer_hi] = vertex.texture.0.to_le_bytes();
+        bytes.extend_from_slice(&[x, y, z, vertex.face, layer_lo, layer_hi]);
     }
 }
 
@@ -136,7 +136,7 @@ fn write_indices(bytes: &mut Vec<u8>, indices: &[u32]) {
 
 #[cfg(test)]
 mod tests {
-    use vox_world::BlockId;
+    use vox_world::TextureLayer;
 
     use super::*;
 
@@ -144,7 +144,7 @@ mod tests {
         ChunkVertex {
             position: [1, 2, 32],
             face: 5,
-            block: BlockId(0x0302),
+            texture: TextureLayer(0x0302),
         }
     }
 

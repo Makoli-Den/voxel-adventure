@@ -4,19 +4,21 @@
 //! The rest of the game never names a block id: it asks [`Content`] for the blocks the terrain
 //! uses and for the block the player places, both resolved by name once at startup.
 //!
-//! The mesher does not read the registry's texture layers yet: it still writes the block id
-//! into the vertex, and the palette in `assets/core/shaders/chunk.vert` is indexed by it. The
-//! real layers from the file are used from step S6a on, so for now the ids of grass, dirt and
-//! stone must stay 1, 2 and 3. A pack that reorders the blocks file would silently mis-colour
-//! the world, so [`Content::new`] checks the ids ([`PALETTE_IDS`]) and stops with
-//! [`ContentError::UnexpectedId`]. Remove the check together with the palette in S6a.
+//! The mesher writes a texture layer per face into the vertex (step S6a), but the real layers
+//! from the file are used only from step S7: until then the palette in
+//! `assets/core/shaders/chunk.vert` is indexed by that number, so the game meshes with
+//! [`identity_face_textures`], where the layer equals the block id, and the ids of grass, dirt
+//! and stone must stay 1, 2 and 3. A pack that reorders the blocks file would silently
+//! mis-colour the world, so [`Content::new`] checks the ids ([`PALETTE_IDS`]) and stops with
+//! [`ContentError::UnexpectedId`]. Remove the check and [`identity_face_textures`] together
+//! with the palette in S7.
 
 use std::error::Error;
 use std::fmt;
 
 use vox_content::{BlockTextures, Warning};
 use vox_resources::PackStack;
-use vox_world::{BlockId, BlockRegistry, TerrainBlocks};
+use vox_world::{BlockId, BlockRegistry, Face, FaceTextures, TerrainBlocks, TextureLayer};
 
 /// Registry name of the grass block.
 pub const GRASS_NAME: &str = "base:grass";
@@ -26,12 +28,29 @@ pub const DIRT_NAME: &str = "base:dirt";
 pub const STONE_NAME: &str = "base:stone";
 
 /// The ids the shader palette in `assets/core/shaders/chunk.vert` is indexed by, per block.
-/// Temporary: removed with the palette in step S6a of decision 0013.
+/// Temporary: removed with the palette in step S7 of decision 0013.
 const PALETTE_IDS: [(&str, BlockId); 3] = [
     (GRASS_NAME, BlockId(1)),
     (DIRT_NAME, BlockId(2)),
     (STONE_NAME, BlockId(3)),
 ];
+
+/// A face texture table in which every face of block `i` has layer `i`, for the `block_count`
+/// blocks with ids `0..block_count`.
+///
+/// Temporary, until the shader samples real textures (step S7 of decision 0013): the palette
+/// in `chunk.vert` is indexed by the number in the vertex, which used to be the block id.
+///
+/// `block_count` is a registry's `len()`: the registry stops at `u16::MAX + 1` blocks, so every
+/// id below the count fits a layer (checked in debug builds).
+pub fn identity_face_textures(block_count: usize) -> FaceTextures {
+    debug_assert!(block_count <= usize::from(u16::MAX) + 1);
+    let layers = (0..block_count)
+        // The cast cannot truncate: see the assert above.
+        .map(|id| [TextureLayer(id as u16); Face::COUNT])
+        .collect();
+    FaceTextures::from_layers(layers)
+}
 
 /// Name of the block the place key puts down. Temporary: the base game mod will provide an
 /// inventory with a selected block.
@@ -44,7 +63,7 @@ pub enum ContentError {
     Load(vox_content::ContentError),
     /// A block the game needs is not in the registry.
     MissingBlock(&'static str),
-    /// A block has an id the shader palette does not expect (temporary, until step S6a).
+    /// A block has an id the shader palette does not expect (temporary, until step S7).
     UnexpectedId {
         /// Registry name of the block.
         name: &'static str,
@@ -206,6 +225,21 @@ mod tests {
         assert_eq!(content.terrain.grass, BlockId(1));
         assert_eq!(content.terrain.dirt, BlockId(2));
         assert_eq!(content.terrain.stone, BlockId(3));
+    }
+
+    #[test]
+    fn the_identity_table_maps_every_face_of_every_block_to_its_id() {
+        let content = content();
+        let table = identity_face_textures(content.registry.len());
+        for id in 0..content.registry.len() {
+            let block = BlockId(u16::try_from(id).unwrap());
+            for face in Face::ALL {
+                assert_eq!(table.get(block, face), TextureLayer(block.0));
+            }
+        }
+        // One past the last block is unknown.
+        let past = BlockId(u16::try_from(content.registry.len()).unwrap());
+        assert_eq!(table.get(past, Face::PosY), TextureLayer::MISSING);
     }
 
     #[test]

@@ -336,6 +336,12 @@ change, run just before.
   the position-based test only on the border slice, gave the numbers above.
 - The effect on frame time is not measured here; it needs the renderer (`--fly` or the
   stationary benchmark) and will be recorded when someone runs it.
+- Texture layers per quad (2026-11-24, step S6a of decision 0013): `build_mesh*` now take a
+  `FaceTextures` and look the layer up once per quad. One run of `--quick`, compared with the
+  figures above: within noise (equal or slightly faster, the machine varied between sessions).
+  `mesh/terrain_seed_1` 171.5 us (185.4), `mesh_reused/terrain_seed_1` 172.1 us (187.5),
+  `mesh_reused/solid` 138.2 us (145.7), `mesh_reused/checkerboard` 1.62 ms (1.67),
+  `mesh_neighbours/terrain_seed_1` 167.5 us (180.7). No same-session baseline was built.
 
 ### Frame time with greedy meshing (2026-11-24, release, standing still, same setup)
 

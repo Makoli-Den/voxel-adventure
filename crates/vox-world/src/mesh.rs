@@ -15,6 +15,7 @@ use crate::block::BlockId;
 use crate::chunk::{
     AXIS_STRIDES, AXIS_X, AXIS_Y, AXIS_Z, CHUNK_SIZE, CHUNK_VOLUME, Chunk, LocalPos,
 };
+use crate::registry::{FaceTextures, TextureLayer};
 use crate::world::Neighbours;
 
 /// Corners of one quad: every face of a block is a square.
@@ -105,7 +106,7 @@ impl Face {
 
 /// A compact mesh vertex.
 ///
-/// Layout is `#[repr(C)]`: `position` (3 bytes), `face` (1 byte), `block` (2 bytes),
+/// Layout is `#[repr(C)]`: `position` (3 bytes), `face` (1 byte), `texture` (2 bytes),
 /// 6 bytes in total with alignment 2 and no padding. Positions are in blocks inside
 /// the chunk; the value 32 occurs on the far edge and still fits a `u8`. Small
 /// vertices cut memory and bandwidth, and the GPU can unpack them cheaply.
@@ -116,8 +117,9 @@ pub struct ChunkVertex {
     pub position: [u8; 3],
     /// Face direction, see [`Face::index`].
     pub face: u8,
-    /// Block the face belongs to, used to pick a texture.
-    pub block: BlockId,
+    /// Layer of the block texture array this face is drawn with. Looked up once per quad
+    /// from the block and the face, so the vertex carries no block id.
+    pub texture: TextureLayer,
 }
 
 /// Mesh of one chunk: vertices and `u32` triangle indices into them.
@@ -148,17 +150,18 @@ impl ChunkMesh {
 /// # Example
 ///
 /// ```
-/// use vox_world::{BlockId, Chunk, LocalPos, build_mesh};
+/// use vox_world::{BlockId, Chunk, FaceTextures, LocalPos, build_mesh};
 ///
 /// let mut chunk = Chunk::new();
 /// if let Some(pos) = LocalPos::new(1, 1, 1) {
 ///     chunk.set(pos, BlockId(1));
 /// }
-/// assert_eq!(build_mesh(&chunk).indices.len(), 36);
+/// let textures = FaceTextures::default();
+/// assert_eq!(build_mesh(&chunk, &textures).indices.len(), 36);
 /// ```
-pub fn build_mesh(chunk: &Chunk) -> ChunkMesh {
+pub fn build_mesh(chunk: &Chunk, textures: &FaceTextures) -> ChunkMesh {
     let mut mesh = ChunkMesh::default();
-    build_mesh_into(chunk, &mut mesh);
+    build_mesh_into(chunk, textures, &mut mesh);
     mesh
 }
 
@@ -171,19 +174,20 @@ pub fn build_mesh(chunk: &Chunk) -> ChunkMesh {
 /// # Example
 ///
 /// ```
-/// use vox_world::{BlockId, Chunk, ChunkMesh, LocalPos, build_mesh_into};
+/// use vox_world::{BlockId, Chunk, ChunkMesh, FaceTextures, LocalPos, build_mesh_into};
 ///
 /// let mut chunk = Chunk::new();
 /// if let Some(pos) = LocalPos::new(1, 1, 1) {
 ///     chunk.set(pos, BlockId(1));
 /// }
+/// let textures = FaceTextures::default();
 /// let mut mesh = ChunkMesh::default();
-/// build_mesh_into(&chunk, &mut mesh);
-/// build_mesh_into(&chunk, &mut mesh);
+/// build_mesh_into(&chunk, &textures, &mut mesh);
+/// build_mesh_into(&chunk, &textures, &mut mesh);
 /// assert_eq!(mesh.indices.len(), 36);
 /// ```
-pub fn build_mesh_into(chunk: &Chunk, mesh: &mut ChunkMesh) {
-    build_mesh_with_neighbours_into(chunk, &Neighbours::none(), mesh);
+pub fn build_mesh_into(chunk: &Chunk, textures: &FaceTextures, mesh: &mut ChunkMesh) {
+    build_mesh_with_neighbours_into(chunk, &Neighbours::none(), textures, mesh);
 }
 
 /// Builds the mesh of a chunk like [`build_mesh_into`], but looks into the neighbouring
@@ -197,7 +201,7 @@ pub fn build_mesh_into(chunk: &Chunk, mesh: &mut ChunkMesh) {
 /// # Example
 ///
 /// ```
-/// use vox_world::{BlockId, Chunk, ChunkMesh, LocalPos, Neighbours};
+/// use vox_world::{BlockId, Chunk, ChunkMesh, FaceTextures, LocalPos, Neighbours};
 /// use vox_world::build_mesh_with_neighbours_into;
 ///
 /// let mut chunk = Chunk::new();
@@ -208,13 +212,15 @@ pub fn build_mesh_into(chunk: &Chunk, mesh: &mut ChunkMesh) {
 /// }
 /// // `wall` lies on the -X side of `chunk`, the index of `Face::NegX` is 1.
 /// let neighbours = Neighbours::new([None, Some(&wall), None, None, None, None]);
+/// let textures = FaceTextures::default();
 /// let mut mesh = ChunkMesh::default();
-/// build_mesh_with_neighbours_into(&chunk, &neighbours, &mut mesh);
+/// build_mesh_with_neighbours_into(&chunk, &neighbours, &textures, &mut mesh);
 /// assert_eq!(mesh.indices.len(), 30); // five faces, the one towards the wall is hidden
 /// ```
 pub fn build_mesh_with_neighbours_into(
     chunk: &Chunk,
     neighbours: &Neighbours<'_>,
+    textures: &FaceTextures,
     mesh: &mut ChunkMesh,
 ) {
     // HOT PATH: runs for every chunk that is generated or edited. For each of the six
@@ -241,7 +247,7 @@ pub fn build_mesh_with_neighbours_into(
                 continue;
             }
             if fill_mask(chunk, neighbours, face, slice, &mut mask) {
-                emit_rectangles(mesh, &mut mask, face, slice);
+                emit_rectangles(mesh, &mut mask, textures, face, slice);
             }
         }
     }
@@ -333,13 +339,15 @@ fn fill_mask(
     any
 }
 
-/// Cuts the faces left in `mask` into rectangles and appends one quad per rectangle.
+/// Cuts the faces left in `mask` into rectangles and appends one quad per rectangle, with
+/// the layer `textures` gives for the block and face.
 /// Each rectangle starts at the first free cell in row order, grows along `u` as far as
 /// the block stays the same, then along `v` as long as the whole row segment matches.
 /// The cells it covers are cleared, so the mask is all air afterwards.
 fn emit_rectangles(
     mesh: &mut ChunkMesh,
     mask: &mut [BlockId; MASK_CELLS],
+    textures: &FaceTextures,
     face: Face,
     slice: usize,
 ) {
@@ -374,7 +382,9 @@ fn emit_rectangles(
             let mut extent = [1; 3];
             extent[u_axis] = width;
             extent[v_axis] = height;
-            push_quad(mesh, origin, extent, face, block);
+            // Merging is by block id; the layer is a function of block and face, so one lookup
+            // per quad is enough and every cell of the rectangle has the same layer.
+            push_quad(mesh, origin, extent, face, textures.get(block, face));
             u += width;
         }
     }
@@ -414,7 +424,7 @@ fn push_quad(
     origin: [usize; 3],
     extent: [usize; 3],
     face: Face,
-    block: BlockId,
+    texture: TextureLayer,
 ) {
     // The cast cannot truncate: see `MAX_VERTICES`.
     let base = mesh.vertices.len() as u32;
@@ -425,17 +435,36 @@ fn push_quad(
         mesh.vertices.push(ChunkVertex {
             position,
             face: face.index(),
-            block,
+            texture,
         });
     }
     mesh.indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
+/// Blocks the test tables cover; more than any test chunk uses.
+#[cfg(test)]
+pub(crate) const TEST_TABLE_BLOCKS: u16 = 256;
+
+/// A table in which every face of block `i` has layer `i`, like the one the game uses until
+/// real textures: the layers of a mesh then read as block ids.
+#[cfg(test)]
+pub(crate) fn identity_textures() -> FaceTextures {
+    FaceTextures::from_layers(
+        (0..TEST_TABLE_BLOCKS)
+            .map(|id| [TextureLayer(id); Face::COUNT])
+            .collect(),
+    )
+}
+
 /// The simple mesher the greedy one replaced: one unit quad per visible face, with the
 /// same visibility rule. It stays as the reference the greedy mesher is checked against.
 #[cfg(test)]
-pub(crate) fn naive_mesh(chunk: &Chunk, neighbours: &Neighbours<'_>) -> ChunkMesh {
+pub(crate) fn naive_mesh(
+    chunk: &Chunk,
+    neighbours: &Neighbours<'_>,
+    textures: &FaceTextures,
+) -> ChunkMesh {
     let mut mesh = ChunkMesh::default();
     for pos in LocalPos::all() {
         let block = chunk.get(pos);
@@ -445,7 +474,7 @@ pub(crate) fn naive_mesh(chunk: &Chunk, neighbours: &Neighbours<'_>) -> ChunkMes
         for face in Face::ALL {
             if is_face_visible(chunk, neighbours, pos, face) {
                 let origin = [pos.x(), pos.y(), pos.z()].map(usize::from);
-                push_quad(&mut mesh, origin, [1; 3], face, block);
+                push_quad(&mut mesh, origin, [1; 3], face, textures.get(block, face));
             }
         }
     }
@@ -458,6 +487,28 @@ mod tests {
     use crate::terrain::TEST_BLOCKS;
     use crate::world::World;
     use crate::{ChunkPos, generate_chunk};
+
+    // The tests mesh with the identity table, so a layer reads as the block id. These
+    // wrappers shadow the public functions of the same names.
+    fn build_mesh(chunk: &Chunk) -> ChunkMesh {
+        super::build_mesh(chunk, &identity_textures())
+    }
+
+    fn build_mesh_into(chunk: &Chunk, mesh: &mut ChunkMesh) {
+        super::build_mesh_into(chunk, &identity_textures(), mesh);
+    }
+
+    fn build_mesh_with_neighbours_into(
+        chunk: &Chunk,
+        neighbours: &Neighbours<'_>,
+        mesh: &mut ChunkMesh,
+    ) {
+        super::build_mesh_with_neighbours_into(chunk, neighbours, &identity_textures(), mesh);
+    }
+
+    fn naive_mesh(chunk: &Chunk, neighbours: &Neighbours<'_>) -> ChunkMesh {
+        super::naive_mesh(chunk, neighbours, &identity_textures())
+    }
 
     const STONE: BlockId = BlockId(1);
 
@@ -683,12 +734,12 @@ mod tests {
         }
     }
 
-    /// Every visible face as `(face index, block id, block position)`, one entry per
+    /// Every visible face as `(face index, layer, block position)`, one entry per
     /// unit square of every quad, sorted. A merged quad is expanded into its squares, so
-    /// two meshes with the same list cover the same squares with the same blocks no
-    /// matter how the squares are grouped into quads. The block position (not the
-    /// position of the square) identifies a face: the square of a positive face lies one
-    /// block further along its normal.
+    /// two meshes with the same list cover the same squares with the same layers (the
+    /// block ids, under the identity table) no matter how the squares are grouped into
+    /// quads. The block position (not the position of the square) identifies a face: the
+    /// square of a positive face lies one block further along its normal.
     fn unit_faces(mesh: &ChunkMesh) -> Vec<(u8, u16, [i32; 3])> {
         let mut faces = Vec::new();
         for quad in mesh.vertices.chunks(VERTICES_PER_QUAD) {
@@ -714,7 +765,7 @@ mod tests {
                     block[normal] -= i32::from(offset[normal].max(0));
                     block[u] = a;
                     block[v] = b;
-                    faces.push((quad[0].face, quad[0].block.0, block));
+                    faces.push((quad[0].face, quad[0].texture.0, block));
                 }
             }
         }
@@ -725,9 +776,24 @@ mod tests {
     /// Asserts the geometry of `mesh` is sound and covers exactly the squares of the naive
     /// mesh, each once, with no more quads than the naive mesh. Returns the quad counts
     /// as `(greedy, naive)`.
+    ///
+    /// It runs twice: with the identity table, and with [`face_layer_textures`], where the
+    /// faces of one block differ, so a layer taken from the wrong face shows up.
     fn assert_matches_naive(chunk: &Chunk, neighbours: &Neighbours<'_>) -> (usize, usize) {
-        let greedy = mesh_with(chunk, neighbours);
-        let naive = naive_mesh(chunk, neighbours);
+        let counts = assert_matches_naive_with(chunk, neighbours, &identity_textures());
+        let by_face = assert_matches_naive_with(chunk, neighbours, &face_layer_textures());
+        assert_eq!(counts, by_face, "the layers must not change the merging");
+        counts
+    }
+
+    fn assert_matches_naive_with(
+        chunk: &Chunk,
+        neighbours: &Neighbours<'_>,
+        textures: &FaceTextures,
+    ) -> (usize, usize) {
+        let mut greedy = ChunkMesh::default();
+        super::build_mesh_with_neighbours_into(chunk, neighbours, textures, &mut greedy);
+        let naive = super::naive_mesh(chunk, neighbours, textures);
         assert_valid(&greedy);
         let faces = unit_faces(&greedy);
         assert_eq!(faces, unit_faces(&naive));
@@ -1183,6 +1249,111 @@ mod tests {
         for (i, face) in Face::ALL.iter().enumerate() {
             assert_eq!(face.index() as usize, i);
         }
+    }
+
+    /// A table where block 1 has a different layer on its top, its sides and its bottom,
+    /// like grass, and block 2 has one layer everywhere.
+    fn grass_textures() -> (FaceTextures, [TextureLayer; 3]) {
+        let [top, side, bottom] = [TextureLayer(10), TextureLayer(11), TextureLayer(12)];
+        let grass = Face::ALL.map(|face| match face {
+            Face::PosY => top,
+            Face::NegY => bottom,
+            _ => side,
+        });
+        let dirt = [bottom; Face::COUNT];
+        let table =
+            FaceTextures::from_layers(vec![[TextureLayer::MISSING; Face::COUNT], grass, dirt]);
+        (table, [top, side, bottom])
+    }
+
+    /// Layers a block has in [`face_layer_textures`]: top, sides, bottom.
+    const LAYERS_PER_BLOCK: u16 = 3;
+
+    /// The layer of `face` of `block` in [`face_layer_textures`]: three layers per block, one
+    /// for the top, one shared by the four sides and one for the bottom, like grass. Every
+    /// block gets its own layers, so a wrong block or a wrong face gives a wrong number.
+    fn layer_of(block: BlockId, face: Face) -> TextureLayer {
+        let kind = match face {
+            Face::PosY => 0,
+            Face::NegY => 2,
+            _ => 1,
+        };
+        TextureLayer(block.0 * LAYERS_PER_BLOCK + kind)
+    }
+
+    fn face_layer_textures() -> FaceTextures {
+        FaceTextures::from_layers(
+            (0..TEST_TABLE_BLOCKS)
+                .map(|id| Face::ALL.map(|face| layer_of(BlockId(id), face)))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_patch_of_grass_merges_into_quads_with_the_layer_of_their_face() {
+        let grass = BlockId(1);
+        let mut chunk = Chunk::new();
+        for x in 4..7 {
+            for z in 4..7 {
+                chunk.set(pos(x, 4, z), grass);
+            }
+        }
+        let mesh = super::build_mesh(&chunk, &face_layer_textures());
+        // One quad per face of the 3 x 3 x 1 slab: the merge must not split by layer.
+        assert_counts(&mesh, Face::COUNT);
+        assert_valid(&mesh);
+        for quad in mesh.vertices.chunks(VERTICES_PER_QUAD) {
+            let face = Face::ALL[usize::from(quad[0].face)];
+            let expected = layer_of(grass, face);
+            assert!(quad.iter().all(|vertex| vertex.texture == expected));
+        }
+        let layer_of_face = |wanted: Face| {
+            mesh.vertices
+                .chunks(VERTICES_PER_QUAD)
+                .find(|quad| quad[0].face == wanted.index())
+                .map(|quad| quad[0].texture)
+        };
+        // Literal numbers: top 3, sides 4, bottom 5. A swapped top and bottom fails here.
+        assert_eq!(layer_of_face(Face::PosY), Some(TextureLayer(3)));
+        assert_eq!(layer_of_face(Face::NegY), Some(TextureLayer(5)));
+        assert_eq!(layer_of_face(Face::PosX), Some(TextureLayer(4)));
+    }
+
+    #[test]
+    fn a_grass_block_gets_different_layers_on_top_side_and_bottom() {
+        let (table, [top, side, bottom]) = grass_textures();
+        let mesh = super::build_mesh(&single_block_chunk(10, 10, 10), &table);
+        assert_counts(&mesh, 6);
+        for quad in mesh.vertices.chunks(VERTICES_PER_QUAD) {
+            let expected = match Face::ALL[usize::from(quad[0].face)] {
+                Face::PosY => top,
+                Face::NegY => bottom,
+                _ => side,
+            };
+            assert!(quad.iter().all(|vertex| vertex.texture == expected));
+        }
+    }
+
+    #[test]
+    fn merging_stays_by_block_even_when_layers_coincide() {
+        // Dirt shares the grass bottom layer, yet the two blocks stay separate quads.
+        let (table, _) = grass_textures();
+        let mut chunk = Chunk::new();
+        chunk.set(pos(4, 4, 4), BlockId(1));
+        chunk.set(pos(5, 4, 4), BlockId(2));
+        let mesh = super::build_mesh(&chunk, &table);
+        // Each block has six faces, and the two touching faces are hidden; no side merges.
+        assert_counts(&mesh, 10);
+    }
+
+    #[test]
+    fn an_unknown_block_gets_the_missing_layer() {
+        let mesh = super::build_mesh(&single_block_chunk(1, 1, 1), &FaceTextures::default());
+        assert!(
+            mesh.vertices
+                .iter()
+                .all(|v| v.texture == TextureLayer::MISSING)
+        );
     }
 
     #[test]

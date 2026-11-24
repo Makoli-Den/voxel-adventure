@@ -7,25 +7,28 @@
 //! is cheap next to meshing.
 
 use vox_world::{
-    Chunk, ChunkMesh, ChunkPos, Face, LocalPos, Neighbours, TerrainBlocks, World,
+    Chunk, ChunkMesh, ChunkPos, Face, FaceTextures, LocalPos, Neighbours, TerrainBlocks, World,
     build_mesh_with_neighbours_into, generate_chunk,
 };
 
 /// Everything a job needs to know about the terrain: the seed, the blocks the generator
-/// places and the bedrock stand-in made of the stone block. Built once and shared by every
+/// places, the texture layer of each block face for the mesher and the bedrock stand-in made
+/// of the stone block. Built once and shared by every
 /// worker and by the game's remeshing.
 #[derive(Debug)]
 pub struct Terrain {
     seed: u32,
     blocks: TerrainBlocks,
+    /// The texture layer of every face of every block, read once per quad by the mesher.
+    textures: FaceTextures,
     /// The stand-in for everything below the terrain: a chunk of solid stone, so the underside
     /// of the terrain, which nobody can see, produces no faces.
     bedrock: Chunk,
 }
 
 impl Terrain {
-    /// The terrain of `seed` made of `blocks`.
-    pub fn new(seed: u32, blocks: TerrainBlocks) -> Self {
+    /// The terrain of `seed` made of `blocks`, meshed with the layers of `textures`.
+    pub fn new(seed: u32, blocks: TerrainBlocks, textures: FaceTextures) -> Self {
         let mut bedrock = Chunk::new();
         for pos in LocalPos::all() {
             bedrock.set(pos, blocks.stone);
@@ -33,6 +36,7 @@ impl Terrain {
         Self {
             seed,
             blocks,
+            textures,
             bedrock,
         }
     }
@@ -82,7 +86,7 @@ fn mesh_with_neighbours(
             .or(generated[usize::from(face.index())].as_ref())
             .or_else(|| (face == Face::NegY).then_some(&terrain.bedrock))
     }));
-    build_mesh_with_neighbours_into(chunk, &neighbours, scratch);
+    build_mesh_with_neighbours_into(chunk, &neighbours, &terrain.textures, scratch);
 }
 
 /// Generates the chunk at `pos` and its four horizontal neighbours, and meshes it into
@@ -125,19 +129,14 @@ mod tests {
     use vox_world::{BlockId, CHUNK_SIZE, CHUNK_VOLUME, build_mesh_into};
 
     use super::*;
+    use crate::content::identity_face_textures;
+    use crate::streaming::test_blocks::{BLOCK_COUNT, BLOCKS};
 
     /// The seed of the tests' terrain.
     const SEED: u32 = 1;
 
-    /// The ids of the tests' blocks: the ones the game's registry hands out.
-    const BLOCKS: TerrainBlocks = TerrainBlocks {
-        grass: BlockId(1),
-        dirt: BlockId(2),
-        stone: BlockId(3),
-    };
-
     fn terrain() -> Terrain {
-        Terrain::new(SEED, BLOCKS)
+        Terrain::new(SEED, BLOCKS, identity_face_textures(BLOCK_COUNT))
     }
 
     /// Shadows the imported function with the tests' seed and blocks filled in.
@@ -162,7 +161,7 @@ mod tests {
         }));
         let mut mesh = ChunkMesh::default();
         let chunk = world.get(pos).expect("the chunk was inserted");
-        build_mesh_with_neighbours_into(chunk, &neighbours, &mut mesh);
+        build_mesh_with_neighbours_into(chunk, &neighbours, &terrain.textures, &mut mesh);
         mesh
     }
 
@@ -227,7 +226,11 @@ mod tests {
         let mut scratch = ChunkMesh::default();
         let joined = build_chunk(&terrain(), ChunkPos::ORIGIN, &mut scratch).mesh;
         let mut alone = ChunkMesh::default();
-        build_mesh_into(&generate_chunk(ChunkPos::ORIGIN), &mut alone);
+        build_mesh_into(
+            &generate_chunk(ChunkPos::ORIGIN),
+            &terrain().textures,
+            &mut alone,
+        );
         assert!(joined.quad_count() < alone.quad_count());
     }
 
