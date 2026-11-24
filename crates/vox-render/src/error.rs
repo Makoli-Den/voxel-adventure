@@ -24,8 +24,9 @@ pub enum RenderError {
     /// NaN or infinite. The text says what is wrong.
     InvalidOverlay(&'static str),
     /// Texture data from the caller is malformed or exceeds a limit, for example the tile
-    /// size is not a power of two or there are more layers than the device supports. The
-    /// text says what is wrong, with the numbers involved.
+    /// size is not a power of two or there are more layers than the device supports, or
+    /// the mip chain built from it does not fit into host memory. The text says what is
+    /// wrong, with the numbers involved where there are any.
     InvalidTextures(String),
 }
 

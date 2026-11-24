@@ -4,6 +4,8 @@
 //! renderer uploads it as one 2D array image, one layer per texture (decision 0013, section
 //! "Textures"). This module checks the data against the limits of the format and the device
 //! and builds the default "missing" picture. It is pure, so it is unit tested without a GPU.
+//! Callers pass the base level only; the renderer builds the mip chain from it
+//! (`crate::mipmap`).
 
 use std::fmt;
 
@@ -20,7 +22,8 @@ pub struct TextureLayers<'a> {
     pub size: u32,
     /// Number of layers: at least 1, at most [`Self::MAX_LAYERS`] and the device's limit.
     pub layer_count: u32,
-    /// Exactly `layer_count * size * size * BYTES_PER_TEXEL` bytes.
+    /// Exactly `layer_count * size * size * BYTES_PER_TEXEL` bytes: the full-size picture
+    /// only. The renderer builds the smaller mip levels from it.
     pub pixels: &'a [u8],
 }
 
@@ -91,13 +94,19 @@ impl TextureLayers<'_> {
     /// count are within [`Self::MAX_SIZE`] and [`Self::MAX_LAYERS`] (64 MiB); saturates
     /// otherwise, which no slice can match.
     fn byte_len(&self) -> usize {
-        // Lossless: `u32` fits `usize` on every target the game supports (32 bits and up).
-        let side = self.size as usize;
-        let layers = self.layer_count as usize;
-        side.saturating_mul(side)
-            .saturating_mul(layers)
-            .saturating_mul(Self::BYTES_PER_TEXEL)
+        level_byte_len(self.size, self.layer_count)
     }
+}
+
+/// Bytes of `layer_count` square layers of `size` pixels: one mip level of an array, or
+/// the whole array the caller passes. Saturates instead of overflowing; no real slice or
+/// allocation is that long.
+pub(crate) fn level_byte_len(size: u32, layer_count: u32) -> usize {
+    // Lossless: `u32` fits `usize` on every target the game supports (32 bits and up).
+    let side = size as usize;
+    side.saturating_mul(side)
+        .saturating_mul(layer_count as usize)
+        .saturating_mul(TextureLayers::BYTES_PER_TEXEL)
 }
 
 /// How large a texture array may be on this device: the crate's own limits, lowered by the
@@ -128,7 +137,8 @@ const MISSING_COLOR_A: [u8; TextureLayers::BYTES_PER_TEXEL] = [255, 0, 255, u8::
 const MISSING_COLOR_B: [u8; TextureLayers::BYTES_PER_TEXEL] = [0, 0, 0, u8::MAX];
 
 /// Side of the missing picture in pixels: a 2x2 checker, one pixel per cell. The sampler
-/// filters with `NEAREST` and repeats, so each block face shows the checker sharply.
+/// magnifies with `NEAREST` and repeats, so each block face shows the checker sharply. Like
+/// every texture it gets a mip chain; its 1x1 level is the checker's mean, a dark magenta.
 pub(crate) const MISSING_SIZE: u32 = 2;
 
 /// The pixels of the missing picture: one layer, a magenta and black checker with magenta

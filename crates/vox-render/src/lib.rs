@@ -7,6 +7,7 @@
 mod error;
 mod frustum;
 mod interface;
+mod mipmap;
 mod overlay;
 mod shader;
 mod stats;
@@ -96,7 +97,10 @@ pub trait Renderer {
     fn set_overlay(&mut self, rects: &[OverlayRect]) -> Result<(), RenderError>;
 
     /// Replaces the block textures the chunk shaders sample: a 2D array, one layer per
-    /// texture, repeated across each face and filtered with `NEAREST` (no mipmaps yet).
+    /// texture, repeated across each face and filtered with `NEAREST` (sharp texels up
+    /// close). The caller passes the full-size pictures only; the renderer builds their mip
+    /// chain (halved copies down to 1x1) and blends between levels, so distant faces show
+    /// averaged colours instead of shimmering.
     ///
     /// Until this is called, a single-layer magenta and black checker is bound, so drawing
     /// is always valid. The pixels are copied to the GPU before this returns, so the caller
@@ -111,7 +115,8 @@ pub trait Renderer {
     /// Returns [`RenderError::InvalidTextures`] if the size is not a power of two or above
     /// [`TextureLayers::MAX_SIZE`], the layer count is zero or above
     /// [`TextureLayers::MAX_LAYERS`] or the device's limit, or the pixel slice does not have
-    /// exactly the expected length; nothing is allocated then. Another error is returned if
+    /// exactly the expected length; nothing is allocated then. Also if the mip chain (a
+    /// third more than the pixels) does not fit into memory. Another error is returned if
     /// the GPU cannot allocate or upload the image, or if waiting for the GPU to go idle
     /// before the swap fails (the new image is then freed and the old one stays bound). The
     /// previous textures are kept in every case.
