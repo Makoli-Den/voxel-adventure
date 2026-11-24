@@ -15,6 +15,7 @@ mod metrics;
 mod pacing;
 mod packs;
 mod physics;
+mod selection;
 mod streaming;
 
 use std::env;
@@ -31,9 +32,11 @@ use vox_render::{
     RenderError, RenderStats, Renderer, ShaderSources, TextureLayers, create_renderer,
 };
 use vox_resources::PackStack;
-use vox_world::{BlockId, ChunkMesh, World, raycast};
+use vox_world::{ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -46,6 +49,7 @@ use editing::{EditAction, REACH};
 use metrics::FrameHistory;
 use pacing::MAX_FRAME_TIME;
 use physics::{Body, WalkInput};
+use selection::Selection;
 use streaming::{ChunkStreamer, Terrain, area, remesh};
 
 /// The window title.
@@ -136,8 +140,8 @@ struct App {
     renderer: Option<Box<dyn Renderer>>,
     /// The terrain every streaming job and every remesh generates from.
     terrain: Arc<Terrain>,
-    /// The block the place key puts down.
-    place_block: BlockId,
+    /// The blocks the player may place and the one the place key puts down.
+    selection: Selection,
     /// Loads and unloads the terrain around the camera; set up with the renderer.
     streamer: Option<ChunkStreamer>,
     /// Progress of the first fill, for the log line.
@@ -191,7 +195,7 @@ impl App {
                 content.terrain,
                 content.face_textures(),
             )),
-            place_block: content.place_block,
+            selection: content.selection,
             options,
             shaders,
             block_textures: Some(content.textures),
@@ -341,6 +345,23 @@ impl App {
         Ok(())
     }
 
+    /// Applies the number key and wheel movement since the last frame to the selected block
+    /// and shows the new block in the panel.
+    fn update_selection(&mut self) -> Result<(), RenderError> {
+        let mut changed = false;
+        if let Some(slot) = self.controls.take_slot() {
+            changed |= self.selection.select_slot(slot);
+        }
+        let steps = self.controls.take_wheel_steps();
+        if steps != 0 {
+            changed |= self.selection.cycle(steps);
+        }
+        if changed {
+            self.refresh_hud()?;
+        }
+        Ok(())
+    }
+
     /// Carries out the edit the player asked for since the last frame, if any: casts a ray
     /// from the eye along the look direction, writes the block the ray picks and rebuilds the
     /// mesh of every chunk the write made out of date.
@@ -355,7 +376,7 @@ impl App {
         let Some(hit) = raycast(&self.world, eye, direction, REACH) else {
             return Ok(());
         };
-        let Some(edit) = editing::plan(action, &hit, &self.body, self.place_block) else {
+        let Some(edit) = editing::plan(action, &hit, &self.body, self.selection.selected()) else {
             return Ok(());
         };
         // `None` when the chunk of the cell is not loaded, for example above the terrain layer.
@@ -392,6 +413,11 @@ impl App {
             }
         }
         if let Err(error) = self.stream() {
+            self.fail(event_loop, error);
+            return;
+        }
+        // Before the edit, so a block chosen and placed in the same frame is the chosen one.
+        if let Err(error) = self.update_selection() {
             self.fail(event_loop, error);
             return;
         }
@@ -450,6 +476,7 @@ impl App {
                 &self.render_stats,
                 &stream_stats,
                 self.frame_limit,
+                self.selection.selected_name(),
             ))
         } else {
             Vec::new()
@@ -490,6 +517,12 @@ impl App {
                 self.refresh_after_toggle(event_loop);
             }
             KeyCode::KeyF if pressed && !repeat => self.controls.request_edit(EditAction::Place),
+            // The block choice acts on the press only; a held key must not keep selecting.
+            code if controls::is_slot_key(code) => {
+                if pressed && !repeat {
+                    self.controls.request_slot(code);
+                }
+            }
             KeyCode::KeyG if pressed && !repeat => {
                 self.toggle_walking();
             }
@@ -557,6 +590,10 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => self.controls.click(),
+            WindowEvent::MouseWheel { delta, .. } => match delta {
+                MouseScrollDelta::LineDelta(_, lines) => self.controls.scroll(lines),
+                MouseScrollDelta::PixelDelta(pixels) => self.controls.scroll_pixels(pixels.y),
+            },
             // Held keys would stay "held" forever, because their release goes to another window.
             WindowEvent::Focused(false) => self.controls.release_all(),
             WindowEvent::Focused(true) => self.controls.focus_gained(),

@@ -23,7 +23,28 @@ fn grass_dirt_and_stone_keep_ids_one_two_three() {
     assert_eq!(registry.id("base:grass"), Some(BlockId(1)));
     assert_eq!(registry.id("base:dirt"), Some(BlockId(2)));
     assert_eq!(registry.id("base:stone"), Some(BlockId(3)));
-    assert_eq!(registry.len(), 4);
+    // Air plus the three terrain blocks plus the blocks only the player places.
+    assert_eq!(registry.len(), 1 + 3 + PLAYER_BLOCKS.len());
+    for name in PLAYER_BLOCKS {
+        assert!(registry.id(name).is_some(), "{name}");
+    }
+}
+
+/// The blocks after grass, dirt and stone, in file order: terrain never places them.
+const PLAYER_BLOCKS: [&str; 4] = ["base:sand", "base:cobblestone", "base:planks", "base:log"];
+
+#[test]
+fn the_log_has_its_own_top_and_bottom_and_one_side_texture() {
+    let (registry, _) = load_blocks(&built_in()).unwrap();
+    let layer = |face| {
+        registry
+            .face_textures()
+            .get(registry.id("base:log").unwrap(), face)
+    };
+    assert_eq!(layer(Face::PosY), layer(Face::NegY));
+    assert_ne!(layer(Face::PosY), layer(Face::PosX));
+    assert_eq!(layer(Face::PosX), layer(Face::NegZ));
+    assert_ne!(layer(Face::PosX), TextureLayer::MISSING);
 }
 
 #[test]
@@ -40,6 +61,7 @@ fn grass_has_different_top_side_and_bottom_and_dirt_is_shared() {
     assert!(top != side && side != bottom && top != bottom);
     assert_eq!(bottom, layer("base:dirt", Face::PosX));
     assert_ne!(top, TextureLayer::MISSING);
-    // Missing + grass_top + grass_side + dirt + stone.
-    assert_eq!(textures.len(), 5);
+    // Missing + grass_top + grass_side + dirt + stone + sand + cobblestone + planks + log_side
+    // + log_top.
+    assert_eq!(textures.len(), 10);
 }
