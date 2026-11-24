@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn vertex_bytes_are_position_face_block_little_endian() {
+    fn vertex_bytes_are_position_face_texture_layer_little_endian() {
         assert_eq!(vertex_bytes(&[sample()]), [1, 2, 32, 5, 0x02, 0x03]);
     }
 

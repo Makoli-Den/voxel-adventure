@@ -129,14 +129,13 @@ mod tests {
     use vox_world::{BlockId, CHUNK_SIZE, CHUNK_VOLUME, build_mesh_into};
 
     use super::*;
-    use crate::content::identity_face_textures;
-    use crate::streaming::test_blocks::{BLOCK_COUNT, BLOCKS};
+    use crate::streaming::test_blocks::{BLOCKS, face_textures};
 
     /// The seed of the tests' terrain.
     const SEED: u32 = 1;
 
     fn terrain() -> Terrain {
-        Terrain::new(SEED, BLOCKS, identity_face_textures(BLOCK_COUNT))
+        Terrain::new(SEED, BLOCKS, face_textures())
     }
 
     /// Shadows the imported function with the tests' seed and blocks filled in.

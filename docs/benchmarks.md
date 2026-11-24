@@ -355,3 +355,22 @@ window size, 7 s, camera standing still).
 | 30 | 307 | 674 | 3.20 ms | 1.41 ms | |
 
 The picture is identical to the per-face mesh (checked on a screenshot), as the coverage tests promise.
+
+## Textured blocks (2026-11-24, step S7 of decision 0013)
+
+The chunk shaders now sample the block texture array (one `texture()` call per fragment, UVs
+derived from the position in the vertex shader) instead of a per-block colour. Command line:
+`vox-game.exe --background --view-radius N` (release build, default window size, camera standing
+still at the start position, 8 s per run, RTX 4070 SUPER). "Before" is `main` at the end of step S6
+(palette colours), built from the same sources; before and after runs alternated, three each.
+The figures are the run summaries' `gpu` (upper bound) and FPS.
+
+| Radius | GPU before (3 runs) | GPU after (3 runs) | FPS before | FPS after |
+|---|---|---|---|---|
+| 8 (default) | 0.08, 0.09, 0.09 ms | 0.09, 0.09, 0.09 ms | 3596, 3545, 3545 | 3577, 3516, 3467 |
+| 16 | 0.43, 0.43, 0.43 ms | 0.42, 0.42, 0.42 ms | 1746, 1735, 1740 | 1748, 1730, 1749 |
+
+No measurable cost on this GPU: the differences are within the run-to-run spread, and the
+summary prints the GPU time to 0.01 ms. The textures are 16x16 with five layers, so
+they stay in the texture cache; a slow integrated GPU and larger packs (256x256 tiles) are not
+measured yet, and distant terrain samples without mipmaps until step S8.

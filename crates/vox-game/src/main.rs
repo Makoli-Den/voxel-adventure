@@ -26,7 +26,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use vox_render::{RenderError, RenderStats, Renderer, ShaderSources, create_renderer};
+use vox_content::BlockTextures;
+use vox_render::{
+    RenderError, RenderStats, Renderer, ShaderSources, TextureLayers, create_renderer,
+};
 use vox_resources::PackStack;
 use vox_world::{BlockId, ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
@@ -37,7 +40,7 @@ use winit::window::{Window, WindowId};
 
 use camera::{Camera, Movement};
 use cli::{Command, Options};
-use content::{Content, identity_face_textures};
+use content::Content;
 use controls::Controls;
 use editing::{EditAction, REACH};
 use metrics::FrameHistory;
@@ -124,6 +127,9 @@ struct App {
     options: Options,
     /// The GLSL of every pipeline, read from the packs before the window opens.
     shaders: ShaderSources,
+    /// The block textures, read from the packs before the window opens and handed to the
+    /// renderer when it is created; `None` after that, so the pixels are not kept twice.
+    block_textures: Option<BlockTextures>,
     /// When the app was created, for the `--fly` autopilot's duration.
     run_started: Instant,
     window: Option<Arc<Window>>,
@@ -178,18 +184,17 @@ struct App {
 }
 
 impl App {
-    fn new(options: Options, shaders: ShaderSources, content: &Content) -> Self {
+    fn new(options: Options, shaders: ShaderSources, content: Content) -> Self {
         Self {
             terrain: Arc::new(Terrain::new(
                 WORLD_SEED,
                 content.terrain,
-                // Until step S7 the layer equals the block id, so the palette shader still
-                // colours by block.
-                identity_face_textures(content.registry.len()),
+                content.face_textures(),
             )),
             place_block: content.place_block,
             options,
             shaders,
+            block_textures: Some(content.textures),
             run_started: Instant::now(),
             window: None,
             renderer: None,
@@ -228,6 +233,15 @@ impl App {
         let mut renderer =
             create_renderer(Arc::clone(&window), size.width, size.height, &self.shaders)?;
         println!("Rendering on: {}", renderer.device_name());
+        if let Some(textures) = self.block_textures.take() {
+            renderer
+                .set_block_textures(&texture_layers(&textures))
+                .map_err(|error| {
+                    format!(
+                        "cannot use the block textures: {error}; check the packs given with --pack"
+                    )
+                })?;
+        }
         renderer.set_camera(self.camera.view_projection(size.width, size.height));
 
         // No chunk is loaded here: the first frames stream them in, nearest first.
@@ -605,6 +619,15 @@ impl ApplicationHandler for App {
     }
 }
 
+/// The renderer's borrowed view of the block textures the content loader built.
+fn texture_layers(textures: &BlockTextures) -> TextureLayers<'_> {
+    TextureLayers {
+        size: textures.size,
+        layer_count: textures.layer_count,
+        pixels: &textures.pixels,
+    }
+}
+
 /// Stacks the built-in pack and the `--pack` directories and warns about any `--pack` that is
 /// not a directory.
 ///
@@ -681,7 +704,7 @@ fn main() -> ExitCode {
     };
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(options, shaders, &content);
+    let mut app = App::new(options, shaders, content);
     let result = event_loop.run_app(&mut app);
     // The summary is printed however the loop ended. A closed standard output is not a
     // reason to fail (`println!` would panic), so a write error is ignored.

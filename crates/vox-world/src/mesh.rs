@@ -446,8 +446,8 @@ fn push_quad(
 #[cfg(test)]
 pub(crate) const TEST_TABLE_BLOCKS: u16 = 256;
 
-/// A table in which every face of block `i` has layer `i`, like the one the game uses until
-/// real textures: the layers of a mesh then read as block ids.
+/// A table in which every face of block `i` has layer `i`, for tests only (the game uses the
+/// registry's real table): the layers of a mesh then read as block ids.
 #[cfg(test)]
 pub(crate) fn identity_textures() -> FaceTextures {
     FaceTextures::from_layers(

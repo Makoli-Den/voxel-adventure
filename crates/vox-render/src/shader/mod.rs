@@ -603,4 +603,72 @@ void main() { broken }
             "{text}"
         );
     }
+
+    /// The `vec3` entries of the GLSL array constant `name` in `source`, one per face, in
+    /// the order of `Face::ALL`. Expects the plain layout of the built-in shader:
+    /// `const vec3 NAME[6] = vec3[6](vec3(a, b, c), ...);`.
+    fn vec3_table(source: &str, name: &str) -> Vec<[f32; 3]> {
+        let start = source
+            .find(&format!("const vec3 {name}["))
+            .unwrap_or_else(|| panic!("{name} is missing"));
+        let body = &source[start..];
+        let body = &body[body.find('(').unwrap() + 1..body.find(");").unwrap()];
+        body.split("vec3(")
+            .skip(1)
+            .map(|entry| {
+                let numbers: Vec<f32> = entry
+                    .split(')')
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .map(|n| n.trim().parse().unwrap())
+                    .collect();
+                [numbers[0], numbers[1], numbers[2]]
+            })
+            .collect()
+    }
+
+    /// The number of entries of the GLSL `float` array constant `name` in `source`, written
+    /// as `const float NAME[6] = float[6](a, b, ...);`.
+    fn float_count(source: &str, name: &str) -> usize {
+        let start = source
+            .find(&format!("const float {name}["))
+            .unwrap_or_else(|| panic!("{name} is missing"));
+        let body = &source[start..];
+        let body = &body[body.find('(').unwrap() + 1..body.find(");").unwrap()];
+        body.split(',').count()
+    }
+
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    /// The texture axes of the built-in `chunk.vert` (decision 0013, section "Textures"):
+    /// side textures stand upright, and no face shows its texture mirrored from outside.
+    #[test]
+    fn built_in_chunk_uvs_are_upright_and_not_mirrored() {
+        use vox_world::Face;
+
+        let source = built_in("chunk.vert").text;
+        assert_eq!(float_count(&source, "FACE_SHADE"), Face::COUNT);
+        let u_axes = vec3_table(&source, "FACE_U");
+        let v_axes = vec3_table(&source, "FACE_V");
+        assert_eq!((u_axes.len(), v_axes.len()), (Face::COUNT, Face::COUNT));
+        let down = [0.0, -1.0, 0.0];
+        for face in Face::ALL {
+            let index = usize::from(face.index());
+            let (u, v) = (u_axes[index], v_axes[index]);
+            let normal = face.offset().map(f32::from);
+            // Picture right x picture down points into the face, away from the viewer
+            // outside: the same handedness as the screen, so nothing is mirrored.
+            assert_eq!(cross(u, v), normal.map(|n| -n), "{face:?} is mirrored");
+            if normal[1] == 0.0 {
+                assert_eq!(v, down, "{face:?} is not upright");
+            }
+        }
+    }
 }

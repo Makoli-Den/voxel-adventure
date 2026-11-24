@@ -1,5 +1,5 @@
-//! The real `assets/base/blocks.json` loads and keeps the ids the shader palette and the
-//! terrain fingerprints depend on.
+//! The real `assets/base/blocks.json` loads and keeps the ids the terrain fingerprints depend
+//! on.
 
 #![allow(clippy::unwrap_used)]
 

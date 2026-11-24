@@ -1,6 +1,6 @@
 # 0013. Resources, block definitions and textured blocks
 
-Status: accepted.
+Status: accepted. Steps S1 to S7 are done (the terrain is drawn with the block textures); S8 (mipmaps) remains.
 
 ## Context
 Blocks are three hard-coded ids (`GRASS`, `DIRT`, `STONE` in `vox-world/src/terrain.rs`) coloured by a palette inside `chunk.vert`. Shaders are read from a fixed folder (decision 0003, which promised a resource file system later). The next milestone is textured blocks whose definitions and pictures come from files, so that architecture rules 3 (content is data), 4 (`mod:path` resources in layered packs) and 5 (numeric ids through a registry) start to hold, and a texture pack can replace any texture.
@@ -117,7 +117,7 @@ S1 and S3 can start together. S4 needs S1 and S3. S6 (render only) runs alongsid
 - **TOML (`toml`):** a larger dependency tree (`toml_edit`/`winnow`/`indexmap`), awkward for lists of nested tables. **RON (`ron`):** Rust-specific syntax that modders do not know. **`nanoserde`:** no dependencies, but a second serialization framework beside serde, which is already in the tree.
 - **`image` crate:** many formats and much more code for one format.
 - **A `Pack` trait and zip packs now:** one implementation exists; added with the second.
-- **Keeping `GRASS`/`DIRT`/`STONE` as public constants:** the generator would depend on ids a pack can reorder; the migration to names is small. Until S6a the shader palette is still indexed by block id, so the game temporarily checks at startup that grass, dirt and stone resolve to ids 1, 2 and 3 and stops with an error otherwise; the check is removed with S6a, when the palette goes away.
+- **Keeping `GRASS`/`DIRT`/`STONE` as public constants:** the generator would depend on ids a pack can reorder; the migration to names is small. Until S7 the shader palette is still indexed by block id, so the game temporarily checks at startup that grass, dirt and stone resolve to ids 1, 2 and 3 and stops with an error otherwise; the check is removed with S7, when the palette goes away.
 - **`vkCmdBlitImage` for mipmaps:** format feature checks and per-level barriers for a one-time job the CPU does in milliseconds.
 - **sRGB texture format now:** with the `UNORM` swapchain the colours would come out darker than the files; switching both is its own decision.
 

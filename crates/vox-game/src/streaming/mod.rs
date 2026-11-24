@@ -134,7 +134,7 @@ impl ChunkStreamer {
 /// The blocks every streaming test uses, in one place.
 #[cfg(test)]
 mod test_blocks {
-    use vox_world::{BlockId, TerrainBlocks};
+    use vox_world::{BlockId, Face, FaceTextures, TerrainBlocks, TextureLayer};
 
     /// The ids of the tests' blocks: the ones the game's registry hands out.
     pub const BLOCKS: TerrainBlocks = TerrainBlocks {
@@ -145,9 +145,18 @@ mod test_blocks {
 
     /// Blocks the tests' texture table covers: air and every id up to the highest terrain
     /// block (stone, checked below).
-    pub const BLOCK_COUNT: usize = BLOCKS.stone.0 as usize + 1;
+    const BLOCK_COUNT: usize = BLOCKS.stone.0 as usize + 1;
 
     const _: () = assert!(BLOCKS.grass.0 < BLOCKS.stone.0 && BLOCKS.dirt.0 < BLOCKS.stone.0);
+
+    /// The tests' texture table: every face of block `i` has layer `i`. The tests compare
+    /// meshes built the same way, so any table would do; this one keeps the blocks apart.
+    pub fn face_textures() -> FaceTextures {
+        let layers = (0..BLOCK_COUNT)
+            .map(|id| [TextureLayer(u16::try_from(id).unwrap()); Face::COUNT])
+            .collect();
+        FaceTextures::from_layers(layers)
+    }
 }
 
 #[cfg(test)]
@@ -156,20 +165,15 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::content::identity_face_textures;
 
     /// A small radius keeps the test fast: 13 columns.
     const RADIUS: i32 = 2;
     /// The seed of the tests' terrain.
     const SEED: u32 = 1;
-    use super::test_blocks::{BLOCK_COUNT, BLOCKS};
+    use super::test_blocks::{BLOCKS, face_textures};
 
     fn terrain() -> Arc<Terrain> {
-        Arc::new(Terrain::new(
-            SEED,
-            BLOCKS,
-            identity_face_textures(BLOCK_COUNT),
-        ))
+        Arc::new(Terrain::new(SEED, BLOCKS, face_textures()))
     }
     /// How long the test waits for the workers before it fails.
     const TIMEOUT: Duration = Duration::from_secs(10);
