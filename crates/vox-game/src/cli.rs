@@ -29,6 +29,9 @@ pub struct Options {
     /// the built-in pack, each one above the previous, so a later pack overrides an earlier
     /// one file by file (decision 0013).
     pub packs: Vec<PathBuf>,
+    /// Mods folders from `--mods`, in command-line order. Each holds one folder per mod
+    /// (decision 0014). Empty means the built-in mods folder, so the base game loads.
+    pub mods: Vec<PathBuf>,
 }
 
 impl Default for Options {
@@ -38,6 +41,7 @@ impl Default for Options {
             view_radius: DEFAULT_VIEW_RADIUS,
             fly_seconds: None,
             packs: Vec::new(),
+            mods: Vec::new(),
         }
     }
 }
@@ -55,7 +59,7 @@ pub enum Command {
 /// constants, so the text cannot disagree with what the parser accepts.
 pub fn usage() -> String {
     format!(
-        "Usage: vox-game [--background] [--view-radius N] [--fly SECONDS] [--pack DIR]...
+        "Usage: vox-game [--background] [--view-radius N] [--fly SECONDS] [--pack DIR]... [--mods DIR]...
 
 Options:
   --background     open the window without taking the keyboard focus
@@ -63,6 +67,9 @@ Options:
   --fly SECONDS    fly sideways automatically, then quit (for measuring)
   --pack DIR       use the resource pack in DIR over the built-in one; repeatable, a later
                    pack overrides an earlier one
+  --mods DIR       load the mods found in DIR instead of the built-in mods folder; repeatable,
+                   a mod id may appear in only one folder; without the base mod (`base`)
+                   in one of them the game stops
   -h, --help       print this text"
     )
 }
@@ -87,7 +94,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Command, String> 
             }
             "--pack" => {
                 let dir = args.next().ok_or("--pack needs a directory")?;
-                options.packs.push(parse_pack(&dir)?);
+                options.packs.push(parse_dir("--pack", &dir)?);
+            }
+            "--mods" => {
+                let dir = args.next().ok_or("--mods needs a directory")?;
+                options.mods.push(parse_dir("--mods", &dir)?);
             }
             "-h" | "--help" => return Ok(Command::Help),
             _ => return Err(format!("unknown option: {arg}")),
@@ -106,10 +117,11 @@ fn parse_fly_seconds(value: &str) -> Result<f32, String> {
 }
 
 /// Rejects an empty directory and one that looks like an option: `--pack --background` is
-/// almost surely a forgotten directory, not a folder named `--background`.
-fn parse_pack(value: &str) -> Result<PathBuf, String> {
+/// almost surely a forgotten directory, not a folder named `--background`. `option` names the
+/// option the value belongs to, for the message.
+fn parse_dir(option: &str, value: &str) -> Result<PathBuf, String> {
     if value.is_empty() || value.starts_with("--") {
-        return Err(format!("--pack needs a directory, got: {value:?}"));
+        return Err(format!("{option} needs a directory, got: {value:?}"));
     }
     Ok(PathBuf::from(value))
 }
@@ -202,6 +214,7 @@ mod tests {
         assert!(text.contains("--background"));
         assert!(text.contains("--view-radius"));
         assert!(text.contains("--pack"));
+        assert!(text.contains("--mods"));
         assert!(text.contains("--help"));
     }
 
@@ -233,6 +246,34 @@ mod tests {
         let error = parse_all(&["--pack", ""]).unwrap_err();
         assert!(error.contains("--pack needs a directory"), "{error}");
         let error = parse_all(&["--pack", "--background"]).unwrap_err();
+        assert!(error.contains("--background"), "{error}");
+    }
+
+    #[test]
+    fn mods_folders_are_kept_in_command_line_order() {
+        let mods = |args: &[&str]| match parse_all(args) {
+            Ok(Command::Run(options)) => Ok(options.mods),
+            other => Err(format!("{other:?}")),
+        };
+        assert_eq!(mods(&[]), Ok(Vec::new()));
+        assert_eq!(
+            mods(&["--mods", "first", "--background", "--mods", "second"]),
+            Ok(vec![PathBuf::from("first"), PathBuf::from("second")])
+        );
+    }
+
+    #[test]
+    fn mods_needs_a_directory() {
+        let error = parse_all(&["--mods"]).unwrap_err();
+        assert!(error.contains("--mods needs a directory"), "{error}");
+    }
+
+    #[test]
+    fn mods_rejects_an_empty_value_and_an_option() {
+        let error = parse_all(&["--mods", ""]).unwrap_err();
+        assert!(error.contains("--mods needs a directory"), "{error}");
+        let error = parse_all(&["--mods", "--background"]).unwrap_err();
+        assert!(error.contains("--mods needs a directory"), "{error}");
         assert!(error.contains("--background"), "{error}");
     }
 }

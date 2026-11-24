@@ -3,7 +3,7 @@
 //!
 //! A mod is a directory `<id>/` with a `mod.json` manifest and an `assets/` pack. This crate
 //! reads only the manifests: it runs no scripts and reads no assets. It knows nothing about
-//! rendering and is not used by the game yet.
+//! rendering. The game calls it at startup (`vox-game`, decision 0014 step S3).
 //!
 //! - [`manifest`]: [`ModManifest`], [`ModId`], [`ApiVersion`], [`Capability`] and their rules.
 //! - [`discover()`]: finds the mods of a folder.
