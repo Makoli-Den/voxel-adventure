@@ -401,6 +401,13 @@ pub fn lines(
         "Columns",
         format!("loaded {}  queued {}", stream.loaded, stream.queued),
     ));
+    lines.push(line(
+        "Tiles",
+        format!(
+            "loaded {}  queued {}",
+            stream.tiles_loaded, stream.tiles_queued
+        ),
+    ));
     lines.push(line("Limit", if frame_limit { "on" } else { "off" }));
     lines.push(line("Keys", "Esc menu, L limit, F3 panel"));
     lines.push(line("Edit", "click break, F place"));
@@ -668,10 +675,14 @@ mod tests {
         let stream = StreamStats {
             loaded: 120,
             queued: 77,
+            tiles_loaded: 640,
+            tiles_queued: 3,
+            ..StreamStats::default()
         };
         for summary in [Some(summary()), None] {
             let text = lines(summary.as_ref(), &RenderStats::default(), &stream, false).join("\n");
             assert!(text.contains("Columns  loaded 120  queued 77"), "{text}");
+            assert!(text.contains("Tiles    loaded 640  queued 3"), "{text}");
         }
     }
 

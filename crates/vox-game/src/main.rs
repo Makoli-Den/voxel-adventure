@@ -58,7 +58,7 @@ use metrics::FrameHistory;
 use pacing::MAX_FRAME_TIME;
 use physics::{Body, Space, WalkInput};
 use selection::Selection;
-use streaming::{ChunkStreamer, ColumnSpans, Terrain, area, remesh};
+use streaming::{ChunkStreamer, ColumnSpans, StreamStats, Terrain, area, remesh};
 
 /// The window title.
 const WINDOW_TITLE: &str = "Voxel Adventure";
@@ -79,8 +79,13 @@ const MOVE_SPEED: f32 = 40.0;
 /// How far the camera turns per pixel of mouse motion, in radians.
 const LOOK_SENSITIVITY: f32 = 0.0025;
 
-/// Timing of the first fill of the area around the camera, for one log line: the time from
-/// the start until nothing is queued any more, and the time spent in uploads on the way.
+/// Bytes in a mebibyte, for the memory figures of the log lines.
+const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+
+/// Timing of the first fill of the area and the horizon around the camera, for one log line:
+/// the time from the start until nothing is queued any more, and the time spent in uploads on
+/// the way. After that, how often columns or tiles were still waiting, the cheap stand-in for
+/// holes in the ground until step S8 measures the uncovered area.
 struct FillReport {
     /// When streaming started.
     started: Instant,
@@ -90,6 +95,12 @@ struct FillReport {
     uploads: u32,
     /// Whether the line has been printed; it is printed once.
     printed: bool,
+    /// Frames since the first fill.
+    frames_after_fill: u32,
+    /// Of those, frames with columns or tiles waiting (a hole, or new ground at the edge).
+    frames_waiting: u32,
+    /// The most columns and tiles waiting in one frame after the first fill.
+    most_waiting: usize,
 }
 
 impl FillReport {
@@ -99,7 +110,34 @@ impl FillReport {
             upload_time: Duration::ZERO,
             uploads: 0,
             printed: false,
+            frames_after_fill: 0,
+            frames_waiting: 0,
+            most_waiting: 0,
         }
+    }
+
+    /// Counts a frame after the first fill and whether columns or tiles were waiting in it.
+    fn add_frame(&mut self, stats: &StreamStats) {
+        if !self.printed {
+            return;
+        }
+        self.frames_after_fill = self.frames_after_fill.saturating_add(1);
+        let waiting = stats.waiting();
+        if waiting > 0 {
+            self.frames_waiting = self.frames_waiting.saturating_add(1);
+        }
+        self.most_waiting = self.most_waiting.max(waiting);
+    }
+
+    /// The figures since the first fill, for the run summary.
+    fn waiting_summary(&self) -> String {
+        if !self.printed {
+            return "first fill not reached".to_owned();
+        }
+        format!(
+            "after the first fill {} of {} frames had columns or tiles waiting (most {})",
+            self.frames_waiting, self.frames_after_fill, self.most_waiting
+        )
     }
 
     /// Adds a frame's uploads.
@@ -113,21 +151,26 @@ impl FillReport {
     /// The log line, the first time it is asked for after the queue emptied.
     fn line_once(&mut self, streamer: &ChunkStreamer) -> Option<String> {
         let stats = streamer.stats();
-        if self.printed || stats.queued > 0 {
+        if self.printed || stats.waiting() > 0 {
             return None;
         }
         self.printed = true;
         let average_job = streamer.average_job_time().unwrap_or_default();
+        let average_tile = streamer.average_tile_time().unwrap_or_default();
         let average_upload = if self.uploads > 0 {
             self.upload_time / self.uploads
         } else {
             Duration::ZERO
         };
         Some(format!(
-            "Streaming: {} columns loaded in {:.1} ms, average job {:.3} ms, average upload {:.3} ms, {} workers",
+            "Streaming: {} columns and {} tiles loaded in {:.1} ms ({} meshes, {:.1} MiB), average job {:.3} ms column / {:.3} ms tile, average upload {:.3} ms, {} workers",
             stats.loaded,
+            stats.tiles_loaded,
             metrics::millis(self.started.elapsed()),
+            self.uploads,
+            stats.mesh_bytes as f64 / BYTES_PER_MIB,
             metrics::millis(average_job),
+            metrics::millis(average_tile),
             metrics::millis(average_upload),
             streamer.worker_count()
         ))
@@ -167,7 +210,11 @@ struct App {
     /// Reused for the mesh of every chunk rebuilt after an edit.
     edit_scratch: ChunkMesh,
     camera: Camera,
-    /// The fog, set from the view radius: it ends where the loaded terrain may end.
+    /// The horizon in blocks the game streams tiles to: the option, lowered for the mesh
+    /// budget and the depth buffer when the renderer starts (0: no tiles).
+    horizon: i32,
+    /// The fog, set from the view radius and the horizon: it ends where the drawn terrain may
+    /// end.
     fog: Fog,
     /// Distance of the camera's far plane in blocks, just beyond the fog end.
     far_plane: f32,
@@ -215,7 +262,8 @@ struct App {
 impl App {
     fn new(options: Options, shaders: ShaderSources, content: Content) -> Self {
         let input_mode = InputMode::new(input_mode::starts_awaiting(&options));
-        let fog = view_distance::fog(options.view_radius);
+        // Without tiles until `start` knows what the renderer's depth buffer allows.
+        let fog = view_distance::fog(options.view_radius, 0);
         Self {
             terrain: Arc::new(Terrain::new(
                 WORLD_SEED,
@@ -236,6 +284,7 @@ impl App {
             edited: EditedChunks::default(),
             edit_scratch: ChunkMesh::default(),
             camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
+            horizon: 0,
             fog,
             far_plane: view_distance::far_plane(fog),
             // A placeholder: `start` overwrites it from the renderer before the first
@@ -282,8 +331,21 @@ impl App {
                     )
                 })?;
         }
-        renderer.set_fog(self.fog);
         self.depth_mode = renderer.depth_mode();
+        let horizon = view_distance::effective_horizon(
+            self.options.horizon,
+            self.options.view_radius,
+            self.depth_mode.max_horizon(),
+        );
+        if let Some(note) =
+            view_distance::horizon_note(self.options.horizon, self.options.view_radius, horizon)
+        {
+            eprintln!("{note}");
+        }
+        self.horizon = horizon.blocks;
+        self.fog = view_distance::fog(self.options.view_radius, self.horizon);
+        self.far_plane = view_distance::far_plane(self.fog);
+        renderer.set_fog(self.fog);
         renderer.set_camera(&self.camera_view(size.width, size.height));
 
         // No chunk is loaded here: the first frames stream them in, nearest first.
@@ -291,6 +353,7 @@ impl App {
         self.streamer = Some(ChunkStreamer::new(
             Arc::clone(&self.terrain),
             self.options.view_radius,
+            self.horizon,
         ));
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -382,11 +445,12 @@ impl App {
         }
     }
 
-    /// One frame of streaming: loads and unloads chunk columns around the camera and hands the
-    /// finished meshes to the renderer. Removals come first, so their memory is freed before
-    /// the uploads need it. An unloaded column takes every chunk of it along, also those an
-    /// edit created; a streamed chunk never replaces one already in the world, and neither
-    /// does its mesh.
+    /// One frame of streaming: loads and unloads chunk columns and tiles around the camera and
+    /// hands the finished meshes to the renderer. Removals come first, so their memory is freed
+    /// before the uploads need it. An unloaded column takes every chunk of it along, also those
+    /// an edit created; a streamed chunk never replaces one already in the world, and neither
+    /// does its mesh. Tiles of level 1 or more have keys of their own level, so they never
+    /// meet a chunk's mesh in the renderer.
     fn stream(&mut self) -> Result<(), Box<dyn Error>> {
         let (Some(streamer), Some(renderer)) = (self.streamer.as_mut(), self.renderer.as_mut())
         else {
@@ -397,6 +461,9 @@ impl App {
             for pos in column.chunks() {
                 renderer.remove_tile_mesh(TilePos::chunk(pos));
             }
+        }
+        for tile in &changes.removed_tiles {
+            renderer.remove_tile_mesh(*tile);
         }
         let arrived: Vec<_> = changes.loaded.iter().map(|loaded| loaded.column).collect();
         let kept = editing::apply_streamed(
@@ -416,6 +483,10 @@ impl App {
             .filter(|(pos, _)| !kept.contains(pos))
         {
             renderer.set_tile_mesh(TilePos::chunk(*pos), mesh)?;
+            uploaded += 1;
+        }
+        for (tile, mesh) in &changes.tile_uploads {
+            renderer.set_tile_mesh(*tile, mesh)?;
             uploaded += 1;
         }
         if uploaded > 0 {
@@ -444,6 +515,7 @@ impl App {
         if let Some(line) = self.fill.line_once(streamer) {
             println!("{line}");
         }
+        self.fill.add_frame(&streamer.stats());
         Ok(())
     }
 
@@ -706,13 +778,26 @@ impl App {
         }
     }
 
-    /// The figures of the whole run, for the line printed when the game ends, and the
-    /// triangles the last frame drew per tile level (decision 0015 budgets them).
+    /// The figures of the whole run, for the line printed when the game ends, the triangles
+    /// the last frame drew per tile level and what streaming held at the end (decision 0015
+    /// budgets them).
     fn run_summary(&self) -> Option<String> {
         let summary = self.run_frames.summary()?;
+        let stream = self
+            .streamer
+            .as_ref()
+            .map(ChunkStreamer::stats)
+            .unwrap_or_default();
         Some(format!(
-            "Run summary (frames: {}, play time: {:.1?}): {summary} | last frame triangles by level {:?}",
-            summary.frames, summary.covered, self.render_stats.triangles_per_level
+            "Run summary (frames: {}, play time: {:.1?}): {summary} | last frame triangles by level {:?} | horizon {} blocks, {} columns and {} tiles loaded, {:.1} MiB of meshes | {}",
+            summary.frames,
+            summary.covered,
+            self.render_stats.triangles_per_level,
+            self.horizon,
+            stream.loaded,
+            stream.tiles_loaded,
+            stream.mesh_bytes as f64 / BYTES_PER_MIB,
+            self.fill.waiting_summary()
         ))
     }
 

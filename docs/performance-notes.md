@@ -9,7 +9,7 @@ Source of ideas: a breakdown of the video "My game is 262,000 times faster than 
 4. Compact vertices: positions stored in bytes.
 5. Cubic chunks, so the world is infinite in height as well. (Done: `ChunkPos` has three coordinates and `World` stores chunks by it, see decision 0006. Faces hidden by a neighbouring chunk are skipped too, item 2.)
 6. Chunk generation and mesh building run off the main thread.
-7. Chunk LOD: distant chunks at lower resolution, merged into larger meshes.
+7. Chunk LOD: distant chunks at lower resolution, merged into larger meshes. (Done: level-of-detail tiles out to a 2048-block horizon, decision 0015; at the default settings about 930 meshes and 196 k triangles drawn at the start view, see `docs/benchmarks.md`.)
 8. Greedy meshing. (Done: `build_mesh_with_neighbours_into` merges coplanar faces of the same block and direction into rectangles, see `docs/benchmarks.md` for the quad counts and the cost.)
 9. Multiplayer: only the world seed and modified chunks go over the network.
 10. GPU-driven rendering: indirect draw, push constants, GPU occlusion culling (depth pyramid).
@@ -28,3 +28,9 @@ Check every speed decision with a measurement on a prototype: one chunk, generat
 - Drawing only half of each chunk's indices roughly halved the GPU time (1.2 to 0.63 ms at radius 16,
   3.2 to 1.84 ms at radius 30): the cost is proportional to the triangles, not to the draw calls.
   Fewer triangles is the lever: greedy meshing, then level of detail for distant chunks.
+- Removing a mesh from the renderer costs about 80 us on the development machine (a temporary
+  probe in decision 0015 S7): a camera that crosses a level border at radius 16 drops about 260
+  meshes in one frame and that frame takes about 25 ms, while the selection and the trackers take
+  about 0.5 ms. Hypothesis, not isolated: the driver's per-allocation free (`remove_tile_mesh`
+  also polls the fences on every call). Fewer, larger allocations, one poll per frame or a
+  bounded number of frees per frame are the levers.

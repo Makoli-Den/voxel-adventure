@@ -792,3 +792,100 @@ to about 2,000 blocks away shows no z-fighting with reversed Z. The same far vie
 depth forced differs in 884 pixels of the whole image and shows no visible fighting either:
 level-2 faces are at least 4 blocks apart, more than the computed 2.5-block step at 2048, so
 this scene does not provoke it.
+
+## LOD streaming (2026-11-25, step S7 of decision 0015)
+
+Development machine (RTX 4070 SUPER), release builds of `main` (exported with `git archive`
+and built apart; its default radius was 12) and this step, start view, the window as the game
+opens it (about 800 x 600), runs of 8 s each started with `--background` and a hidden console,
+alternating between the cases (three rounds). FPS, 1% low, worst frame, GPU and triangles come
+from the run summary (the triangles are those of the last frame, by level); meshes, MiB and the
+fill time from the fill log line (`Streaming: ... loaded in ... ms (N meshes, X MiB)`). MiB is
+the vertex and index payload of the streamed meshes, not the driver's allocation sizes. The
+maximum case asks for `--view-radius 16 --horizon 4096`; the game lowers the horizon to 3328
+for the mesh budget and says so on stderr.
+
+| Case | FPS (median; runs) | 1% low | Worst frame | GPU | Triangles by level 0..3 (total) |
+|---|---|---|---|---|---|
+| `main` radius 12 standing | 2819 (2688, 2855, 2819) | 256-290 | 9.0-10.0 ms | 0.12 ms | 106,904 (level 0 only) |
+| default (radius 8, horizon 2048) standing | 1898 (1898, 1927, 1865) | 239-250 | 10.5-12.3 ms | 0.31 ms | 72,994 / 63,350 / 43,848 / 16,208 (196,400) |
+| radius 8, `--horizon 0` standing | 3142 (3083, 3142, 3474) | 228-281 | 9.5-11.0 ms | 0.06 ms | 48,638 (level 0 only) |
+| maximum (radius 16, horizon 3328) standing | 846 (846, 815, 847) | 178-188 | 9.4-9.7 ms | 1.01-1.04 ms | 213,220 / 184,782 / 137,554 / 35,232 (570,788) |
+| `main` radius 12 `--fly 8` | 2558 (2558, 2402, 2581) | 217-284 | 11.6-15.7 ms | 0.13 ms | about 110,000 |
+| default `--fly 8` | 1762 (1762, 1713, 1807) | 190-232 | 13.9-15.6 ms | 0.30 ms | about 70,000 / 64,000 / 43,000 / 17,500 |
+| maximum `--fly 8` | 826 (774, 828, 826) | 123-127 | 24.3-25.7 ms | 1.01-1.05 ms | about 213,000 / 186,000 / 140,000 / 35,000 |
+
+| Case | Columns | Tiles | Meshes | Mesh MiB | Fill to the horizon |
+|---|---|---|---|---|---|
+| `main` radius 12 | 441 | 0 | 441 | not printed | 75-97 ms |
+| default | 308 | 619 | 927 | 23.8 | 150-194 ms (median 190) |
+| radius 8, `--horizon 0` | 197 | 0 | 197 | 5.4 | 41-48 ms |
+| maximum | 996 | 1,827 | 2,823 | 74.7 | 641-655 ms (median 648) |
+
+Average job on 15 workers: a column 0.53-0.61 ms, a tile 0.21-0.24 ms (the estimate was 0.2).
+Uploads 0.08 ms each, 4 per frame shared by columns and tiles.
+
+**Against the budget table of decision 0015 (e):**
+
+| Budget | Default: limit / measured | Maximum: limit / measured |
+|---|---|---|
+| Triangles, full-detail area | 100 k / 73.0 k, met | 300 k / 213 k, met |
+| Triangles, each LOD ring | 60 k / 63.4 k (level 1), 43.8 k, 16.2 k: **level 1 over by 6 percent** | 120 k / 184.8 k (level 1), 137.6 k (level 2), 35.2 k: **two rings over** |
+| Triangles, total | 300 k / 196 k, met | 700 k / 571 k, met |
+| FPS standing | 1500 / 1898, met | 600 / 846, met |
+| `--fly 8` average / worst frame | 1000 / 16.7 ms; 1762 / 15.6 ms, met | 400 / 16.7 ms; 826 / **25.7 ms, worst frame missed** |
+| Meshes | 1500 / 927, met | 3000 / 2,823 standing (2,913 uploads during the flying fill), met |
+| GPU mesh memory | 64 MiB / 23.8 MiB payload only, unverified | 160 MiB / 74.7 MiB payload only, unverified |
+| Fill time to the horizon | 1 s / 0.19 s, met | 3 s / 0.65 s, met |
+
+The memory row counts vertex and index bytes, not what the driver allocates per mesh, so it is
+not a verified GPU figure. Allocation count: at the maximum about 2,823 meshes are live and up
+to about 260 more wait as retired buffers right after a level-border crossing, about 3,080
+against the 4,096 `maxMemoryAllocationCount` Vulkan guarantees (decision 0007): the headroom is
+about 1,000 allocations.
+
+**Why the misses.**
+- *Ring triangles.* The split ratio is `view_radius / 2`, so every ring is as many tiles wide as
+  the full-detail circle is chunks: a ring's area, and its triangles, grow with the square of the
+  radius (level 1: 63 k at radius 8, 185 k at 16, about 2.9 times). The per-ring limits (60 k and
+  120 k) assumed a smaller growth; the totals, which set the frame time, are met. The skirts
+  facing the camera (about half of a level's skirt quads, under 13 percent of its triangles,
+  S4) cannot bring level 1 at radius 16 under 120 k, and neighbour-aware skirts are rejected in
+  the decision. Left as measured; a ratio that does not grow with the radius, or per-ring limits
+  that do, is a question for the decision, not for this step.
+- *Worst frame flying at radius 16.* A temporary probe (reverted) timed the parts of a slow
+  frame: the selection and the trackers take 0.4-0.7 ms; the frame where the camera crosses a
+  level-2 border removes 68 columns and 191 tiles, and the renderer's `remove_tile_mesh` calls
+  alone took 20-24 ms of it (about 80 us per mesh removed; when the GPU is still busy, the same
+  cost moves into the next `render_frame`). Lighter crossings removed 68 columns and 18, 22 or 104
+  tiles and took 11-17 ms. *Hypothesis, not isolated:* the cost is the driver freeing one
+  allocation per mesh; `remove_tile_mesh` also polls the frame fences on every call, which the
+  probe did not separate. Either way the fix belongs to the renderer (free retired meshes in
+  bounded batches per frame, poll once per frame, or sub-allocate, the trigger of decision 0007),
+  not to streaming. Accepted as a deviation from the table for now. At the default settings a crossing removes about 150
+  meshes and the worst frame stays at 15.6 ms, close to the limit; `main` at radius 12 shows
+  similar worst frames (11.6-15.7 ms).
+
+**Holes during level changes (until S8).** A tile that leaves the selection is removed at once,
+and so is a column that a tile now covers. After the first fill, `--fly 8` had tiles waiting in
+391-395 of about 12,600-13,300 frames at the default settings (at most 103 at once) and in
+685-698 of about 5,100-5,500 frames at the maximum (at most 191). These runs counted waiting
+tiles only, so they are a **lower bound** on frames with holes: waiting columns (a removed
+column's ground before its tile arrives, or the reverse) were not counted. The run summary now
+counts columns and tiles together (`stats.waiting()`) and says "first fill not reached" when the
+fill never completed; it was not re-measured. Standing, no frame had a tile waiting.
+
+**What the extra full-detail columns cost.** The selection's level-0 leaves are loaded as columns
+(308 instead of 197 at radius 8, see decision 0015 "S7 as built"), and the fog now ends near the
+horizon, so the full-detail area draws 73 k triangles instead of 49 k at `--horizon 0`.
+
+**Window checks** (screenshots in the session's scratchpad, not committed): the start view at the
+default settings shows terrain out to the horizon line, the last rows fading into the sky over
+a few pixels (from 60 blocks up the fog band from 1,215 to 2,025 blocks spans about 6 rows); from
+300 blocks up (a temporary start position, reverted) the terrain reaches the horizon and fades
+into the sky over a wide band with no edge, at radius 8 and at the maximum; with `--horizon 0`
+from 300 blocks up everything is sky (the radius-8 fog ends at 210 blocks), the old behaviour. No crack
+or band of sky is visible at the borders between levels. A count of pure sky-coloured pixels
+below the horizon finds 6 single pixels at the start view, the same 6 at `--horizon 0` (sparkles
+at T-junctions of the greedy mesh, not new), and 16 (radius 8) and 34 (maximum) isolated single
+pixels from 300 blocks up, none forming a line or a hole.
