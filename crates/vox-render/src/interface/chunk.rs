@@ -8,11 +8,17 @@
 //! |------|-------------------------|----------------------------------------|
 //! | 0..3 | position x, y, z (`u8`) | location 0, 4 x `u8`, `uvec4` as `xyz` |
 //! | 3    | face index (`u8`)       | location 0, 4 x `u8`, `uvec4` as `w`   |
-//! | 4..6 | block id (`u16`)        | location 1, 1 x `u16`, `uint`          |
+//! | 4..6 | texture layer (`u16`)   | location 1, 1 x `u16`, `uint`          |
 //!
 //! Location 0 reads four bytes at once because a three-byte vertex format is not
 //! guaranteed in Vulkan 1.0, while a four-byte one is. The fourth byte happens to be
 //! the face index, so nothing is wasted.
+//!
+//! The texture layer is the layer of the block texture array the face is drawn with; the
+//! mesher looks it up per quad from the block and the face, so the block id itself does not
+//! reach the shaders. No texture coordinates are stored: corners are whole blocks, so the
+//! built-in vertex shader derives them from the position (the table next to `FACE_SHADE` in
+//! `chunk.vert`).
 //!
 //! # Shader contract
 //! The renderer skips chunks whose box (the chunk's 32-block cube at its origin) lies outside
@@ -51,11 +57,11 @@ use super::{
     RESOURCE_SET, ResourceBinding, ResourceKind, Stage, VertexAttribute,
 };
 
-/// Byte offset of the block id inside a vertex, right after the position and face bytes.
-const BLOCK_OFFSET: u32 = AttributeFormat::Uint8x4.size();
+/// Byte offset of the texture layer inside a vertex, right after the position and face bytes.
+const LAYER_OFFSET: u32 = AttributeFormat::Uint8x4.size();
 
 /// Bytes from one vertex to the next.
-pub(crate) const VERTEX_STRIDE: u32 = BLOCK_OFFSET + AttributeFormat::Uint16.size();
+pub(crate) const VERTEX_STRIDE: u32 = LAYER_OFFSET + AttributeFormat::Uint16.size();
 
 /// Floats in a GLSL `vec4`: the four homogeneous coordinates `x, y, z, w`.
 const VEC4_FLOATS: u32 = 4;
@@ -85,7 +91,7 @@ const ATTRIBUTES: [VertexAttribute; 2] = [
     },
     VertexAttribute {
         location: 1,
-        offset: BLOCK_OFFSET,
+        offset: LAYER_OFFSET,
         format: AttributeFormat::Uint16,
     },
 ];
@@ -130,7 +136,7 @@ mod tests {
     #[test]
     fn vertices_are_six_bytes() {
         assert_eq!(VERTEX_STRIDE, 6);
-        assert_eq!(BLOCK_OFFSET, 4);
+        assert_eq!(LAYER_OFFSET, 4);
     }
 
     #[test]
@@ -150,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn attributes_are_position_face_then_block() {
+    fn attributes_are_position_face_then_texture_layer() {
         let [first, second] = ATTRIBUTES;
         assert_eq!((first.location, first.offset), (0, 0));
         assert_eq!((second.location, second.offset), (1, 4));
