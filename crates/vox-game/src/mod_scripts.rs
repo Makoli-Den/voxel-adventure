@@ -60,9 +60,10 @@ mod tests {
 
     use super::*;
     use crate::content::{Content, STONE_NAME};
-    use crate::editing::{StaleChunks, apply_mod_edits};
+    use crate::editing::{EditedChunks, StaleChunks, apply_mod_edits};
     use crate::packs;
     use crate::startup::assemble;
+    use crate::streaming::{Column, ColumnSpans, Terrain};
 
     /// The example mods of the source tree.
     fn examples_dir() -> PathBuf {
@@ -134,7 +135,19 @@ mod tests {
             .collect();
         assert_eq!(edits, pillar);
         let mut stale = StaleChunks::default();
-        apply_mod_edits(&mut world, &edits, &mut stale);
+        let terrain = Terrain::new(0, content.terrain, content.face_textures());
+        let mut spans = ColumnSpans::default();
+        spans.insert(Column::new(0, 0), 0..=0);
+        let mut edited = EditedChunks::default();
+        apply_mod_edits(
+            &mut world,
+            &terrain,
+            &spans,
+            &mut edited,
+            &edits,
+            &mut stale,
+        );
+        assert!(edited.contains(ChunkPos::ORIGIN));
         assert_eq!(stale.as_slice(), [ChunkPos::ORIGIN]);
 
         world.set_block([4, 4, 4], BlockId::AIR);

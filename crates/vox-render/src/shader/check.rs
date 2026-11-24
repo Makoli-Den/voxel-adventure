@@ -9,7 +9,7 @@
 //! `crate::interface`. Checked: descriptor resources (every buffer, image or sampler the
 //! module declares, used or not, must be one the interface lists, at its set and binding,
 //! of its kind, in its stage), push constants (only
-//! in the interface's stage, at most its size in bytes), vertex inputs (locations and
+//! in the interface's stages, at most its size in bytes), vertex inputs (locations and
 //! exact types of the interface's attributes, built-ins limited to vertex and instance
 //! index), and every fragment input location against a vertex output of the same scalar
 //! or vector type. Not checked: interpolation qualifiers, and fragment outputs (writes
@@ -182,18 +182,19 @@ fn is_kind(kind: ResourceKind, space: AddressSpace, inner: &TypeInner) -> bool {
     }
 }
 
-/// Push constants exist only in the interface's stage, and only as many bytes as it has.
+/// Push constants exist only in the interface's stages, and only as many bytes as it has.
 fn check_push_constants(
     module: &Module,
     stage: ShaderStage,
     interface: &PipelineInterface,
 ) -> Result<(), String> {
     let provided = interface.push_constants;
+    let visible = pipeline_stage(stage).is_some_and(|stage| provided.visible_to(stage));
     match push_constant_size(module)? {
         None => Ok(()),
-        Some(_) if pipeline_stage(stage) != Some(provided.stage) => Err(format!(
+        Some(_) if !visible => Err(format!(
             "push constants are only available in the {} stage",
-            provided.stage.name()
+            provided.stage_names()
         )),
         Some(size) if size > provided.size => Err(format!(
             "push constants use {size} bytes, the pipeline provides {} bytes",
@@ -214,7 +215,7 @@ fn pipeline_stage(stage: ShaderStage) -> Option<Stage> {
 }
 
 /// Total size of all push-constant blocks, or `None` if the module declares none.
-fn push_constant_size(module: &Module) -> Result<Option<u32>, String> {
+pub(super) fn push_constant_size(module: &Module) -> Result<Option<u32>, String> {
     let mut layouter = Layouter::default();
     layouter
         .update(module.to_ctx())

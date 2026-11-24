@@ -812,16 +812,16 @@ mod tests {
         let (registry, textures, warnings) = load_content(&base_stack()).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         // Missing, grass top, grass side, dirt, stone, sand, cobblestone, planks, log side,
-        // log top.
-        assert_eq!(textures.layer_count, 10);
+        // log top, bedrock.
+        assert_eq!(textures.layer_count, 11);
         assert_eq!(textures.size, DEFAULT_TILE_SIZE);
         let layers = usize::try_from(textures.layer_count).unwrap();
         assert_eq!(
             textures.pixels.len(),
             layers * side(textures.size) * side(textures.size) * BYTES_PER_PIXEL
         );
-        // Air, grass, dirt, stone, sand, cobblestone, planks, log.
-        assert_eq!(registry.len(), 8);
+        // Air, grass, dirt, stone, sand, cobblestone, planks, log, bedrock.
+        assert_eq!(registry.len(), 9);
     }
 
     #[test]

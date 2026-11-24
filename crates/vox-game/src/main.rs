@@ -4,6 +4,10 @@
 //! window, creates the renderer with the shaders from the packs, starts the mods' scripts,
 //! streams terrain chunks in around the camera and runs the event loop, flying a camera over
 //! the terrain and sending the player's block edits to the mods. Networking will join later.
+//!
+//! The mouse is captured while the player plays; Esc, losing the window focus or the menu's
+//! buttons switch the input mode (the rules live in `input_mode`, this file only applies them
+//! to the window).
 
 mod camera;
 mod cli;
@@ -11,6 +15,7 @@ mod content;
 mod controls;
 mod editing;
 mod hud;
+mod input_mode;
 mod metrics;
 mod mod_scripts;
 mod pacing;
@@ -19,6 +24,7 @@ mod physics;
 mod selection;
 mod startup;
 mod streaming;
+mod view_distance;
 
 use std::env;
 use std::error::Error;
@@ -32,27 +38,29 @@ use glam::Vec3;
 use vox_content::BlockTextures;
 use vox_mods::{DiscoveredMod, ModHost, ModStatus};
 use vox_render::{
-    RenderError, RenderStats, Renderer, ShaderSources, TextureLayers, create_renderer,
+    CameraView, DepthMode, Fog, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers,
+    create_renderer,
 };
-use vox_world::{BlockRegistry, ChunkMesh, World, raycast};
+use vox_world::{BlockRegistry, ChunkMesh, TilePos, World, raycast_with};
 use winit::application::ApplicationHandler;
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use camera::{Camera, Movement};
 use cli::{Command, Options};
 use content::Content;
 use controls::Controls;
-use editing::{Edit, EditAction, REACH, StaleChunks};
+use editing::{Edit, EditAction, EditedChunks, REACH};
+use input_mode::{InputMode, MenuButton, Outcome};
 use metrics::FrameHistory;
 use pacing::MAX_FRAME_TIME;
-use physics::{Body, WalkInput};
+use physics::{Body, Space, WalkInput};
 use selection::Selection;
-use streaming::{ChunkStreamer, Terrain, area, remesh};
+use streaming::{ChunkStreamer, ColumnSpans, StreamStats, Terrain, area, remesh};
 
 /// The window title.
 const WINDOW_TITLE: &str = "Voxel Adventure";
@@ -73,17 +81,28 @@ const MOVE_SPEED: f32 = 40.0;
 /// How far the camera turns per pixel of mouse motion, in radians.
 const LOOK_SENSITIVITY: f32 = 0.0025;
 
-/// Timing of the first fill of the area around the camera, for one log line: the time from
-/// the start until nothing is queued any more, and the time spent in uploads on the way.
+/// Bytes in a mebibyte, for the memory figures of the log lines.
+const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+
+/// Timing of the first fill of the area and the horizon around the camera, for one log line:
+/// the time from the start until nothing is queued any more, and the time spent in uploads on
+/// the way. After that, how often columns or tiles were still waiting, the cheap stand-in for
+/// holes in the ground until step S8 measures the uncovered area.
 struct FillReport {
     /// When streaming started.
     started: Instant,
-    /// Time spent in `set_chunk_mesh` so far.
+    /// Time spent in `set_tile_mesh` so far.
     upload_time: Duration,
     /// Meshes uploaded so far.
     uploads: u32,
     /// Whether the line has been printed; it is printed once.
     printed: bool,
+    /// Frames since the first fill.
+    frames_after_fill: u32,
+    /// Of those, frames with columns or tiles waiting (a hole, or new ground at the edge).
+    frames_waiting: u32,
+    /// The most columns and tiles waiting in one frame after the first fill.
+    most_waiting: usize,
 }
 
 impl FillReport {
@@ -93,7 +112,34 @@ impl FillReport {
             upload_time: Duration::ZERO,
             uploads: 0,
             printed: false,
+            frames_after_fill: 0,
+            frames_waiting: 0,
+            most_waiting: 0,
         }
+    }
+
+    /// Counts a frame after the first fill and whether columns or tiles were waiting in it.
+    fn add_frame(&mut self, stats: &StreamStats) {
+        if !self.printed {
+            return;
+        }
+        self.frames_after_fill = self.frames_after_fill.saturating_add(1);
+        let waiting = stats.waiting();
+        if waiting > 0 {
+            self.frames_waiting = self.frames_waiting.saturating_add(1);
+        }
+        self.most_waiting = self.most_waiting.max(waiting);
+    }
+
+    /// The figures since the first fill, for the run summary.
+    fn waiting_summary(&self) -> String {
+        if !self.printed {
+            return "first fill not reached".to_owned();
+        }
+        format!(
+            "after the first fill {} of {} frames had columns or tiles waiting (most {})",
+            self.frames_waiting, self.frames_after_fill, self.most_waiting
+        )
     }
 
     /// Adds a frame's uploads.
@@ -107,21 +153,26 @@ impl FillReport {
     /// The log line, the first time it is asked for after the queue emptied.
     fn line_once(&mut self, streamer: &ChunkStreamer) -> Option<String> {
         let stats = streamer.stats();
-        if self.printed || stats.queued > 0 {
+        if self.printed || stats.waiting() > 0 {
             return None;
         }
         self.printed = true;
         let average_job = streamer.average_job_time().unwrap_or_default();
+        let average_tile = streamer.average_tile_time().unwrap_or_default();
         let average_upload = if self.uploads > 0 {
             self.upload_time / self.uploads
         } else {
             Duration::ZERO
         };
         Some(format!(
-            "Streaming: {} chunks loaded in {:.1} ms, average job {:.3} ms, average upload {:.3} ms, {} workers",
+            "Streaming: {} columns and {} tiles loaded in {:.1} ms ({} meshes, {:.1} MiB), average job {:.3} ms column / {:.3} ms tile, average upload {:.3} ms, {} workers",
             stats.loaded,
+            stats.tiles_loaded,
             metrics::millis(self.started.elapsed()),
+            self.uploads,
+            stats.mesh_bytes as f64 / BYTES_PER_MIB,
             metrics::millis(average_job),
+            metrics::millis(average_tile),
             metrics::millis(average_upload),
             streamer.worker_count()
         ))
@@ -156,15 +207,36 @@ struct App {
     /// Chunks are added and dropped as streaming loads and unloads them, so it stays as big
     /// as the view area.
     world: World,
+    /// The span of every loaded column: what physics and editing know of the layers that are
+    /// not in `world`. Updated together with `world` from the streaming changes.
+    spans: ColumnSpans,
+    /// The chunks the player wrote into, whose neighbours must be completed when they stream
+    /// in again (decision 0015).
+    edited: EditedChunks,
     /// Reused for the mesh of every chunk rebuilt after an edit.
     edit_scratch: ChunkMesh,
     camera: Camera,
+    /// The horizon in blocks the game streams tiles to: the option, lowered for the mesh
+    /// budget and the depth buffer when the renderer starts (0: no tiles).
+    horizon: i32,
+    /// The fog, set from the view radius and the horizon: it ends where the drawn terrain may
+    /// end.
+    fog: Fog,
+    /// Distance of the camera's far plane in blocks, just beyond the fog end.
+    far_plane: f32,
+    /// How the renderer maps depth, so the projection matches it; read from the renderer
+    /// when it is created.
+    depth_mode: DepthMode,
     /// The player's box. While flying it only follows the camera; while walking it moves the
     /// camera.
     body: Body,
     /// Whether the player walks (collision and gravity) instead of flying; the G key toggles.
     walking: bool,
     controls: Controls,
+    /// Whether the game or the pause menu has the input, and the menu's selection.
+    input_mode: InputMode,
+    /// The last position of the mouse cursor in window pixels, for clicks on the menu.
+    cursor: (f32, f32),
     /// Whether the frame rate is capped (twice the monitor's refresh rate, see `pacing`).
     /// Off by default, so the metrics show what the game can really do; the L key toggles it.
     frame_limit: bool,
@@ -195,6 +267,9 @@ struct App {
 
 impl App {
     fn new(options: Options, shaders: ShaderSources, content: Content, mods: ModHost) -> Self {
+        let input_mode = InputMode::new(input_mode::starts_awaiting(&options));
+        // Without tiles until `start` knows what the renderer's depth buffer allows.
+        let fog = view_distance::fog(options.view_radius, 0);
         Self {
             terrain: Arc::new(Terrain::new(
                 WORLD_SEED,
@@ -213,11 +288,21 @@ impl App {
             streamer: None,
             fill: FillReport::new(),
             world: World::new(),
+            spans: ColumnSpans::default(),
+            edited: EditedChunks::default(),
             edit_scratch: ChunkMesh::default(),
             camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
+            horizon: 0,
+            fog,
+            far_plane: view_distance::far_plane(fog),
+            // A placeholder: `start` overwrites it from the renderer before the first
+            // `set_camera`, and no projection is built before the renderer exists.
+            depth_mode: DepthMode::Standard,
             body: Body::from_eye(CAMERA_START.to_array()),
             walking: false,
             controls: Controls::default(),
+            input_mode,
+            cursor: (0.0, 0.0),
             frame_limit: false,
             hud_visible: true,
             last_frame: Instant::now(),
@@ -254,16 +339,33 @@ impl App {
                     )
                 })?;
         }
-        renderer.set_camera(self.camera.view_projection(size.width, size.height));
+        self.depth_mode = renderer.depth_mode();
+        let horizon = view_distance::effective_horizon(
+            self.options.horizon,
+            self.options.view_radius,
+            self.depth_mode.max_horizon(),
+        );
+        if let Some(note) =
+            view_distance::horizon_note(self.options.horizon, self.options.view_radius, horizon)
+        {
+            eprintln!("{note}");
+        }
+        self.horizon = horizon.blocks;
+        self.fog = view_distance::fog(self.options.view_radius, self.horizon);
+        self.far_plane = view_distance::far_plane(self.fog);
+        renderer.set_fog(self.fog);
+        renderer.set_camera(&self.camera_view(size.width, size.height));
 
         // No chunk is loaded here: the first frames stream them in, nearest first.
         self.fill = FillReport::new();
         self.streamer = Some(ChunkStreamer::new(
             Arc::clone(&self.terrain),
             self.options.view_radius,
+            self.horizon,
         ));
         self.window = Some(window);
         self.renderer = Some(renderer);
+        self.apply_cursor();
         self.update_frame_interval();
         self.refresh_hud()?;
         self.last_frame = Instant::now();
@@ -289,14 +391,22 @@ impl App {
         let dt = since_last_frame.as_secs_f32().min(MAX_FRAME_TIME);
         // The autopilot always flies, whatever mode the player toggled.
         if self.walking && self.options.fly_seconds.is_none() {
-            // Walking: the body decides where the eye is (decision 0012).
-            let movement = self.controls.movement();
-            let input = WalkInput {
-                direction: self.camera.walk_direction(movement),
-                jump: movement.up > 0.0,
-            };
-            self.body.step(&self.world, input, dt);
-            self.camera.set_position(Vec3::from(self.body.eye()));
+            // Walking: the body decides where the eye is (decision 0012). While the menu is
+            // open the body stands still, so the player does not fall (or keep walking)
+            // while paused.
+            if !self.input_mode.is_paused() {
+                let movement = self.controls.movement();
+                let input = WalkInput {
+                    direction: self.camera.walk_direction(movement),
+                    jump: movement.up > 0.0,
+                };
+                let space = Space {
+                    world: &self.world,
+                    spans: &self.spans,
+                };
+                self.body.step(space, input, dt);
+                self.camera.set_position(Vec3::from(self.body.eye()));
+            }
         } else {
             let (movement, speed) = if self.options.fly_seconds.is_some() {
                 // The autopilot flies sideways, keeping the height, so the camera always meets
@@ -310,46 +420,110 @@ impl App {
                 (self.controls.movement(), MOVE_SPEED)
             };
             self.camera.translate(movement, speed * dt);
+            self.camera
+                .clamp_height(camera::FLY_FLOOR, camera::FLY_CEILING);
             // The body follows the flying eye, so placing a block still keeps clear of it and
             // switching to walking continues from here.
             self.body = Body::from_eye(self.camera.position().to_array());
         }
 
-        if let (Some(window), Some(renderer)) = (&self.window, self.renderer.as_mut()) {
-            // The aspect ratio comes from the window. For a frame or so after a resize the
-            // swapchain may still have the old size, which only stretches that one frame.
-            let size = window.inner_size();
-            renderer.set_camera(self.camera.view_projection(size.width, size.height));
+        // The aspect ratio comes from the window. For a frame or so after a resize the
+        // swapchain may still have the old size, which only stretches that one frame.
+        let Some(size) = self.window.as_ref().map(|window| window.inner_size()) else {
+            return;
+        };
+        let view = self.camera_view(size.width, size.height);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_camera(&view);
         }
     }
 
-    /// One frame of streaming: loads and unloads chunks around the camera and hands the
-    /// finished meshes to the renderer. Removals come first, so their memory is freed before
-    /// the uploads need it.
+    /// What the renderer needs of the camera for a window of `width` by `height` pixels:
+    /// the matrix around the eye with the far plane just beyond the fog, in the renderer's
+    /// depth mode, and the eye.
+    fn camera_view(&self, width: u32, height: u32) -> CameraView {
+        CameraView {
+            view_projection: self.camera.view_projection(
+                width,
+                height,
+                self.far_plane,
+                self.depth_mode,
+            ),
+            position: self.camera.position().to_array(),
+        }
+    }
+
+    /// One frame of streaming: loads and unloads chunk columns and tiles around the camera and
+    /// hands the finished meshes to the renderer. Removals come first, so their memory is freed
+    /// before the uploads need it. An unloaded column takes every chunk of it along, also those
+    /// an edit created; a streamed chunk never replaces one already in the world, and neither
+    /// does its mesh. Tiles of level 1 or more have keys of their own level, so they never
+    /// meet a chunk's mesh in the renderer.
     fn stream(&mut self) -> Result<(), Box<dyn Error>> {
         let (Some(streamer), Some(renderer)) = (self.streamer.as_mut(), self.renderer.as_mut())
         else {
             return Ok(());
         };
         let changes = streamer.update(area::chunk_of(self.camera.position().to_array()))?;
-        for pos in &changes.removed {
-            renderer.remove_chunk_mesh(*pos);
+        for column in &changes.removed {
+            for pos in column.chunks() {
+                renderer.remove_tile_mesh(TilePos::chunk(pos));
+            }
         }
-        editing::apply_streamed(&mut self.world, &changes.removed, changes.loaded);
+        for tile in &changes.removed_tiles {
+            renderer.remove_tile_mesh(*tile);
+        }
+        let arrived: Vec<_> = changes.loaded.iter().map(|loaded| loaded.column).collect();
+        let kept = editing::apply_streamed(
+            &mut self.world,
+            &mut self.spans,
+            &mut self.edited,
+            &changes.removed,
+            changes.loaded,
+        );
         let uploading = Instant::now();
         let mut uploaded = 0;
         // An upload error is fatal (the caller exits the game), so the streamer's record of
         // what is loaded need not be corrected when one fails halfway.
-        for (pos, mesh) in &changes.uploads {
-            renderer.set_chunk_mesh(*pos, mesh)?;
+        for (pos, mesh) in changes
+            .uploads
+            .iter()
+            .filter(|(pos, _)| !kept.contains(pos))
+        {
+            renderer.set_tile_mesh(TilePos::chunk(*pos), mesh)?;
+            uploaded += 1;
+        }
+        for (tile, mesh) in &changes.tile_uploads {
+            renderer.set_tile_mesh(*tile, mesh)?;
             uploaded += 1;
         }
         if uploaded > 0 {
             self.fill.add_uploads(uploaded, uploading.elapsed());
         }
+        // After the uploads, so a remeshed neighbour that arrived in this frame keeps the
+        // remeshed version.
+        let beside = editing::create_chunks_beside_edits(
+            &mut self.world,
+            &self.terrain,
+            &self.spans,
+            &self.edited,
+            &arrived,
+        );
+        for pos in beside {
+            if remesh(
+                &self.terrain,
+                &self.world,
+                &self.spans,
+                pos,
+                &mut self.edit_scratch,
+            ) {
+                renderer.set_tile_mesh(TilePos::chunk(pos), &self.edit_scratch)?;
+            }
+        }
         if let Some(line) = self.fill.line_once(streamer) {
             println!("{line}");
         }
+        self.fill.add_frame(&streamer.stats());
         Ok(())
     }
 
@@ -380,7 +554,10 @@ impl App {
         };
         let eye = self.camera.position().to_array();
         let direction = self.camera.forward().to_array();
-        let Some(hit) = raycast(&self.world, eye, direction, REACH) else {
+        // Missing chunks above a loaded column's span are air, so a ray from the flying height
+        // reaches the terrain (decision 0015).
+        let lookup = |block| editing::block_for_ray(&self.world, &self.spans, block);
+        let Some(hit) = raycast_with(lookup, eye, direction, REACH) else {
             return Ok(());
         };
         let Some(edit) = editing::plan(action, &hit, &self.body, self.selection.selected()) else {
@@ -389,34 +566,60 @@ impl App {
         self.apply_edit(action, edit)
     }
 
-    /// Writes the player's `edit`, sends the event to the mods, writes what they asked for and
-    /// rebuilds the mesh of every chunk the writes made out of date, each once (decision 0014).
-    /// The mods see the world after the player's write and cannot undo it.
+    /// Writes the player's `edit` (after creating the chunks under the terrain it needs), sends
+    /// the event to the mods, writes what they asked for and rebuilds the mesh of every chunk
+    /// the writes made out of date, each once (decisions 0014 and 0015). The mods see the world
+    /// after the player's write and cannot undo it. An edit that created chunks logs its cost
+    /// (decision 0015 budgets it).
     fn apply_edit(&mut self, action: EditAction, edit: Edit) -> Result<(), RenderError> {
-        // `None` when the chunk of the cell is not loaded, for example above the terrain layer.
-        let Some(previous) = self.world.block_at(edit.position) else {
-            return Ok(());
-        };
-        let Some(changed) = self.world.set_block(edit.position, edit.block) else {
-            return Ok(());
-        };
-        if changed.is_empty() {
-            // The cell already held the block: nothing happened, so there is no event.
+        if self.renderer.is_none() {
             return Ok(());
         }
-        let mut stale = StaleChunks::default();
-        stale.add(&changed);
-        let event = editing::block_event(action, &edit, previous);
-        let mod_edits = self.mods.block_event(&event, &self.world, &self.registry);
-        editing::apply_mod_edits(&mut self.world, &mod_edits, &mut stale);
+        let started = Instant::now();
+        let Some(done) = editing::player_edit(
+            &mut self.world,
+            &self.terrain,
+            &self.spans,
+            &mut self.edited,
+            action,
+            &edit,
+        ) else {
+            return Ok(());
+        };
+        let mut stale = done.stale;
+        let mod_edits = self
+            .mods
+            .block_event(&done.event, &self.world, &self.registry);
+        editing::apply_mod_edits(
+            &mut self.world,
+            &self.terrain,
+            &self.spans,
+            &mut self.edited,
+            &mod_edits,
+            &mut stale,
+        );
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
         for pos in stale.as_slice() {
-            if remesh(&self.terrain, &self.world, *pos, &mut self.edit_scratch) {
+            if remesh(
+                &self.terrain,
+                &self.world,
+                &self.spans,
+                *pos,
+                &mut self.edit_scratch,
+            ) {
                 // An empty mesh removes the chunk's entry, so a chunk that was dug empty vanishes.
-                renderer.set_chunk_mesh(*pos, &self.edit_scratch)?;
+                renderer.set_tile_mesh(TilePos::chunk(*pos), &self.edit_scratch)?;
             }
+        }
+        if done.created > 0 {
+            println!(
+                "Edit: {} chunks created, {} remeshed in {:.3} ms",
+                done.created,
+                stale.as_slice().len(),
+                metrics::millis(started.elapsed())
+            );
         }
         Ok(())
     }
@@ -508,26 +711,148 @@ impl App {
         } else {
             Vec::new()
         };
-        // The crosshair is always visible, also while the metrics panel is hidden.
         if let Some(window) = &self.window {
             let size = window.inner_size();
-            rects.extend(hud::crosshair(size.width, size.height));
+            if self.input_mode.is_paused() {
+                // The menu covers the crosshair, which means nothing while nothing can be edited.
+                rects.extend(hud::menu(
+                    size.width,
+                    size.height,
+                    self.input_mode.selected(),
+                ));
+            } else {
+                // The crosshair is always visible, also while the metrics panel is hidden.
+                rects.extend(hud::crosshair(size.width, size.height));
+            }
         }
         renderer.set_overlay(&rects)
     }
 
-    /// The figures of the whole run, for the line printed when the game ends.
+    /// The menu button under the mouse cursor, if the menu is open and the cursor is on one.
+    fn button_under_cursor(&self) -> Option<MenuButton> {
+        let window = self.window.as_ref()?;
+        if !self.input_mode.is_paused() {
+            return None;
+        }
+        let size = window.inner_size();
+        hud::button_at(
+            &hud::menu_buttons(size.width, size.height),
+            self.cursor.0,
+            self.cursor.1,
+        )
+    }
+
+    /// Hides and captures the cursor while playing, and frees and shows it otherwise.
+    ///
+    /// Capturing is tried as `Locked` first: on Windows winit implements it by clipping the
+    /// cursor to a one-pixel rectangle, and it succeeds there. `Confined` (the cursor stays
+    /// inside the window) is the fallback for platforms that refuse `Locked`. Failures are
+    /// logged, since a failed capture costs only the capture. Idempotent, so it is safe to
+    /// call again whenever the state may have drifted.
+    fn apply_cursor(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        if self.input_mode.is_playing() {
+            if let Err(locked) = window.set_cursor_grab(CursorGrabMode::Locked) {
+                if let Err(confined) = window.set_cursor_grab(CursorGrabMode::Confined) {
+                    eprintln!(
+                        "warning: cannot capture the mouse cursor (locking: {locked}; confining: {confined})"
+                    );
+                }
+            }
+            window.set_cursor_visible(false);
+        } else {
+            if let Err(error) = window.set_cursor_grab(CursorGrabMode::None) {
+                eprintln!("warning: cannot release the mouse cursor: {error}");
+            }
+            window.set_cursor_visible(true);
+        }
+    }
+
+    /// Runs `change` on the input mode and, if the mode or the menu selection changed, brings
+    /// the window in line: the cursor, the held keys (forgotten when the menu opens, since
+    /// their releases go to the menu) and the overlay.
+    fn change_input_mode(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        change: impl FnOnce(&mut InputMode),
+    ) {
+        let before = self.input_mode;
+        change(&mut self.input_mode);
+        if self.input_mode == before {
+            return;
+        }
+        let effects = input_mode::effects(before.mode(), self.input_mode.mode());
+        if effects.release_controls {
+            self.controls.release_all();
+        }
+        if effects.apply_cursor {
+            self.apply_cursor();
+        }
+        self.refresh_after_toggle(event_loop);
+    }
+
+    /// Uses a menu button: the mode change it asks for, or ending the game.
+    fn use_menu_button(&mut self, event_loop: &ActiveEventLoop, button: Option<MenuButton>) {
+        let mut outcome = Outcome::Continue;
+        self.change_input_mode(event_loop, |input| {
+            outcome = match button {
+                Some(button) => input.activate(button),
+                None => input.activate_selected(),
+            };
+        });
+        if outcome == Outcome::Quit {
+            event_loop.exit();
+        }
+    }
+
+    /// The figures of the whole run, for the line printed when the game ends, the triangles
+    /// the last frame drew per tile level and what streaming held at the end (decision 0015
+    /// budgets them).
     fn run_summary(&self) -> Option<String> {
         let summary = self.run_frames.summary()?;
+        let stream = self
+            .streamer
+            .as_ref()
+            .map(ChunkStreamer::stats)
+            .unwrap_or_default();
         Some(format!(
-            "Run summary (frames: {}, play time: {:.1?}): {summary}",
-            summary.frames, summary.covered
+            "Run summary (frames: {}, play time: {:.1?}): {summary} | last frame triangles by level {:?} | horizon {} blocks, {} columns and {} tiles loaded, {:.1} MiB of meshes | {}",
+            summary.frames,
+            summary.covered,
+            self.render_stats.triangles_per_level,
+            self.horizon,
+            stream.loaded,
+            stream.tiles_loaded,
+            stream.mesh_bytes as f64 / BYTES_PER_MIB,
+            self.fill.waiting_summary()
         ))
     }
 
-    /// Handles a keyboard event: Escape quits, L toggles the frame limit, F3 shows or hides
-    /// the metrics panel, and the movement keys go to the controls. The toggles act on the
-    /// press only, not on the repeats of a held key.
+    /// Handles a key while the menu is open: Escape closes it, Up/W and Down/S move the
+    /// selection, Enter uses the selected button. Everything else is ignored.
+    /// The selection keys repeat when held; Escape and Enter act on the press only.
+    fn handle_menu_key(&mut self, event_loop: &ActiveEventLoop, code: KeyCode, repeat: bool) {
+        match code {
+            KeyCode::Escape if !repeat => self.change_input_mode(event_loop, InputMode::escape),
+            KeyCode::ArrowUp | KeyCode::KeyW => {
+                self.change_input_mode(event_loop, InputMode::select_previous);
+            }
+            KeyCode::ArrowDown | KeyCode::KeyS => {
+                self.change_input_mode(event_loop, InputMode::select_next);
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter if !repeat => {
+                self.use_menu_button(event_loop, None);
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles a keyboard event: Escape opens the menu, L toggles the frame limit, F3 shows or
+    /// hides the metrics panel, and the movement keys go to the controls. The toggles act on
+    /// the press only, not on the repeats of a held key. While the menu is open the menu gets
+    /// the presses and releases are ignored (the controls were cleared when it opened).
     fn handle_key(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -536,8 +861,16 @@ impl App {
         repeat: bool,
     ) {
         let pressed = state == ElementState::Pressed;
+        if self.input_mode.is_paused() {
+            if pressed {
+                self.handle_menu_key(event_loop, code, repeat);
+            }
+            return;
+        }
         match code {
-            KeyCode::Escape if pressed => event_loop.exit(),
+            KeyCode::Escape if pressed && !repeat => {
+                self.change_input_mode(event_loop, InputMode::escape);
+            }
             KeyCode::KeyL if pressed && !repeat => {
                 self.frame_limit = !self.frame_limit;
                 self.next_frame = Instant::now();
@@ -570,7 +903,11 @@ impl App {
             return;
         }
         let body = Body::from_eye(self.camera.position().to_array());
-        if body.is_free(&self.world) {
+        let space = Space {
+            world: &self.world,
+            spans: &self.spans,
+        };
+        if body.is_free(space) {
             self.body = body;
             self.walking = true;
         }
@@ -607,23 +944,50 @@ impl ApplicationHandler for App {
                     self.handle_key(event_loop, code, event.state, event.repeat);
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Right,
-                ..
-            } => self.controls.set_looking(state == ElementState::Pressed),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+                // The mouse selects the button it is over, so Enter then uses that one too.
+                if let Some(button) = self.button_under_cursor() {
+                    self.change_input_mode(event_loop, |input| input.select(button));
+                }
+            }
+            // The right button has no use yet.
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => self.controls.click(),
+            } => {
+                if self.input_mode.is_paused() {
+                    // A click outside the buttons does nothing, and neither does the one that
+                    // focused the window.
+                    if input_mode::click_activates(self.controls.just_focused()) {
+                        if let Some(button) = self.button_under_cursor() {
+                            self.use_menu_button(event_loop, Some(button));
+                        }
+                    }
+                } else {
+                    self.controls.click();
+                }
+            }
+            WindowEvent::MouseWheel { .. } if self.input_mode.is_paused() => {}
             WindowEvent::MouseWheel { delta, .. } => match delta {
                 MouseScrollDelta::LineDelta(_, lines) => self.controls.scroll(lines),
                 MouseScrollDelta::PixelDelta(pixels) => self.controls.scroll_pixels(pixels.y),
             },
             // Held keys would stay "held" forever, because their release goes to another window.
-            WindowEvent::Focused(false) => self.controls.release_all(),
-            WindowEvent::Focused(true) => self.controls.focus_gained(),
+            // The menu opens too, which frees the cursor.
+            WindowEvent::Focused(false) => {
+                self.controls.release_all();
+                self.change_input_mode(event_loop, InputMode::focus_lost);
+            }
+            WindowEvent::Focused(true) => {
+                self.controls.focus_gained();
+                self.change_input_mode(event_loop, InputMode::focus_gained);
+                // Whatever the mode, the grab is set again: winit does not release it when
+                // the focus is lost and only refreshes it while focused, so a paused window
+                // must free the cursor the moment it is active again.
+                self.apply_cursor();
+            }
             WindowEvent::Moved(_) => self.update_frame_interval(),
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -647,7 +1011,7 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.controls.is_looking() {
+            if self.input_mode.is_playing() {
                 self.camera
                     .look(dx as f32 * LOOK_SENSITIVITY, dy as f32 * LOOK_SENSITIVITY);
             }

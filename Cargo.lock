@@ -1947,6 +1947,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "glam",
  "naga",
  "raw-window-handle",
  "vox-world",

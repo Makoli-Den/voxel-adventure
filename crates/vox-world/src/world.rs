@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use crate::block::BlockId;
-use crate::chunk::{AXIS_COUNT, CHUNK_SIZE, Chunk, LocalPos};
+use crate::bounds::contains_block_y;
+use crate::chunk::{AXIS_COUNT, AXIS_Y, CHUNK_SIZE, Chunk, LocalPos};
 use crate::chunk_pos::ChunkPos;
 use crate::mesh::Face;
 
@@ -14,7 +15,8 @@ use crate::mesh::Face;
 /// per axis, which a block in a corner of its chunk touches (one face per axis).
 pub const MAX_CHANGED_CHUNKS: usize = 1 + AXIS_COUNT;
 
-/// The loaded chunks whose mesh must be rebuilt after one block edit.
+/// The chunks around one block edit: the loaded ones whose mesh must be rebuilt
+/// ([`World::set_block`]) or every one the edit can touch ([`chunks_touching`]).
 ///
 /// A fixed array with a length instead of a `Vec`: an edit happens in the game loop and
 /// the answer never exceeds [`MAX_CHANGED_CHUNKS`], so it needs no allocation.
@@ -118,13 +120,17 @@ impl World {
 
     /// Sets the block at world block position `pos`.
     ///
-    /// Returns `None` if the chunk of `pos` is not loaded (nothing is written). Otherwise
+    /// Returns `None` if `pos` is outside the world's height bounds
+    /// ([`contains_block_y`]) or the chunk of `pos` is not loaded (nothing is written). Otherwise
     /// returns the loaded chunks whose mesh is now out of date: the chunk of the block,
     /// and, when the block lies on a chunk border, the loaded chunk behind that border,
     /// because its mesh hides or shows faces depending on this block. Neighbours that are
     /// not loaded have no mesh and are left out. Writing the value the block already has
     /// changes nothing and returns an empty set.
     pub fn set_block(&mut self, pos: [i32; 3], block: BlockId) -> Option<ChangedChunks> {
+        if !contains_block_y(pos[AXIS_Y]) {
+            return None;
+        }
         let (chunk_pos, local) = ChunkPos::containing(pos);
         let chunk = self.chunks.get_mut(&chunk_pos)?;
         let mut changed = ChangedChunks::empty();
@@ -132,13 +138,9 @@ impl World {
             return Some(changed);
         }
         chunk.set(local, block);
-        changed.push(chunk_pos);
-        for face in Face::ALL {
-            if on_border(local, face) {
-                let neighbour = chunk_pos.neighbour(face);
-                if self.contains(neighbour) {
-                    changed.push(neighbour);
-                }
+        for touched in chunks_touching(pos).as_slice() {
+            if self.contains(*touched) {
+                changed.push(*touched);
             }
         }
         Some(changed)
@@ -150,6 +152,32 @@ impl World {
     pub fn neighbours(&self, pos: ChunkPos) -> Neighbours<'_> {
         Neighbours::new(Face::ALL.map(|face| self.get(pos.neighbour(face))))
     }
+}
+
+/// The chunks an edit of the block at world position `pos` can make out of date: the chunk of
+/// the block first, then, for each chunk border the block lies on, the chunk behind that border
+/// in [`Face::ALL`] order. Whether they are loaded plays no part, so a caller can make sure they
+/// exist before the edit (decision 0015: chunks under the terrain are created on demand).
+///
+/// # Example
+///
+/// ```
+/// use vox_world::{ChunkPos, chunks_touching};
+///
+/// // Block (0, 5, 7) lies on the -X border of chunk (0, 0, 0).
+/// let touched = chunks_touching([0, 5, 7]);
+/// assert_eq!(touched.as_slice(), [ChunkPos::ORIGIN, ChunkPos::new(-1, 0, 0)]);
+/// ```
+pub fn chunks_touching(pos: [i32; 3]) -> ChangedChunks {
+    let (chunk_pos, local) = ChunkPos::containing(pos);
+    let mut touched = ChangedChunks::empty();
+    touched.push(chunk_pos);
+    for face in Face::ALL {
+        if on_border(local, face) {
+            touched.push(chunk_pos.neighbour(face));
+        }
+    }
+    touched
 }
 
 /// Whether the block at `local` touches the border of its chunk on the side of `face`.
@@ -313,6 +341,45 @@ mod tests {
     }
 
     #[test]
+    fn set_block_outside_the_height_bounds_writes_nothing() {
+        use crate::bounds::{WORLD_CEILING_Y, WORLD_FLOOR_Y};
+        // Chunks exist on both sides of both limits, so only the bounds can refuse.
+        let layers = [-17, -16, 15, 16].map(|y| ChunkPos::new(0, y, 0));
+        let mut world = world_with_empty_chunks(&layers);
+        assert!(
+            world
+                .set_block([0, WORLD_FLOOR_Y - 1, 0], BlockId(1))
+                .is_none()
+        );
+        assert!(
+            world
+                .set_block([0, WORLD_CEILING_Y, 0], BlockId(1))
+                .is_none()
+        );
+        assert!(world.set_block([0, i32::MAX, 0], BlockId(1)).is_none());
+        assert_eq!(
+            world.block_at([0, WORLD_FLOOR_Y - 1, 0]),
+            Some(BlockId::AIR)
+        );
+        assert_eq!(world.block_at([0, WORLD_CEILING_Y, 0]), Some(BlockId::AIR));
+        // The first and last rows inside accept writes.
+        assert!(world.set_block([0, WORLD_FLOOR_Y, 0], BlockId(1)).is_some());
+        assert!(
+            world
+                .set_block([0, WORLD_CEILING_Y - 1, 0], BlockId(1))
+                .is_some()
+        );
+        assert_eq!(world.block_at([0, WORLD_FLOOR_Y, 0]), Some(BlockId(1)));
+    }
+
+    #[test]
+    fn block_at_stays_total_outside_the_bounds() {
+        let world = World::new();
+        assert_eq!(world.block_at([0, i32::MIN, 0]), None);
+        assert_eq!(world.block_at([0, i32::MAX, 0]), None);
+    }
+
+    #[test]
     fn set_block_in_an_unloaded_chunk_does_nothing() {
         let mut world = World::new();
         assert!(world.set_block([0, 0, 0], BlockId(1)).is_none());
@@ -376,6 +443,43 @@ mod tests {
         let changed = world.set_block([-32, -1, -1], BlockId(1)).unwrap();
         assert!(changed.contains(ChunkPos::new(-2, -1, -1)));
         assert_eq!(changed.as_slice().len(), 2);
+    }
+
+    #[test]
+    fn chunks_touching_lists_the_block_chunk_and_the_chunks_behind_its_borders() {
+        // Literal world coordinates: 10 is inside chunk 0, 31 its last block, -32 the first
+        // block of chunk -1.
+        assert_eq!(chunks_touching([10, 10, 10]).as_slice(), [ChunkPos::ORIGIN]);
+        assert_eq!(
+            chunks_touching([31, 10, 10]).as_slice(),
+            [ChunkPos::ORIGIN, ChunkPos::new(1, 0, 0)]
+        );
+        assert_eq!(
+            chunks_touching([-32, -1, 31]).as_slice(),
+            [
+                ChunkPos::new(-1, -1, 0),
+                ChunkPos::new(-2, -1, 0),
+                ChunkPos::new(-1, 0, 0),
+                ChunkPos::new(-1, -1, 1),
+            ]
+        );
+        assert_eq!(
+            chunks_touching([0, 0, 0]).as_slice().len(),
+            MAX_CHANGED_CHUNKS
+        );
+    }
+
+    #[test]
+    fn a_block_on_an_edge_touches_three_chunks() {
+        // x = 0 is the -X border and y = 31 the +Y border of chunk 0; z = 5 is inside.
+        assert_eq!(
+            chunks_touching([0, 31, 5]).as_slice(),
+            [
+                ChunkPos::ORIGIN,
+                ChunkPos::new(-1, 0, 0),
+                ChunkPos::new(0, 1, 0)
+            ]
+        );
     }
 
     #[test]

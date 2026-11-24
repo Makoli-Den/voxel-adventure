@@ -1,24 +1,27 @@
-//! The depth buffer: choosing its format and owning the image it lives in.
+//! The depth buffer: choosing its format and its depth mapping ([`DepthMode`]), and owning
+//! the image it lives in.
 
 use ash::vk;
 
 use super::context::Context;
 use super::gpu::Gpu;
 use super::memory;
-use crate::RenderError;
+use crate::{DepthMode, RenderError};
 
 /// Depth formats in order of preference. Vulkan 1.0 guarantees that at least one of
 /// `X8_D24_UNORM_PACK32` and `D32_SFLOAT` works as a depth attachment, and at least one
 /// of `D24_UNORM_S8_UINT` and `D32_SFLOAT_S8_UINT`; `D32_SFLOAT` alone is not guaranteed.
+/// `D32_SFLOAT` comes first because reversed Z needs a float buffer ([`mode_for`]).
 const DEPTH_CANDIDATES: [vk::Format; 3] = [
     vk::Format::D32_SFLOAT,
     vk::Format::X8_D24_UNORM_PACK32,
     vk::Format::D24_UNORM_S8_UINT,
 ];
 
-/// Chooses the depth format for this GPU. Called once at startup.
-pub fn depth_format(context: &Context, gpu: &Gpu) -> Result<vk::Format, RenderError> {
-    choose_depth_format(|format| {
+/// Chooses the depth format for this GPU and the depth mapping that goes with it. Called once
+/// at startup.
+pub fn depth_setup(context: &Context, gpu: &Gpu) -> Result<(vk::Format, DepthMode), RenderError> {
+    let format = choose_depth_format(|format| {
         // SAFETY: the physical device was enumerated from this live instance.
         let properties = unsafe {
             context
@@ -29,7 +32,19 @@ pub fn depth_format(context: &Context, gpu: &Gpu) -> Result<vk::Format, RenderEr
             .optimal_tiling_features
             .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
     })
-    .ok_or(RenderError::Unsupported("no depth buffer format"))
+    .ok_or(RenderError::Unsupported("no depth buffer format"))?;
+    Ok((format, mode_for(format)))
+}
+
+/// The depth mapping for a depth buffer of `format`: reversed on `D32_SFLOAT`, where the
+/// float's fine steps near 0 go to the far distance; standard on the 24-bit fixed-point
+/// formats, whose steps are even, so reversing them gains nothing (decision 0015).
+fn mode_for(format: vk::Format) -> DepthMode {
+    if format == vk::Format::D32_SFLOAT {
+        DepthMode::Reversed
+    } else {
+        DepthMode::Standard
+    }
 }
 
 /// The first candidate format for which `is_supported` holds.
@@ -70,7 +85,7 @@ impl DepthImage {
         };
         let info = image_info(format, extent);
         // SAFETY: the device is alive, `info` outlives the call, and the format supports
-        // depth attachments with optimal tiling (checked by `depth_format`).
+        // depth attachments with optimal tiling (checked by `depth_setup`).
         depth.image = unsafe { device.create_image(&info, None)? };
         // SAFETY: the image was just created from this device.
         let requirements = unsafe { device.get_image_memory_requirements(depth.image) };
@@ -162,6 +177,22 @@ mod tests {
     #[test]
     fn no_supported_format_gives_none() {
         assert_eq!(choose_depth_format(|_| false), None);
+    }
+
+    #[test]
+    fn only_the_float_buffer_runs_reversed() {
+        assert_eq!(mode_for(vk::Format::D32_SFLOAT), DepthMode::Reversed);
+        assert_eq!(
+            mode_for(vk::Format::X8_D24_UNORM_PACK32),
+            DepthMode::Standard
+        );
+        assert_eq!(mode_for(vk::Format::D24_UNORM_S8_UINT), DepthMode::Standard);
+        // Every candidate but the first falls back to standard depth.
+        assert!(
+            DEPTH_CANDIDATES[1..]
+                .iter()
+                .all(|&format| mode_for(format) == DepthMode::Standard)
+        );
     }
 
     #[test]

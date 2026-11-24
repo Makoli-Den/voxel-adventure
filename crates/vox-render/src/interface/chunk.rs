@@ -6,7 +6,7 @@
 //!
 //! | byte | content                 | attribute                              |
 //! |------|-------------------------|----------------------------------------|
-//! | 0..3 | position x, y, z (`u8`) | location 0, 4 x `u8`, `uvec4` as `xyz` |
+//! | 0..3 | position x, y, z (`u8`) in cells | location 0, 4 x `u8`, `uvec4` as `xyz` |
 //! | 3    | face index (`u8`)       | location 0, 4 x `u8`, `uvec4` as `w`   |
 //! | 4..6 | texture layer (`u16`)   | location 1, 1 x `u16`, `uint`          |
 //!
@@ -16,27 +16,77 @@
 //!
 //! The texture layer is the layer of the block texture array the face is drawn with; the
 //! mesher looks it up per quad from the block and the face, so the block id itself does not
-//! reach the shaders. No texture coordinates are stored: corners are whole blocks, so the
-//! built-in vertex shader derives them from the position (the table next to `FACE_SHADE` in
-//! `chunk.vert`).
+//! reach the shaders. No texture coordinates are stored: corners are whole cells, so the
+//! built-in vertex shader derives them from the position (see "Texture coordinates" below).
+//!
+//! Positions count **cells** of the mesh's tile, `0..=32` per axis. A cell is one block in a
+//! chunk (level 0) and `2^level` blocks in a level-of-detail tile (decision 0015); the cell
+//! size reaches the vertex shader in the origin's `w` (see the push constants).
 //!
 //! # Shader contract
-//! The renderer skips chunks whose box (the chunk's 32-block cube at its origin) lies outside
-//! the view, so a vertex shader must place every vertex inside that box:
-//! `chunk_origin + position` with no displacement. A shader pack that moves vertices
-//! (waves, wind) must keep them within the box, or chunks will disappear at the screen edges.
+//! Positions reach the shaders **relative to the camera** (decision 0015): the renderer
+//! subtracts the camera position from each chunk origin on the CPU and pushes a matrix
+//! without the camera's translation, so the numbers the GPU sees stay small and `f32`
+//! keeps sub-block precision however far the camera is from the world origin.
+//!
+//! The renderer skips meshes whose box lies outside the view. The box spans the whole tile on
+//! X and Z (32 cells) and on Y the mesh's lowest to highest vertex (`crate::tile_box`), so a
+//! vertex shader must place every vertex where the renderer expects it:
+//! `chunk_origin.xyz + position * chunk_origin.w` with no displacement. A shader pack that
+//! moves vertices (waves, wind) must keep them within that box, or meshes will disappear at
+//! the screen edges.
+//!
+//! The renderer also skips, per mesh, the face directions the camera cannot be in front of
+//! (per-direction culling, `crate::face_culling`): it assumes every triangle faces the
+//! direction of its group, as the vertex's face index says. A vertex shader must not turn or
+//! tilt faces (no rotation, no per-vertex displacement that changes a face's orientation), or
+//! faces that should show from the camera's side are not drawn.
 //!
 //! # Push constants
-//! One range for the vertex stage only, 80 bytes at offset 0, pushed once per chunk
-//! drawn. Floats are little-endian `f32`:
+//! One range for the vertex and the fragment stage, 112 bytes at offset 0. Floats are
+//! little-endian `f32`. Every push names both stages, so either shader may declare the
+//! whole block (or a prefix of it):
 //!
-//! | byte   | content                                             | GLSL   |
-//! |--------|-----------------------------------------------------|--------|
-//! | 0..64  | the camera's view-projection, column-major          | `mat4` |
-//! | 64..80 | the chunk's origin in blocks in `xyz`, `w` is 0     | `vec4` |
+//! | byte    | content                                                         | GLSL   |
+//! |---------|-----------------------------------------------------------------|--------|
+//! | 0..64   | the camera's view-projection without its translation, column-major | `mat4` |
+//! | 64..80  | the tile's origin relative to the camera in `xyz`; `w` the cell size | `vec4` |
+//! | 80..96  | fog: `x` start, `y` end (blocks from the camera), `z` `1 / (end - start)`, `w` 0 | `vec4` |
+//! | 96..112 | fog colour, `rgb` the sky colour the frame is cleared to, `a` 1  | `vec4` |
 //!
-//! A `mat4` followed by a `vec4` has these offsets under the std430 rules push
-//! constants use, so a shader can declare the block as written in the table.
+//! The matrix and the fog are pushed once per frame, the origin once per mesh drawn.
+//!
+//! - **Origin:** the lowest corner of the mesh's chunk or tile, `TilePos::origin()`, minus the
+//!   camera position, in blocks.
+//! - **Cell size:** the edge of one mesh cell in blocks: 1.0 for a chunk, `2^level` for a
+//!   level-of-detail tile (exact in `f32`). A vertex lies at `origin + position * cell size`.
+//! - **Fog:** the fraction of a fragment's colour replaced by the fog colour is
+//!   `smoothstep(start, end, distance)`, with `distance` the straight-line (radial) distance
+//!   from the camera, so the fog does not change when the camera turns. `z` saves the
+//!   division and is 0 while fog is off (`start` and `end` are 0 then): a shader that
+//!   computes `clamp((distance - x) * z, 0, 1)` needs no special case. Do not call GLSL
+//!   `smoothstep(x, y, ...)` directly, it is undefined while fog is off.
+//! - **Fog colour:** equal to the clear colour, so a fully fogged face cannot be told from
+//!   the sky and the end of the loaded terrain is invisible.
+//!
+//! # Texture coordinates
+//! The built-in `chunk.vert` derives them from the position **in blocks**, so a texture
+//! repeats once per block at every level of detail:
+//!
+//! ```glsl
+//! vec3 local = vec3(in_pos_face.xyz) * draw.chunk_origin.w;   // cells to blocks
+//! v_uv = vec2(dot(local, FACE_U[face]), dot(local, FACE_V[face]));
+//! ```
+//!
+//! `FACE_U` and `FACE_V` are unit axes per face. A greedy quad `w` cells wide on a tile of
+//! level `k` spans `w * 2^k` blocks and the same number of texture repeats; its corners land
+//! on whole numbers, as do tile origins, so the pattern lines up with full-detail chunks and
+//! tiles of other levels (repeat addressing). The mip level comes from the screen derivatives
+//! of `v_uv` as before, so a far tile samples the same small levels a far chunk would. Both
+//! lines are pinned by a test in `shader/mod.rs`, which also checks a level-2 quad.
+//!
+//! A `mat4` followed by `vec4`s has these offsets under the std430 rules push constants
+//! use, so a shader can declare the block as written in the table.
 //!
 //! # Descriptor resources
 //! One descriptor set (set 0) for the fragment stage only, holding the block textures
@@ -76,9 +126,15 @@ const MAT4_SIZE: u32 = VEC4_FLOATS * VEC4_SIZE;
 /// Byte offset of the chunk origin inside the push constants, right after the matrix.
 pub(crate) const CHUNK_ORIGIN_OFFSET: u32 = MAT4_SIZE;
 
-/// Size of the push constants, see the table in the module docs: the matrix, then the
-/// origin `vec4` filling the rest of the block.
-pub(crate) const PUSH_CONSTANT_SIZE: u32 = CHUNK_ORIGIN_OFFSET + VEC4_SIZE;
+/// Byte offset of the fog distances inside the push constants, right after the origin.
+pub(crate) const FOG_OFFSET: u32 = CHUNK_ORIGIN_OFFSET + VEC4_SIZE;
+
+/// Byte offset of the fog colour inside the push constants, right after the distances.
+pub(crate) const FOG_COLOR_OFFSET: u32 = FOG_OFFSET + VEC4_SIZE;
+
+/// Size of the push constants, see the table in the module docs: the matrix, the origin,
+/// the fog distances and the fog colour.
+pub(crate) const PUSH_CONSTANT_SIZE: u32 = FOG_COLOR_OFFSET + VEC4_SIZE;
 
 // Staying within the guaranteed size means no capability check is needed.
 const _: () = assert!(PUSH_CONSTANT_SIZE <= GUARANTEED_PUSH_CONSTANT_SIZE);
@@ -124,7 +180,8 @@ pub(crate) const INTERFACE: PipelineInterface = PipelineInterface {
     vertex_stride: VERTEX_STRIDE,
     attributes: &ATTRIBUTES,
     push_constants: PushConstants {
-        stage: Stage::Vertex,
+        // The vertex stage places the chunk, the fragment stage fogs it.
+        stages: &[Stage::Vertex, Stage::Fragment],
         size: PUSH_CONSTANT_SIZE,
     },
     resources: &RESOURCES,
@@ -141,9 +198,18 @@ mod tests {
     }
 
     #[test]
-    fn push_constants_are_a_matrix_then_a_vec4() {
-        assert_eq!(CHUNK_ORIGIN_OFFSET, 16 * 4);
-        assert_eq!(PUSH_CONSTANT_SIZE, CHUNK_ORIGIN_OFFSET + 4 * 4);
+    fn push_constants_are_a_matrix_then_three_vec4s() {
+        assert_eq!(CHUNK_ORIGIN_OFFSET, 64);
+        assert_eq!(FOG_OFFSET, 80);
+        assert_eq!(FOG_COLOR_OFFSET, 96);
+        assert_eq!(PUSH_CONSTANT_SIZE, 112);
+    }
+
+    #[test]
+    fn both_stages_read_the_push_constants() {
+        let push = INTERFACE.push_constants;
+        assert!(push.visible_to(Stage::Vertex) && push.visible_to(Stage::Fragment));
+        assert_eq!(push.stage_names(), "vertex and fragment");
     }
 
     #[test]

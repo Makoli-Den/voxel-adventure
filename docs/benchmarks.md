@@ -411,6 +411,48 @@ is 8 or more out of 255 (Pillow `ImageChops.difference`, then `convert("L")`).
 little in a still frame. NL is kept because it hides the line where one level hands over to
 the next while the camera moves (not measured, the frames are stills).
 
+## Fog and camera-relative drawing (2026-11-24, step S1 of decision 0015)
+
+The chunk fragment shader now fades faces into the sky colour with the radial distance from
+the camera (`smoothstep` from 60 percent of the fog end to the fog end, which lies
+`(radius - 1.41) * 32` blocks away), chunks are placed relative to the camera, and the far
+plane lies 1 block beyond the fog end instead of at 3000 blocks. Command line:
+`vox-game.exe --background --view-radius N` standing still at the start position for 8 s, or
+with `--fly 8` (flies sideways for 8 s, then quits); release build, default window size, RTX
+4070 SUPER. The figures are the run summaries' `gpu` (upper bound, printed to 0.01 ms) and FPS;
+runs alternated, three each.
+
+**The fog shader alone.** The same build with and without a pack that replaces `chunk.frag` by
+the fog-free one of `main` (`--pack DIR`), so culling and the far plane are identical:
+
+| Radius | GPU without fog | GPU with fog | FPS without fog | FPS with fog |
+|---|---|---|---|---|
+| 8 | 0.08, 0.08, 0.08 ms | 0.08, 0.08, 0.08 ms | 3713, 3781, 3801 | 3813, 3721, 3746 |
+| 12 | 0.22, 0.22, 0.22 ms | 0.23, 0.22, 0.23 ms | 2508, 2539, 2530 | 2551, 2543, 2554 |
+| 16 | 0.43, 0.43, 0.43 ms | 0.43, 0.42, 0.43 ms | 1775, 1753, 1736 | 1754, 1762, 1766 |
+
+No measurable cost: at most 0.01 ms at radius 12, the printing resolution (decision 0015 asks
+for at most 0.01 ms at 8 and 5 percent at 16). One `length`, a multiply-add, a clamp, the
+smoothstep polynomial and a `mix` per fragment.
+
+**The whole step against `main`** (the far plane now culls the fully fogged outer ring: at the
+start view, radius 8 draws 59 chunks and 71 k triangles instead of 67 and 80 k):
+
+| Case | GPU before | GPU after | FPS before | FPS after | Worst frame before | Worst frame after |
+|---|---|---|---|---|---|---|
+| radius 8, standing | 0.09, 0.09, 0.09 ms | 0.08, 0.08, 0.08 ms | 3517, 3403, 3581 | 3655, 3597, 3754 | 9.7, 10.0, 10.6 ms | 8.7, 10.2, 9.7 ms |
+| radius 12, standing | 0.22, 0.22, 0.23 ms | 0.22, 0.22, 0.23 ms | 2497, 2491, 2551 | 2497, 2474, 2501 | 9.6, 9.4, 10.1 ms | 9.8, 8.8, 10.0 ms |
+| radius 16, standing | 0.42, 0.42, 0.42 ms | 0.43, 0.43, 0.43 ms | 1763, 1749, 1765 | 1749, 1709, 1757 | 9.5, 15.7, 8.4 ms | 9.5, 9.4, 9.1 ms |
+| radius 8, `--fly 8` | 0.10, 0.10, 0.10 ms | 0.08, 0.08, 0.08 ms | 3395, 3281, 3398 | 3646, 3548, 3584 | 10.0, 9.9, 11.4 ms | 9.4, 9.7, 10.1 ms |
+| radius 12, `--fly 8` | 0.21, 0.21, 0.21 ms | 0.23, 0.23, 0.23 ms | 2181, 2350, 2396 | 2400, 2462, 2466 | 10.1, 10.5, 9.4 ms | 8.6, 9.2, 8.5 ms |
+| radius 16, `--fly 8` | 0.46, 0.45, 0.46 ms | 0.44, 0.44, 0.44 ms | 1635, 1663, 1662 | 1617, 1680, 1674 | 9.2, 9.4, 9.7 ms | 8.1, 10.1, 8.8 ms |
+
+**Default radius.** Decision 0015 sets it to the largest of 8, 12 and 16 that keeps at least
+2000 FPS standing and 1000 FPS flying here: radius 16 stands at about 1740 FPS, radius 12 at
+about 2490 standing and 2440 flying, so `DEFAULT_VIEW_RADIUS` is now 12 (fog from about 203 to
+339 blocks, 441 chunks loaded, filled in about 85 ms). On a slow GPU these figures do not hold;
+step S9 measures one.
+
 ## Lua sandbox: build cost and state size (2026-11-24, step S4 of decision 0014)
 
 `vox-mods` now depends on `mlua` 0.11.6 with Lua 5.4.8 compiled from source (`vendored`). The
@@ -493,3 +535,357 @@ the limit, before the mod is disabled; an old CPU takes longer. It is a one-time
 is then off). The overrun is about `HOOK_INTERVAL` / (instructions per loop iteration) such
 instructions, so a lower `HOOK_INTERVAL` or a lower cap shrinks it in proportion. Documented
 as a residual risk for S7, which decides on the low-end device.
+
+## Face groups in the mesh (S2a of decision 0015)
+
+`ChunkMesh::face_quads` is filled once per face in `build_mesh_with_neighbours_into`, from the
+growth of the index buffer while that face was meshed. The quads were already emitted face by
+face, so the vertices and indices are grouped by direction with no change to the loops, and
+`push_quad` is unchanged.
+
+Method: `cargo bench -p vox-world --bench mesh` (full run, no `--quick`), three runs of the
+code before (main, a second worktree) and three of the code after, alternating, on the same
+machine. Medians of the three medians per case:
+
+| Case | Before | After | Change | Runs before | Runs after |
+|---|---|---|---|---|---|
+| `mesh/empty` | 1.33 us | 1.32 us | -1.1% | 1.40 / 1.33 / 1.33 | 1.32 / 1.32 / 1.34 |
+| `mesh/single_block` | 6.84 us | 6.63 us | -3.1% | 6.84 / 6.54 / 7.54 | 6.26 / 6.63 / 6.72 |
+| `mesh/terrain_seed_1` | 182.3 us | 168.8 us | -7.4% | 182.3 / 177.3 / 205.0 | 168.8 / 170.0 / 167.9 |
+| `mesh/slab` | 84.6 us | 83.6 us | -1.2% | 84.6 / 82.2 / 85.8 | 83.6 / 82.7 / 85.4 |
+| `mesh/solid` | 140.5 us | 139.4 us | -0.8% | 147.0 / 137.5 / 140.5 | 139.4 / 141.3 / 139.2 |
+| `mesh/checkerboard` | 2.87 ms | 2.73 ms | -4.8% | 2.87 / 2.55 / 3.04 | 2.73 / 2.82 / 2.62 |
+| `mesh_reused/terrain_seed_1` | 176.0 us | 167.6 us | -4.8% | 176.8 / 174.5 / 176.0 | 167.6 / 194.2 / 167.1 |
+| `mesh_reused/solid` | 139.7 us | 148.8 us | +6.5% | 139.7 / 137.3 / 143.0 | 138.9 / 204.8 / 148.8 |
+| `mesh_reused/checkerboard` | 1.63 ms | 1.79 ms | +9.4% | 1.63 / 1.73 / 1.58 | 1.61 / 2.54 / 1.79 |
+| `mesh_neighbours/terrain_seed_1` | 175.7 us | 173.6 us | -1.2% | 176.3 / 172.9 / 175.7 | 166.6 / 186.7 / 173.6 |
+| `terrain/generate_seed_1` (control, code unchanged) | 26.5 us | 26.6 us | +0.5% | 26.4 / 26.5 / 36.5 | 25.6 / 26.6 / 27.8 |
+
+Reading: the control moved 0.5 percent at the median but one of its runs was 38 percent above
+the others, so a spread of that size is present in this setup. Seven of the ten mesh cases are
+faster after (the terrain cases by 1 to 7 percent, which cannot be an effect of the change, so
+it is noise or placement). The two reused cases that are slower at the median each owe it to a
+single bad run after (204.8 us and 2.54 ms); their other two runs are within 1 to 7 percent of
+the runs before (lowest runs: 138.9 vs 137.3 us, 1.61 vs 1.58 ms, which is +1.2 and +1.4
+percent). So the criterion "within noise" is met in the sense that no case shows a difference
+larger than the run-to-run spread, but the data cannot prove a cost below that spread; the
+added work is three instructions per face (six times per chunk), not per quad.
+
+## Per-direction culling (2026-11-24, step S2b of decision 0015)
+
+The renderer draws, of each mesh in view, only the face directions the camera can be in front
+of (one to three ranged draws per mesh instead of one draw of the whole mesh). Before is
+`main` at the end of S1 and S2a (exported with `git archive` and built separately), after is
+this step; release builds, default window size, RTX 4070 SUPER, start position.
+
+**Picture.** One screenshot of each build at the start view (`--background --view-radius N`,
+captured with `PrintWindow` after 4 s), compared pixel by pixel outside the HUD panel (the
+full width below y = 300 and the strip right of x = 615, 356,700 pixels):
+
+| Radius | Pixels that differ |
+|---|---|
+| 8 | 0 |
+| 12 (default) | 0 |
+| 16 | 0 |
+
+Only the HUD numbers differ. One of the first radius-16 shots of the new build showed the
+camera somewhere else (a different view, 216 instead of 224 chunks, its worst frame 22 ms); a
+second shot of the same build, and a repeat of the old one, matched exactly. The terrain in
+that shot was right, seen from another place, so it is not a rendering difference.
+Hypothesis, not confirmed: the `--background` window received the focus once, the game
+entered playing mode on that first focus event, and mouse or keys moved the camera.
+
+**Triangles drawn** at the start view (HUD "Drawn" line, same shots):
+
+| Radius | Chunks | Triangles before | Triangles after | Change |
+|---|---|---|---|---|
+| 8 | 59 | 71,354 | 51,810 | -27.4% |
+| 12 | 132 | 155,918 | 111,650 | -28.4% |
+| 16 | 224 | 261,848 | 186,244 | -28.9% |
+
+Decision 0015 asks for at least 20 percent (expected 25 to 40): met. The camera stands above
+the terrain, so all bottoms and the side faces turned away drop out; tops stay.
+
+**Frame figures.** 8 s per run (`--fly 8` flies sideways for 8 s), the run summary's FPS,
+`work` average and `gpu`, three runs each, before and after alternating. Median, then the
+three runs:
+
+| Case | FPS before | FPS after | Work before | Work after | GPU before | GPU after |
+|---|---|---|---|---|---|---|
+| radius 8, standing | 3559 (3499, 3559, 3635) | 3901 (3908, 3784, 3901) | 0.20 (0.20, 0.20, 0.20) ms | 0.18 (0.17, 0.18, 0.18) ms | 0.08 ms | 0.06 ms |
+| radius 16, standing | 1675 (1719, 1675, 1615) | 2089 (2150, 2054, 2089) | 0.50 (0.49, 0.50, 0.53) ms | 0.39 (0.37, 0.39, 0.39) ms | 0.43 (0.43, 0.43, 0.44) ms | 0.29 ms |
+| radius 8, `--fly 8` | 3555 (3560, 3555, 3485) | 3626 (3626, 3700, 3570) | 0.20 (0.20, 0.21, 0.20) ms | 0.19 (0.19, 0.19, 0.19) ms | 0.08 ms | 0.06 ms |
+| radius 16, `--fly 8` | 1597 (1597, 1630, 1563) | 1980 (1980, 2019, 1941) | 0.53 (0.53, 0.53, 0.50) ms | 0.40 (0.41, 0.40, 0.39) ms | 0.45 ms | 0.30 ms |
+
+FPS is not lower in any case (+2 to +25 percent), and `work` is lower, not higher. The GPU
+time drops by about a third at radius 16 (0.43 to 0.29 ms standing), a little more than the
+triangle count, while radius 8 is near the printing resolution. The lows moved within their
+run-to-run spread (radius 16 flying, 0.1% low: 196 to 222 before, 182 to 220 after).
+
+**CPU cost of the culling itself.** `work` includes `render_frame`'s wait for the GPU, so
+the lighter GPU load hides the CPU side. An ignored timing test measures it apart:
+`cargo test -p vox-render --release -- --ignored per_chunk_cpu_cost --nocapture`
+(`vox-render/src/face_culling.rs`). It runs the renderer's per-chunk path over 197 surface
+chunks (a circle of radius 8, one layer, face groups shaped like terrain: many tops, sides in
+every direction, almost no bottoms) from a camera at the start height looking slightly down;
+69 are in view and get 99 draws. Old path: relative origin, box, frustum test. New path: the
+same plus `visible_ranges` and summing the drawn indices. Fastest of 14 rounds of 20,000
+frames, three runs:
+
+| Path | ns per mesh (3 runs) |
+|---|---|
+| old: frustum test only | 6.07, 6.15, 6.21 |
+| new: frustum test and per-direction ranges | 8.22, 8.22, 8.26 |
+
+About 2.1 ns more per mesh, 0.4 us per frame for 197 meshes, 0.2 percent of the 0.20 ms
+`work` at radius 8: far below the 10 percent the decision allows. Not covered by the test:
+the driver's cost of the extra `vkCmdDrawIndexed` calls (99 draws instead of 69 here, about
+43 percent more). That part is only bounded by the frame figures above (`work` fell); it is
+re-measured on a CPU-bound low-end device in S9.
+
+## Vertical streaming by column span (2026-11-24, step S3b of decision 0015)
+
+Development machine (RTX 4070 SUPER), release builds of `main` (before) and this step (after),
+start view, 1280x720 window as the game opens it, alternating runs of 8 s each.
+
+**Unchanged picture.** Every span is layer 0 today, so the loaded set and the meshes must not
+change. The screenshots at the start view are pixel-identical outside the HUD panel at radius 8
+and 12 (0 of 356,700 pixels differ). Drawn at the start view, before and after: radius 8, 59
+chunks and 51,810 triangles; radius 12, 132 chunks and 111,650 triangles; loaded 197 and 441.
+
+**Frame rate at radius 12** (three runs each):
+
+| Case | FPS before | FPS after | `work` before | `work` after |
+|---|---|---|---|---|
+| standing | 3053 (3032, 3075, 3053) | 3075 (3026, 3075, 3081) | 0.25 ms | 0.25 ms |
+| `--fly 8` | 2787 (2787, 2784, 2884) | 2848 (2848, 2839, 2885) | 0.27 ms | 0.27 ms |
+
+Within the run spread. The column job (one layer plus the span scan) averaged 0.629 ms in a
+`--fly 8` run at radius 12 with 15 workers.
+
+**Edit that creates chunks.** An ignored timing test,
+`cargo test -p vox-game --release -- --ignored the_cost_of_an_edit_that_creates_four_chunks --nocapture`
+(`vox-game/src/editing.rs`), breaks block (0, -32, 0) under a streamed 3 x 3 area: the corner of
+chunk (0, -1, 0), so the edit creates that chunk and the three behind its -X, -Y and -Z borders,
+writes the block and remeshes the four chunks, as the game does on the main thread. Four is a
+deliberate upper bound: in the game an edit creates at most 3 chunks (the hit block's chunk is
+always present), so the game's worst case is cheaper than this. Median and
+worst of 20 runs, three runs:
+
+| Remesh of a missing neighbour | median | worst |
+|---|---|---|
+| generated (first version) | 1.69, 1.64, 1.65 ms | 1.95, 2.63, 2.11 ms |
+| solid or air from the column's span, generated only outside the loaded columns | 0.91, 0.92, 0.86 ms | 1.10, 1.37, 1.13 ms |
+
+The budget of decision 0015 is 2 ms, checked here on the development machine only; S9
+re-measures it on the low-end device. Generating the up to five missing neighbours of each of
+the four remeshed chunks (about 14 generations) was nearly half of the edit; reading the span
+instead keeps the edit near 0.9 ms. The game logs every edit that created chunks
+(`Edit: N chunks created, M remeshed in T ms`).
+
+## LOD tile generation (step S4 of decision 0015)
+
+`generate_lod_chunk` fills a chunk of 32 x 32 x 32 cells (cells of `2^level` blocks): one noise
+sample per cell column at its centre block, then one write per solid cell. A tile is meshed
+alone (`build_tile_mesh_into`, solid bedrock chunk below), so its four sides become walls
+(skirts).
+
+Method: `cargo bench -p vox-world --bench mesh -- "generate_seed_1|generate_lod|lod_tile"`, one
+full run (no `--quick`), nothing else running, seed 1, origin tile of the level. One run per
+case, so there is no spread across runs; the control moved a lot against the older tables
+(37 us here against 26 to 28 us in the sections above, same code), so only compare numbers
+inside this table. The ratios to the control are indicative only: the control drifted by
+about 35 percent against the older tables, which is larger than the differences between the
+levels.
+
+| Case | Median (range) | Notes |
+|---|---|---|
+| `terrain/generate_seed_1` (control, code unchanged) | 37.0 us (36.8 - 37.2) | one chunk, 1,024 samples |
+| `terrain/generate_lod_level_1` | 45.4 us (45.2 - 45.5) | 1.23 x control |
+| `terrain/generate_lod_level_2` | 39.5 us (39.3 - 39.6) | 1.07 x control |
+| `terrain/generate_lod_level_4` | 32.6 us (32.5 - 32.8) | 0.88 x control |
+| `mesh_reused/lod_tile_level_2` | 122.2 us (121.6 - 122.8) | 567 quads |
+
+Reading: a tile costs about one chunk generation, as decision 0015 estimated. The noise cost is the
+same 1,024 samples at every level; the finer levels fill more solid cells (level 1 reaches
+rows up to about 12, level 4 only 0 and 1), which is a plausible reason why level 1 costs the
+most (not isolated).
+Generation plus mesh of a level-2 tile is about 160 us, near the 0.2 ms per tile of the
+estimate.
+
+Quads and skirts (the test `skirt_share_is_reported_and_below_the_adr_limit` prints them; a
+skirt is a sideways quad on the tile's own border plane), seed 1, origin tile:
+
+| Level | Quads | Skirt share |
+|---|---|---|
+| 1 | 787 | 18.9 percent |
+| 2 | 567 | 14.3 percent (81 quads) |
+| 3 | 320 | 17.5 percent |
+| 4 | 31 | 96.8 percent |
+
+Over 5 seeds and the 3 x 3 tiles around the origin the skirt share at levels 1 to 3 stays
+under 26 percent (limit of the decision: 40), so neighbour-aware skirts are not needed. Level 4 is the exception in share only: with cells
+of 16 blocks the whole tile is nearly flat (rows 0 and 1), so it is 23 to 45 quads over the same
+tiles, and the share is meaningless; it is judged by its absolute cost. For comparison, a full
+chunk of the same terrain is 760 quads. The outward half of the skirts is dropped at draw time
+by the per-direction culling (S2b).
+
+## Tile selection (step S6 of decision 0015)
+
+One `select_tiles` call (the quadtree over the horizon disc, view radius 8), release build,
+averaged over 49 cameras, three quiet runs read 25 to 29 us at 2048 and 51 to 52 us at 4096; one run during other work read 62 and 73 us (negative columns and tile borders included). Run with
+`cargo test -p vox-game --release streaming::lod::tests::selection_cost -- --ignored --nocapture`.
+
+| Horizon | Time per selection | Leaves |
+|---|---|---|
+| 2048 | 26 us | 927 |
+| 4096 | 52 us | 1157 |
+
+Far below the 1 ms the decision expected. The leaf counts are about 45 percent above the
+estimate of the decision (650 and 800); see "S6 as built" in decision 0015.
+
+## Tiles and reversed Z in the renderer (2026-11-24, step S5 of decision 0015)
+
+Development machine (RTX 4070 SUPER), release builds of `main` (before, exported with
+`git archive` and built apart) and this step (after), start view, the window as the game opens
+it, alternating runs of 8 s each. The game still streams only full-detail chunks; tiles are
+drawn only by the temporary check below.
+
+**Picture at level 0.** Screenshots at the start view, compared outside the HUD panel (356,700
+pixels): **3 pixels differ** at radius 8 and the same 3 at radius 12, isolated single pixels
+on edges where two faces meet. With reversed Z switched off by a temporary edit (standard depth
+on the same `D32_SFLOAT` buffer, everything else of this step in place) **0 pixels differ**, so
+the tile path (cell size, mesh boxes, one map keyed by `TilePos`) is pixel-identical and the 3
+pixels are depth ties at shared edges that the other depth mapping resolves the other way.
+
+**Drawn at the start view.** The box of every mesh now spans only its vertices on Y (decision
+0015 (c), applied to chunks too), so a few more chunks fail the frustum test and a few more top
+groups fail the per-direction test; the picture does not change:
+
+| Radius | Before | After |
+|---|---|---|
+| 8 | 59 chunks, 51,810 triangles | 56 meshes, 48,638 triangles (-6 percent) |
+| 12 | 132 chunks, 111,650 triangles | 127 meshes, 106,904 triangles (-4 percent) |
+
+**Frame rate** (three runs each, median first; the GPU column is the run summary's average):
+
+| Case | FPS before | FPS after | GPU before | GPU after | `work` before | `work` after |
+|---|---|---|---|---|---|---|
+| radius 8 standing | 3337 (3393, 3337, 3290) | 3443 (3376, 3443, 3451) | 0.06 ms | 0.06 ms | 0.22 ms | 0.22 ms |
+| radius 12 standing | 2618 (2632, 2617, 2618) | 2678 (2650, 2678, 2726) | 0.13 ms | 0.12 ms | 0.30 ms | 0.30 ms |
+| radius 12 `--fly 8` | 2494 (2515, 2494, 2477) | 2580 (2580, 2568, 2581) | 0.16 ms | 0.13 ms | 0.33 ms | 0.31 ms |
+
+Not lower anywhere; at radius 12 slightly higher, in line with the fewer triangles above (a
+hypothesis: the runs do not isolate the cause). The radius-12 FPS of `main` here are lower
+than in the S3b table above (same code), so compare only inside this table.
+
+**Tiles next to chunks (temporary check, reverted).** A local edit uploaded level-2 tiles
+(`generate_lod_chunk` + `build_tile_mesh_into` through `set_tile_mesh`) over every level-2 tile
+around the camera that holds no loaded column, out to about 2,200 blocks, and filled the
+remaining columns of the tiles that hold loaded ones with full-detail chunks, so tiles and
+chunks meet along tile borders; fog off, far plane 4,000 blocks. With 423 tiles at radius 8
+from the start view: 1,629 FPS, GPU 0.36 ms, last frame 77,144 triangles at level 0 and 181,578
+at level 2 (`Run summary ... last frame triangles by level`). The screenshots show no crack
+and no sky between chunks and tiles or between tiles; the 4-block walls of level-2 steps show
+four texture repeats each (one per block), lined up with the chunks beside them; terrain up
+to about 2,000 blocks away shows no z-fighting with reversed Z. The same far view with standard
+depth forced differs in 884 pixels of the whole image and shows no visible fighting either:
+level-2 faces are at least 4 blocks apart, more than the computed 2.5-block step at 2048, so
+this scene does not provoke it.
+
+## LOD streaming (2026-11-25, step S7 of decision 0015)
+
+Development machine (RTX 4070 SUPER), release builds of `main` (exported with `git archive`
+and built apart; its default radius was 12) and this step, start view, the window as the game
+opens it (about 800 x 600), runs of 8 s each started with `--background` and a hidden console,
+alternating between the cases (three rounds). FPS, 1% low, worst frame, GPU and triangles come
+from the run summary (the triangles are those of the last frame, by level); meshes, MiB and the
+fill time from the fill log line (`Streaming: ... loaded in ... ms (N meshes, X MiB)`). MiB is
+the vertex and index payload of the streamed meshes, not the driver's allocation sizes. The
+maximum case asks for `--view-radius 16 --horizon 4096`; the game lowers the horizon to 3328
+for the mesh budget and says so on stderr.
+
+| Case | FPS (median; runs) | 1% low | Worst frame | GPU | Triangles by level 0..3 (total) |
+|---|---|---|---|---|---|
+| `main` radius 12 standing | 2819 (2688, 2855, 2819) | 256-290 | 9.0-10.0 ms | 0.12 ms | 106,904 (level 0 only) |
+| default (radius 8, horizon 2048) standing | 1898 (1898, 1927, 1865) | 239-250 | 10.5-12.3 ms | 0.31 ms | 72,994 / 63,350 / 43,848 / 16,208 (196,400) |
+| radius 8, `--horizon 0` standing | 3142 (3083, 3142, 3474) | 228-281 | 9.5-11.0 ms | 0.06 ms | 48,638 (level 0 only) |
+| maximum (radius 16, horizon 3328) standing | 846 (846, 815, 847) | 178-188 | 9.4-9.7 ms | 1.01-1.04 ms | 213,220 / 184,782 / 137,554 / 35,232 (570,788) |
+| `main` radius 12 `--fly 8` | 2558 (2558, 2402, 2581) | 217-284 | 11.6-15.7 ms | 0.13 ms | about 110,000 |
+| default `--fly 8` | 1762 (1762, 1713, 1807) | 190-232 | 13.9-15.6 ms | 0.30 ms | about 70,000 / 64,000 / 43,000 / 17,500 |
+| maximum `--fly 8` | 826 (774, 828, 826) | 123-127 | 24.3-25.7 ms | 1.01-1.05 ms | about 213,000 / 186,000 / 140,000 / 35,000 |
+
+| Case | Columns | Tiles | Meshes | Mesh MiB | Fill to the horizon |
+|---|---|---|---|---|---|
+| `main` radius 12 | 441 | 0 | 441 | not printed | 75-97 ms |
+| default | 308 | 619 | 927 | 23.8 | 150-194 ms (median 190) |
+| radius 8, `--horizon 0` | 197 | 0 | 197 | 5.4 | 41-48 ms |
+| maximum | 996 | 1,827 | 2,823 | 74.7 | 641-655 ms (median 648) |
+
+Average job on 15 workers: a column 0.53-0.61 ms, a tile 0.21-0.24 ms (the estimate was 0.2).
+Uploads 0.08 ms each, 4 per frame shared by columns and tiles.
+
+**Against the budget table of decision 0015 (e):**
+
+| Budget | Default: limit / measured | Maximum: limit / measured |
+|---|---|---|
+| Triangles, full-detail area | 100 k / 73.0 k, met | 300 k / 213 k, met |
+| Triangles, each LOD ring | 60 k / 63.4 k (level 1), 43.8 k, 16.2 k: **level 1 over by 6 percent** | 120 k / 184.8 k (level 1), 137.6 k (level 2), 35.2 k: **two rings over** |
+| Triangles, total | 300 k / 196 k, met | 700 k / 571 k, met |
+| FPS standing | 1500 / 1898, met | 600 / 846, met |
+| `--fly 8` average / worst frame | 1000 / 16.7 ms; 1762 / 15.6 ms, met | 400 / 16.7 ms; 826 / **25.7 ms, worst frame missed** |
+| Meshes | 1500 / 927, met | 3000 / 2,823 standing (2,913 uploads during the flying fill), met |
+| GPU mesh memory | 64 MiB / 23.8 MiB payload only, unverified | 160 MiB / 74.7 MiB payload only, unverified |
+| Fill time to the horizon | 1 s / 0.19 s, met | 3 s / 0.65 s, met |
+
+The memory row counts vertex and index bytes, not what the driver allocates per mesh, so it is
+not a verified GPU figure. Allocation count: at the maximum about 2,823 meshes are live and up
+to about 260 more wait as retired buffers right after a level-border crossing, about 3,080
+against the 4,096 `maxMemoryAllocationCount` Vulkan guarantees (decision 0007): the headroom is
+about 1,000 allocations.
+
+**Why the misses.**
+- *Ring triangles.* The split ratio is `view_radius / 2`, so every ring is as many tiles wide as
+  the full-detail circle is chunks: a ring's area, and its triangles, grow with the square of the
+  radius (level 1: 63 k at radius 8, 185 k at 16, about 2.9 times). The per-ring limits (60 k and
+  120 k) assumed a smaller growth; the totals, which set the frame time, are met. The skirts
+  facing the camera (about half of a level's skirt quads, under 13 percent of its triangles,
+  S4) cannot bring level 1 at radius 16 under 120 k, and neighbour-aware skirts are rejected in
+  the decision. Left as measured; a ratio that does not grow with the radius, or per-ring limits
+  that do, is a question for the decision, not for this step.
+- *Worst frame flying at radius 16.* A temporary probe (reverted) timed the parts of a slow
+  frame: the selection and the trackers take 0.4-0.7 ms; the frame where the camera crosses a
+  level-2 border removes 68 columns and 191 tiles, and the renderer's `remove_tile_mesh` calls
+  alone took 20-24 ms of it (about 80 us per mesh removed; when the GPU is still busy, the same
+  cost moves into the next `render_frame`). Lighter crossings removed 68 columns and 18, 22 or 104
+  tiles and took 11-17 ms. *Hypothesis, not isolated:* the cost is the driver freeing one
+  allocation per mesh; `remove_tile_mesh` also polls the frame fences on every call, which the
+  probe did not separate. Either way the fix belongs to the renderer (free retired meshes in
+  bounded batches per frame, poll once per frame, or sub-allocate, the trigger of decision 0007),
+  not to streaming. Accepted as a deviation from the table for now. At the default settings a crossing removes about 150
+  meshes and the worst frame stays at 15.6 ms, close to the limit; `main` at radius 12 shows
+  similar worst frames (11.6-15.7 ms).
+
+**Holes during level changes (until S8).** A tile that leaves the selection is removed at once,
+and so is a column that a tile now covers. After the first fill, `--fly 8` had tiles waiting in
+391-395 of about 12,600-13,300 frames at the default settings (at most 103 at once) and in
+685-698 of about 5,100-5,500 frames at the maximum (at most 191). These runs counted waiting
+tiles only, so they are a **lower bound** on frames with holes: waiting columns (a removed
+column's ground before its tile arrives, or the reverse) were not counted. The run summary now
+counts columns and tiles together (`stats.waiting()`) and says "first fill not reached" when the
+fill never completed; it was not re-measured. Standing, no frame had a tile waiting.
+
+**What the extra full-detail columns cost.** The selection's level-0 leaves are loaded as columns
+(308 instead of 197 at radius 8, see decision 0015 "S7 as built"), and the fog now ends near the
+horizon, so the full-detail area draws 73 k triangles instead of 49 k at `--horizon 0`.
+
+**Window checks** (screenshots in the session's scratchpad, not committed): the start view at the
+default settings shows terrain out to the horizon line, the last rows fading into the sky over
+a few pixels (from 60 blocks up the fog band from 1,215 to 2,025 blocks spans about 6 rows); from
+300 blocks up (a temporary start position, reverted) the terrain reaches the horizon and fades
+into the sky over a wide band with no edge, at radius 8 and at the maximum; with `--horizon 0`
+from 300 blocks up everything is sky (the radius-8 fog ends at 210 blocks), the old behaviour. No crack
+or band of sky is visible at the borders between levels. A count of pure sky-coloured pixels
+below the horizon finds 6 single pixels at the start view, the same 6 at `--horizon 0` (sparkles
+at T-junctions of the greedy mesh, not new), and 16 (radius 8) and 34 (maximum) isolated single
+pixels from 300 blocks up, none forming a line or a hole.

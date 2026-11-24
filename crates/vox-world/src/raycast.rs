@@ -138,6 +138,38 @@ pub fn raycast(
     direction: [f32; 3],
     max_distance: f32,
 ) -> Option<RayHit> {
+    raycast_with(
+        |block| world.block_at(block),
+        origin,
+        direction,
+        max_distance,
+    )
+}
+
+/// [`raycast`] through blocks looked up by `block_at`, which returns the block at a world
+/// position or `None` where the ray must stop because what lies there is unknown.
+///
+/// The caller decides what a missing chunk means: the game knows that a chunk above a loaded
+/// column's span is air although it is not stored (decision 0015), which the [`World`] alone
+/// cannot tell. Everything else behaves as in [`raycast`].
+///
+/// # Example
+///
+/// ```
+/// use vox_world::{BlockId, Face, raycast_with};
+///
+/// // A floor of stone below height 0 and air everywhere above it, without any chunk.
+/// let lookup = |block: [i32; 3]| Some(if block[1] < 0 { BlockId(1) } else { BlockId::AIR });
+/// let hit = raycast_with(lookup, [0.5, 60.5, 0.5], [0.0, -1.0, 0.0], 100.0).unwrap();
+/// assert_eq!(hit.block, [0, -1, 0]);
+/// assert_eq!(hit.face, Face::PosY);
+/// ```
+pub fn raycast_with(
+    block_at: impl Fn([i32; 3]) -> Option<BlockId>,
+    origin: [f32; 3],
+    direction: [f32; 3],
+    max_distance: f32,
+) -> Option<RayHit> {
     if !max_distance.is_finite() || max_distance < 0.0 {
         return None;
     }
@@ -155,7 +187,7 @@ pub fn raycast(
     ];
 
     let start = [axes[AXIS_X].cell, axes[AXIS_Y].cell, axes[AXIS_Z].cell];
-    let id = world.block_at(start)?;
+    let id = block_at(start)?;
     if !id.is_air() {
         let axis = strongest_axis(unit);
         return Some(RayHit {
@@ -177,7 +209,7 @@ pub fn raycast(
         state.next_border += state.border_spacing;
 
         let block = [axes[AXIS_X].cell, axes[AXIS_Y].cell, axes[AXIS_Z].cell];
-        let id = world.block_at(block)?;
+        let id = block_at(block)?;
         if !id.is_air() {
             return Some(RayHit {
                 block,
@@ -423,6 +455,25 @@ mod tests {
         far.set(crate::chunk::LocalPos::new(0, 0, 0).unwrap(), STONE);
         world.insert(ChunkPos::new(2, 0, 0), far);
         assert!(raycast(&world, [0.5, 0.5, 0.5], [1.0, 0.0, 0.0], 200.0).is_none());
+    }
+
+    #[test]
+    fn a_lookup_can_treat_missing_chunks_as_air() {
+        // The chunks reach up to height 63; the origin at 100 lies in no chunk. The lookup calls
+        // every missing cell air, so the ray still finds the block, and `raycast` stops at once.
+        const REACH: f32 = 200.0;
+        let world = world_with(&[[3, -2, 4]]);
+        let lookup = |block: [i32; 3]| world.block_at(block).or(Some(BlockId::AIR));
+        let origin = [3.5, 100.5, 4.5];
+        let down = [0.0, -1.0, 0.0];
+        let hit = raycast_with(lookup, origin, down, REACH).unwrap();
+        assert_eq!(hit.block, [3, -2, 4]);
+        assert_eq!(hit.face, Face::PosY);
+        assert!((hit.distance - 101.5).abs() < 1e-4);
+        assert!(raycast(&world, origin, down, REACH).is_none());
+        // A lookup that stops above the block stops the ray there.
+        let stopping = |block: [i32; 3]| (block[1] > 0).then_some(BlockId::AIR);
+        assert!(raycast_with(stopping, origin, down, REACH).is_none());
     }
 
     #[test]

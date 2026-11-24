@@ -4,7 +4,10 @@
 //! game talks to it through the [`Renderer`] trait, so the backend can be
 //! replaced (for example by a fallback for old devices) without touching other layers.
 
+mod chunk_push;
+mod depth_mode;
 mod error;
+mod face_culling;
 mod frustum;
 mod interface;
 mod mipmap;
@@ -12,17 +15,21 @@ mod overlay;
 mod shader;
 mod stats;
 mod texture;
+mod tile_box;
+mod view;
 mod vulkan;
 
 use std::sync::Arc;
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
+pub use depth_mode::{D24_MAX_HORIZON, DepthMode};
 pub use error::RenderError;
 pub use overlay::OverlayRect;
 pub use shader::{ShaderSource, ShaderSources};
-pub use stats::RenderStats;
+pub use stats::{LOD_LEVEL_COUNT, RenderStats};
 pub use texture::TextureLayers;
+pub use view::{CameraView, Fog};
 
 /// What the game needs from a renderer.
 pub trait Renderer {
@@ -45,32 +52,65 @@ pub trait Renderer {
     /// Human-readable name of the GPU in use.
     fn device_name(&self) -> &str;
 
-    /// Adds or replaces the mesh of the chunk at `pos`. An empty mesh (no indices) removes the entry.
+    /// Adds or replaces the mesh of the tile `tile`: a chunk (`TilePos::chunk(pos)`, level 0)
+    /// or a level-of-detail tile. An empty mesh (no indices) removes the entry.
     ///
-    /// Every chunk that has a mesh is drawn each frame unless its bounding box lies entirely
-    /// outside the camera's view (frustum culling). Mesh coordinates are chunk-local
-    /// block units; the renderer places the chunk at `pos.origin()`. A replaced mesh's GPU
-    /// memory is freed a few frames later, once no frame in flight can use it, so this
-    /// never waits for the GPU.
+    /// Mesh coordinates count **cells** of the tile, `0..=32` per axis, each cell
+    /// [`vox_world::cell_size`]`(tile.level())` blocks (one block for a chunk): the renderer
+    /// places a vertex at `tile.origin() + position * cell size` and repeats the textures once
+    /// per block, so a level-2 face one cell wide shows four texture repeats. Every tile of
+    /// every level is drawn by the same pipeline in the same loop.
+    ///
+    /// Every tile that has a mesh is drawn each frame unless its box lies entirely outside
+    /// the camera's view (frustum culling). The box spans the whole tile on X and Z
+    /// ([`vox_world::TilePos::extent`] blocks) and on Y only the mesh's own vertices, taken
+    /// once here, so the thin band of terrain in a tall tile is tested as such. Of a drawn
+    /// mesh only the face directions the camera can be in front of are drawn (per-direction
+    /// culling): the quads must be grouped by direction as
+    /// [`vox_world::ChunkMesh::face_quads`] describes, which the greedy mesher does. A
+    /// replaced mesh's GPU memory is freed a few frames later, once no frame in flight can
+    /// use it, so this never waits for the GPU.
     ///
     /// # Errors
     /// Returns [`RenderError::InvalidMesh`] if the data is malformed (an index points
-    /// past the last vertex), or another error if the GPU cannot allocate or fill the
-    /// buffer. The chunk's previous mesh is then kept.
-    fn set_chunk_mesh(
+    /// past the last vertex, or `face_quads` does not add up to the indices, six per
+    /// quad), or another error if the GPU cannot allocate or fill the
+    /// buffer. The tile's previous mesh is then kept.
+    fn set_tile_mesh(
         &mut self,
-        pos: vox_world::ChunkPos,
+        tile: vox_world::TilePos,
         mesh: &vox_world::ChunkMesh,
     ) -> Result<(), RenderError>;
 
-    /// Removes the mesh of the chunk at `pos`, if there is one. Does nothing otherwise.
-    fn remove_chunk_mesh(&mut self, pos: vox_world::ChunkPos);
+    /// Removes the mesh of the tile `tile`, if there is one. Does nothing otherwise.
+    fn remove_tile_mesh(&mut self, tile: vox_world::TilePos);
 
-    /// Sets the combined view-projection matrix, column-major, exactly `glam::Mat4::to_cols_array_2d()`.
+    /// Sets the camera the next frames are drawn from, see [`CameraView`].
     ///
-    /// The matrix must already produce Vulkan clip space (Y down, depth 0..1); the
-    /// renderer applies it unchanged.
-    fn set_camera(&mut self, view_projection: [[f32; 4]; 4]);
+    /// The matrix is that of the camera placed at the world origin (no translation) and must
+    /// already produce Vulkan clip space (Y down, depth 0..1) with the depth mapping
+    /// [`Self::depth_mode`] reports: near at 0 and far at 1 for [`DepthMode::Standard`], near
+    /// at 1 and far at 0 for [`DepthMode::Reversed`] (the same perspective with near and far
+    /// swapped). The renderer draws everything
+    /// relative to [`CameraView::position`]: it places each tile by its origin minus the
+    /// position, computed on the CPU, so the picture stays precise far from the world origin.
+    /// Frustum culling follows the matrix, far plane included. Until this is called, the
+    /// identity matrix at the world origin is used.
+    fn set_camera(&mut self, camera: &CameraView);
+
+    /// Sets the distance fog of the next frames, see [`Fog`]: chunk faces fade into the sky
+    /// colour, which the frame is cleared to, between `start` and `end` blocks from the
+    /// camera, so terrain that ends at `end` has no visible edge. Fog that is not
+    /// [`Fog::is_enabled`] (for example `end <= start`) turns it off, which is also the
+    /// state until this is called. The overlay is never fogged.
+    fn set_fog(&mut self, fog: Fog);
+
+    /// How this renderer maps distance to depth; fixed for its whole life. The game builds
+    /// the projection of [`Self::set_camera`] to match, and keeps its horizon within
+    /// [`DepthMode::max_horizon`]: reversed Z on a 32-bit float depth buffer where the device
+    /// has one (no limit), otherwise standard depth with the horizon capped at
+    /// [`D24_MAX_HORIZON`] blocks (decision 0015, "Depth precision").
+    fn depth_mode(&self) -> DepthMode;
 
     /// Replaces the overlay. The rectangles are drawn on top of everything else, in slice
     /// order (later ones over earlier ones), blended by their alpha. An empty slice removes

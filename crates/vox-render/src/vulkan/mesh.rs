@@ -1,4 +1,4 @@
-//! Chunk meshes on the GPU: the buffer that holds one mesh.
+//! Chunk and tile meshes on the GPU: the buffer that holds one mesh.
 //!
 //! The byte layout of a vertex is defined once, in `crate::interface::chunk`; this
 //! module serializes [`ChunkVertex`] into it. Indices are little-endian `u32` and follow
@@ -10,17 +10,23 @@ use vox_world::{ChunkMesh, ChunkVertex};
 use super::buffer::Buffer;
 use super::gpu::Gpu;
 use crate::RenderError;
+use crate::face_culling::FaceGroups;
 use crate::interface::chunk::VERTEX_STRIDE;
+use crate::tile_box::MeshHeight;
 
-/// One chunk mesh in a single GPU buffer, ready to draw: the vertices first, then the
-/// `u32` indices from [`Self::index_offset`] on.
+/// One chunk or tile mesh in a single GPU buffer, ready to draw: the vertices first, then the
+/// `u32` indices from [`Self::index_offset`] on, grouped by face direction as
+/// [`Self::face_groups`] records.
 ///
 /// One buffer instead of two halves the device memory allocations per chunk; Vulkan
 /// guarantees only 4096 of them in total (`maxMemoryAllocationCount`).
 pub struct GpuMesh {
     buffer: Buffer,
     index_offset: vk::DeviceSize,
-    index_count: u32,
+    /// Copied from the mesh at upload; the draws of a frame are ranges of these groups.
+    face_groups: FaceGroups,
+    /// The vertices' lowest and highest `y`, taken at upload for the mesh's box.
+    height: MeshHeight,
 }
 
 impl GpuMesh {
@@ -37,8 +43,21 @@ impl GpuMesh {
                 "an index points past the last vertex",
             ));
         }
-        let index_count = u32::try_from(mesh.indices.len())
-            .map_err(|_| RenderError::InvalidMesh("more than 2^32 indices"))?;
+        // A draw's first index and count are `u32`.
+        if u32::try_from(mesh.indices.len()).is_err() {
+            return Err(RenderError::InvalidMesh("more than 2^32 indices"));
+        }
+        // Every frame draws ranges of these groups, so counts that disagree with the
+        // indices would draw past them. Refused like a bad index rather than drawn whole:
+        // the counts are part of the mesh's contract, and a silent fallback would hide a
+        // broken mesher together with the saving it costs.
+        let face_groups = FaceGroups::from_mesh(mesh).ok_or(RenderError::InvalidMesh(
+            "the quads per face direction do not add up to the indices",
+        ))?;
+        // Every index was checked against the vertices, and there are indices, so there are
+        // vertices too; the error only keeps the library free of panics.
+        let height = MeshHeight::of(&mesh.vertices)
+            .ok_or(RenderError::InvalidMesh("indices without vertices"))?;
         let layout = MeshLayout::new(mesh.vertices.len(), mesh.indices.len())
             .ok_or(RenderError::InvalidMesh("the mesh does not fit in memory"))?;
         let usage = vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::INDEX_BUFFER;
@@ -47,7 +66,8 @@ impl GpuMesh {
             buffer,
             // Lossless: `usize` is at most 64 bits on every supported target.
             index_offset: layout.index_offset as vk::DeviceSize,
-            index_count,
+            face_groups,
+            height,
         }))
     }
 
@@ -62,9 +82,15 @@ impl GpuMesh {
         self.index_offset
     }
 
-    /// How many indices to draw.
-    pub fn index_count(&self) -> u32 {
-        self.index_count
+    /// Where the quads of each face direction lie among the indices; together they cover
+    /// all of them, so every range drawn from them lies inside the index data.
+    pub fn face_groups(&self) -> &FaceGroups {
+        &self.face_groups
+    }
+
+    /// The vertices' lowest and highest `y` in cells, for the mesh's box (`crate::tile_box`).
+    pub fn height(&self) -> MeshHeight {
+        self.height
     }
 
     /// Gives up the mesh, keeping only its buffer, so it can be retired with the others.
@@ -241,6 +267,8 @@ mod tests {
         let mesh = ChunkMesh {
             vertices: vec![sample(); 3],
             indices: vec![0, 1, 2],
+            // Less than one quad of indices, so no quad in any direction.
+            face_quads: [0; vox_world::Face::COUNT],
         };
         let layout = MeshLayout::new(3, 3).unwrap();
         let bytes = mesh_bytes(&mesh, layout);
