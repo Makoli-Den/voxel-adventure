@@ -141,13 +141,18 @@ mod test_blocks {
         grass: BlockId(1),
         dirt: BlockId(2),
         stone: BlockId(3),
+        bedrock: BlockId(4),
     };
 
     /// Blocks the tests' texture table covers: air and every id up to the highest terrain
-    /// block (stone, checked below).
-    const BLOCK_COUNT: usize = BLOCKS.stone.0 as usize + 1;
+    /// block (bedrock, checked below).
+    const BLOCK_COUNT: usize = BLOCKS.bedrock.0 as usize + 1;
 
-    const _: () = assert!(BLOCKS.grass.0 < BLOCKS.stone.0 && BLOCKS.dirt.0 < BLOCKS.stone.0);
+    const _: () = assert!(
+        BLOCKS.grass.0 < BLOCKS.bedrock.0
+            && BLOCKS.dirt.0 < BLOCKS.bedrock.0
+            && BLOCKS.stone.0 < BLOCKS.bedrock.0
+    );
 
     /// The tests' texture table: every face of block `i` has layer `i`. The tests compare
     /// meshes built the same way, so any table would do; this one keeps the blocks apart.

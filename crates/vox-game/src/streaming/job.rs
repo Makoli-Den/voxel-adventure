@@ -12,8 +12,8 @@ use vox_world::{
 };
 
 /// Everything a job needs to know about the terrain: the seed, the blocks the generator
-/// places, the texture layer of each block face for the mesher and the bedrock stand-in made
-/// of the stone block. Built once and shared by every
+/// places, the texture layer of each block face for the mesher and the solid chunk that stands
+/// in for everything below the terrain. Built once and shared by every
 /// worker and by the game's remeshing.
 #[derive(Debug)]
 pub struct Terrain {
@@ -21,23 +21,23 @@ pub struct Terrain {
     blocks: TerrainBlocks,
     /// The texture layer of every face of every block, read once per quad by the mesher.
     textures: FaceTextures,
-    /// The stand-in for everything below the terrain: a chunk of solid stone, so the underside
+    /// The stand-in for everything below the terrain: a chunk of solid bedrock, so the underside
     /// of the terrain, which nobody can see, produces no faces.
-    bedrock: Chunk,
+    solid_below: Chunk,
 }
 
 impl Terrain {
     /// The terrain of `seed` made of `blocks`, meshed with the layers of `textures`.
     pub fn new(seed: u32, blocks: TerrainBlocks, textures: FaceTextures) -> Self {
-        let mut bedrock = Chunk::new();
+        let mut solid_below = Chunk::new();
         for pos in LocalPos::all() {
-            bedrock.set(pos, blocks.stone);
+            solid_below.set(pos, blocks.bedrock);
         }
         Self {
             seed,
             blocks,
             textures,
-            bedrock,
+            solid_below,
         }
     }
 
@@ -48,7 +48,7 @@ impl Terrain {
 
 /// Whether the neighbour on side `face` is generated for a job: the four horizontal ones.
 /// The layer above the terrain is air, so a missing `PosY` is correct, and `NegY` is the
-/// bedrock stand-in.
+/// solid stand-in.
 fn is_horizontal(face: Face) -> bool {
     face.offset()[1] == 0
 }
@@ -84,7 +84,7 @@ fn mesh_with_neighbours(
     let neighbours = Neighbours::new(Face::ALL.map(|face| {
         loaded(face)
             .or(generated[usize::from(face.index())].as_ref())
-            .or_else(|| (face == Face::NegY).then_some(&terrain.bedrock))
+            .or_else(|| (face == Face::NegY).then_some(&terrain.solid_below))
     }));
     build_mesh_with_neighbours_into(chunk, &neighbours, &terrain.textures, scratch);
 }
@@ -100,7 +100,7 @@ fn mesh_with_neighbours(
 pub fn build_chunk(terrain: &Terrain, pos: ChunkPos, scratch: &mut ChunkMesh) -> Built {
     // HOT PATH: runs for every streamed chunk on a worker thread. The mesh is built into the
     // worker's reused `scratch` (no growth after the first jobs) and only the final exact-size
-    // copy is allocated; the bedrock is built once, not per job.
+    // copy is allocated; the solid stand-in is built once, not per job.
     let chunk = terrain.generate(pos);
     mesh_with_neighbours(terrain, &chunk, pos, None, scratch);
     let mesh = if scratch.indices.is_empty() {
@@ -156,7 +156,7 @@ mod tests {
         let neighbours = Neighbours::new(Face::ALL.map(|face| {
             world
                 .get(pos.neighbour(face))
-                .or_else(|| (face == Face::NegY).then_some(&terrain.bedrock))
+                .or_else(|| (face == Face::NegY).then_some(&terrain.solid_below))
         }));
         let mut mesh = ChunkMesh::default();
         let chunk = world.get(pos).expect("the chunk was inserted");
@@ -242,10 +242,44 @@ mod tests {
     }
 
     #[test]
-    fn the_bedrock_is_solid_all_through() {
-        let solid = LocalPos::all().all(|pos| terrain().bedrock.get(pos) == BLOCKS.stone);
+    fn the_stand_in_below_is_bedrock_all_through() {
+        let solid = LocalPos::all().all(|pos| terrain().solid_below.get(pos) == BLOCKS.bedrock);
         assert!(solid);
         assert_eq!(LocalPos::all().count(), CHUNK_VOLUME);
+    }
+
+    #[test]
+    fn the_filler_block_does_not_change_the_mesh() {
+        // The mesher only asks whether the neighbour is solid, so a stone filler gives the same
+        // mesh as the bedrock one. Compared with a hand-built stone chunk below.
+        let terrain = terrain();
+        let mut stone = Chunk::new();
+        for pos in LocalPos::all() {
+            stone.set(pos, BLOCKS.stone);
+        }
+        let pos = ChunkPos::ORIGIN;
+        let chunk = generate_chunk(pos);
+        let sides: Vec<Chunk> = Face::ALL
+            .into_iter()
+            .filter(|face| is_horizontal(*face))
+            .map(|face| generate_chunk(pos.neighbour(face)))
+            .collect();
+        let mesh_below = |below: &Chunk| {
+            let mut sides = sides.iter();
+            let neighbours = Neighbours::new(Face::ALL.map(|face| {
+                if face == Face::NegY {
+                    Some(below)
+                } else if is_horizontal(face) {
+                    sides.next()
+                } else {
+                    None
+                }
+            }));
+            let mut mesh = ChunkMesh::default();
+            build_mesh_with_neighbours_into(&chunk, &neighbours, &terrain.textures, &mut mesh);
+            mesh
+        };
+        assert_eq!(mesh_below(&stone), mesh_below(&terrain.solid_below));
     }
 
     #[test]

@@ -171,6 +171,11 @@ Caves and cave culling; uniform or palette chunk storage; the two-stage generati
 - **Stats.** `draw_calls` counts the ranged draws, `triangles` only the drawn ranges, so the HUD's "Drawn" line shows the saving.
 - **Measured** (`docs/benchmarks.md`, "Per-direction culling"): the screenshots at the start view are pixel-identical to `main` at radius 8, 12 and 16 outside the HUD panel; drawn triangles drop by 27 to 29 percent (radius 8: 71 k to 52 k; 16: 262 k to 186 k); FPS rises by 2 to 25 percent (radius 16 standing about 1675 to 2090), GPU time at radius 16 by about a third, and the per-frame `work` falls. `work` includes waiting for the GPU, so the culling's CPU cost was timed apart (ignored test `per_chunk_cpu_cost`): about 2.1 ns more per mesh (8.2 instead of 6.1 ns), 0.4 us per frame for about 200 meshes, 0.2 percent of `work` at radius 8. The driver's cost of the extra draw calls (about 40 percent more draws) is not isolated: that part of the CPU criterion is bounded only by the falling `work` here and is deferred to S9.
 
+## S3b must (found in the S3a review)
+- Exclude `base:bedrock` from the placeable list (`placeable_blocks` in `vox-game/src/content.rs`; the wheel currently offers every block but air) and fix the README line about the base blocks.
+- Filter chunk creation before an edit with `contains_chunk_layer`: `set_block` refuses out-of-bounds writes, but creating chunks outside the world first would store them for nothing.
+- Make bedrock unbreakable (engine rule at `y == WORLD_FLOOR_Y`), as in (a).
+
 ## Answers to the open questions
 - The world bounds are -512 and 512 (named parameters, easy to change).
 - The floor is a visible `base:bedrock` block (data plus a texture) that the engine refuses to break.
