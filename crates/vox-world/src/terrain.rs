@@ -91,6 +91,22 @@ const fn weight_sum() -> f32 {
 /// [`DIRT_DEPTH`] as a world height difference.
 const DIRT_DEPTH_I32: i32 = DIRT_DEPTH as i32;
 
+/// The block `depth` blocks below the surface of a column (`depth == 0` is the grass block,
+/// a negative depth is above it: air). This is the layer rule of [`fill_column`] for one
+/// block, for callers that classify single blocks (level-of-detail cells); a test checks
+/// that both agree.
+pub(crate) const fn block_at_depth(depth: i32, blocks: &TerrainBlocks) -> BlockId {
+    if depth < 0 {
+        BlockId::AIR
+    } else if depth == 0 {
+        blocks.grass
+    } else if depth <= DIRT_DEPTH_I32 {
+        blocks.dirt
+    } else {
+        blocks.stone
+    }
+}
+
 /// Generates the chunk at the origin: rolling hills. The same `seed` always gives the same
 /// chunk. It is [`generate_chunk`] at [`ChunkPos::ORIGIN`].
 ///
@@ -245,7 +261,7 @@ fn span_of(lowest: i32, highest: i32) -> RangeInclusive<i32> {
 
 /// World height of the grass block in the world column `(x, z)`, always in
 /// `MIN_SURFACE..=MAX_SURFACE`.
-fn surface_height(seed: u32, x: i32, z: i32) -> i32 {
+pub(crate) fn surface_height(seed: u32, x: i32, z: i32) -> i32 {
     let span = (MAX_SURFACE - MIN_SURFACE) as f32;
     // Adding 0.5 and truncating rounds to nearest for non-negative values.
     let offset = (octave_sum(seed, x, z) * span + 0.5) as i32;
@@ -421,6 +437,24 @@ mod tests {
 
     fn same_blocks(a: &Chunk, b: &Chunk) -> bool {
         LocalPos::all().all(|pos| a.get(pos) == b.get(pos))
+    }
+
+    #[test]
+    fn block_at_depth_agrees_with_fill_column() {
+        for height in [-70, -3, 0, 5, 9, 31, 32, 40] {
+            for base_y in [-64, -32, 0, 32] {
+                let mut chunk = Chunk::new();
+                fill_column(&mut chunk, 0, 0, base_y, height, &TEST_BLOCKS);
+                for y in 0..CHUNK_SIZE {
+                    let world_y = base_y + y as i32;
+                    assert_eq!(
+                        block_at(&chunk, 0, y, 0),
+                        block_at_depth(height - world_y, &TEST_BLOCKS),
+                        "height {height}, y {world_y}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
