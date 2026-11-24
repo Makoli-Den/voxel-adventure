@@ -176,6 +176,13 @@ Caves and cave culling; uniform or palette chunk storage; the two-stage generati
 - Filter chunk creation before an edit with `contains_chunk_layer`: `set_block` refuses out-of-bounds writes, but creating chunks outside the world first would store them for nothing.
 - Make bedrock unbreakable (engine rule at `y == WORLD_FLOOR_Y`), as in (a).
 
+## S4 as built
+- **`vox-world/src/lod.rs`:** `TilePos { level, pos }` (`chunk`, `origin`, `extent`), `cell_size`, `MAX_LOD_LEVEL` = 4, `generate_lod_chunk`, and for meshing a tile alone `solid_chunk`, `build_tile_mesh_into` (solid stand-in below, no horizontal neighbours) and `skirt_quads`. A level above `MAX_LOD_LEVEL` counts as the maximum (no panic).
+- **Rules:** the column samples its height at the cell's centre block (`cell / 2` blocks in from the corner); the surface row is `floor((h + cell / 2) / cell)` (nearest, ties up, floor-based for negative `h`); the top cell is grass, a cell below takes the layer rule (`terrain::block_at_depth`, tested against `fill_column`) at its highest block capped one below the surface, so the cell under the grass is dirt in most columns at every level (stone where it lies more than three blocks below) and deeper cells are stone; the cell row holding `WORLD_FLOOR_Y` and the rows below are bedrock; any tile layer works (above the surface air, below the floor bedrock). Level 0 equals `generate_chunk` (tested over seeds, layers, negative and far chunks).
+- **Measured** (`docs/benchmarks.md`): a tile costs 33 to 45 us to generate (one chunk 37 us in the same run); level 2 meshes in 122 us. Skirt share of quads at levels 1 to 3: under 26 percent over 5 seeds and the 3 x 3 tiles around the origin, under the 40 percent limit, so the skirts stay neighbour-blind. Level 4 (23 to 45 quads, nearly all walls) is judged by its absolute cost, not by the share.
+- **`TilePos` fields are private** (`level()`, `pos()`): `new` clamps the level, so equal tiles are equal keys.
+- **For S5 to S7: layers outside the column span must not be meshed.** A tile meshed alone has a top and four walls, so a layer that lies fully inside the solid part would mesh a hidden top and four walls for nothing, and a solid layer above the surface layer (all stone, below the span) would do the same. The worker meshes only the layers of the span (selection in S6 and jobs in S7), as (a) says for chunks.
+
 ## Answers to the open questions
 - The world bounds are -512 and 512 (named parameters, easy to change).
 - The floor is a visible `base:bedrock` block (data plus a texture) that the engine refuses to break.

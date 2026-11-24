@@ -10,10 +10,12 @@ use std::hint::black_box;
 use std::mem::size_of;
 
 use criterion::{Criterion, Throughput};
+use vox_world::solid_chunk as solid_stand_in;
 use vox_world::{
     BlockId, CHUNK_SIZE, CHUNK_VOLUME, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, FaceTextures,
     LocalPos, TextureLayer,
 };
+use vox_world::{MAX_LOD_LEVEL, TilePos, build_tile_mesh_into, generate_lod_chunk, skirt_quads};
 use vox_world::{Neighbours, build_mesh, build_mesh_into, build_mesh_with_neighbours_into};
 use vox_world::{TerrainBlocks, column_span, generate_chunk, generate_terrain};
 
@@ -170,6 +172,47 @@ fn bench_mesh_reused(c: &mut Criterion) {
     group.finish();
 }
 
+/// The level of the benchmarked tile mesh: cells of 4 blocks, a tile of 128 blocks, the middle
+/// of the range a quadtree uses.
+const LOD_MESH_LEVEL: u8 = 2;
+
+/// The levels whose generation is timed: fine, middle and coarsest (`MAX_LOD_LEVEL`).
+const LOD_GENERATE_LEVELS: [u8; 3] = [1, LOD_MESH_LEVEL, MAX_LOD_LEVEL];
+
+/// Converts a share (0 to 1) to percent for printing.
+const PERCENT: f64 = 100.0;
+
+/// The tile position of the LOD cases: the origin tile of its level, where the terrain lies.
+fn lod_tile(level: u8) -> TilePos {
+    TilePos::new(level, ChunkPos::ORIGIN)
+}
+
+/// Times a LOD tile meshed alone (skirts on every side, solid bedrock below), on one reused
+/// mesh like `mesh_reused`. Prints the quads and the skirt share once.
+fn bench_lod_mesh(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mesh_reused");
+    group.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
+    let tile = generate_lod_chunk(SEED, lod_tile(LOD_MESH_LEVEL), &TERRAIN);
+    let below = solid_stand_in(TERRAIN.bedrock);
+    let textures = textures();
+    let mut mesh = ChunkMesh::default();
+    build_tile_mesh_into(&tile, &below, &textures, &mut mesh);
+    let skirts = skirt_quads(&mesh);
+    println!(
+        "lod_tile_level_{LOD_MESH_LEVEL}: {} quads, {} skirt quads ({:.1} percent)",
+        mesh.quad_count(),
+        skirts,
+        PERCENT * skirts as f64 / mesh.quad_count() as f64
+    );
+    group.bench_function(format!("lod_tile_level_{LOD_MESH_LEVEL}"), |b| {
+        b.iter(|| {
+            build_tile_mesh_into(black_box(&tile), &below, &textures, &mut mesh);
+            black_box(&mesh);
+        })
+    });
+    group.finish();
+}
+
 /// Times `build_mesh_with_neighbours_into` on the origin terrain chunk with all six
 /// neighbours present, on one reused mesh. Compare with `mesh_reused/terrain_seed_1`: the
 /// difference is the cost of looking into the neighbouring chunks.
@@ -218,6 +261,12 @@ fn bench_terrain(c: &mut Criterion) {
             )
         })
     });
+    // LOD tiles: 1,024 samples and one cell fill each, about the cost of one chunk.
+    for level in LOD_GENERATE_LEVELS {
+        group.bench_function(format!("generate_lod_level_{level}"), |b| {
+            b.iter(|| generate_lod_chunk(black_box(SEED), lod_tile(level), &TERRAIN))
+        });
+    }
     // The column span: 34 x 34 height samples, the worker's extra cost per column (decision 0015).
     group.bench_function("column_span", |b| {
         b.iter(|| column_span(black_box(SEED), black_box(3), black_box(-2)))
@@ -228,12 +277,15 @@ fn bench_terrain(c: &mut Criterion) {
 // `criterion_group!` generates a public function without a doc comment.
 #[allow(missing_docs)]
 mod groups {
-    use super::{bench_mesh, bench_mesh_neighbours, bench_mesh_reused, bench_terrain};
+    use super::{
+        bench_lod_mesh, bench_mesh, bench_mesh_neighbours, bench_mesh_reused, bench_terrain,
+    };
     use criterion::criterion_group;
     criterion_group!(
         benches,
         bench_mesh,
         bench_mesh_reused,
+        bench_lod_mesh,
         bench_mesh_neighbours,
         bench_terrain
     );
