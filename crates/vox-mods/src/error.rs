@@ -7,10 +7,12 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use vox_resources::IdProblem;
 
 use crate::manifest::{ApiVersion, ModId};
+use crate::text::printable;
 
 /// Why one manifest is not valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,3 +328,129 @@ impl fmt::Display for ResolveError {
 }
 
 impl Error for ResolveError {}
+
+/// Longest message of a [`ModFailure`] that comes from a script (a Lua error with its
+/// traceback), in bytes. A traceback of the deepest useful stack fits; a script cannot flood
+/// the console through its error. Provisional.
+pub const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
+
+/// Why a mod's script was disabled. The mod's data (blocks, textures) stays loaded; only its
+/// code stops (decision 0014, section b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModFailure {
+    /// The entry script is not where the manifest says, or reading it failed.
+    EntryIo {
+        /// The script file.
+        path: PathBuf,
+        /// The underlying failure.
+        message: String,
+    },
+    /// The entry script, or a folder on its way from the mod folder, is a symbolic link or a
+    /// junction. Links are not followed, so a mod cannot run code from outside its folder.
+    EntryLink {
+        /// The link.
+        path: PathBuf,
+    },
+    /// The entry script is not a regular file.
+    EntryNotAFile {
+        /// The path.
+        path: PathBuf,
+    },
+    /// The entry script is larger than the limit; it was not read whole.
+    EntryTooLarge {
+        /// The script file.
+        path: PathBuf,
+        /// The limit in bytes.
+        limit: usize,
+    },
+    /// The entry would lie outside the mod's own pack. The manifest already refuses this, so it
+    /// means an internal bug; it is checked again because it guards code loading.
+    EntryOutsideMod {
+        /// The entry as written.
+        entry: String,
+    },
+    /// Creating the Lua state failed.
+    Setup(String),
+    /// The script does not compile, or is precompiled bytecode (only text is accepted).
+    Syntax(String),
+    /// A Lua error: raised by the script or by a host function it called. Holds the message
+    /// with the Lua traceback.
+    Runtime(String),
+    /// The script ran more instructions than one call may (library functions charge for
+    /// their work in C too).
+    InstructionBudget {
+        /// The budget of the call, in Lua instructions.
+        limit: u64,
+    },
+    /// The call took longer than it may.
+    TimeBudget {
+        /// The wall-clock limit of the call.
+        limit: Duration,
+    },
+    /// The script tried to use more memory than a mod may.
+    Memory,
+}
+
+impl ModFailure {
+    /// Sorts an error returned by `mlua` into a failure. Errors that went through a host
+    /// function arrive wrapped in callbacks, so the cause is looked at, not the wrapper.
+    /// Messages come from the script, so they are made [printable](crate::text::printable):
+    /// one line of at most [`MAX_FAILURE_MESSAGE_BYTES`].
+    pub(crate) fn from_lua(error: &mlua::Error) -> Self {
+        if crate::budget::is_memory_error(error) {
+            return Self::Memory;
+        }
+        let mut cause = error;
+        while let mlua::Error::CallbackError { cause: inner, .. } = cause {
+            cause = inner;
+        }
+        let clean = |text: &str| printable(text, MAX_FAILURE_MESSAGE_BYTES);
+        match cause {
+            mlua::Error::SyntaxError { message, .. } => Self::Syntax(clean(message)),
+            _ => Self::Runtime(clean(&error.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for ModFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EntryIo { path, message } => {
+                write!(f, "cannot read script {}: {message}", path.display())
+            }
+            Self::EntryLink { path } => write!(
+                f,
+                "{} is a symbolic link or junction; links are not followed",
+                path.display()
+            ),
+            Self::EntryNotAFile { path } => {
+                write!(f, "script {} is not a regular file", path.display())
+            }
+            Self::EntryTooLarge { path, limit } => write!(
+                f,
+                "script {} is larger than the limit of {limit} bytes",
+                path.display()
+            ),
+            Self::EntryOutsideMod { entry } => {
+                write!(f, "entry `{entry}` is outside the mod's own pack")
+            }
+            Self::Setup(message) => write!(f, "cannot create the Lua state: {message}"),
+            Self::Syntax(message) => write!(f, "syntax error: {message}"),
+            Self::Runtime(message) => write!(f, "{message}"),
+            Self::InstructionBudget { limit } => write!(
+                f,
+                "ran more than {limit} Lua instructions in one call (an endless loop?)"
+            ),
+            Self::TimeBudget { limit } => {
+                write!(f, "took longer than {} ms in one call", limit.as_millis())
+            }
+            Self::Memory => write!(
+                f,
+                "used more than the {} bytes of memory a mod may use",
+                crate::sandbox::MAX_MOD_MEMORY
+            ),
+        }
+    }
+}
+
+impl Error for ModFailure {}

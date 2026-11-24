@@ -410,3 +410,86 @@ is 8 or more out of 255 (Pillow `ImageChops.difference`, then `convert("L")`).
 `LINEAR` within a level softens textures visibly at middle distance; the mip mode changes
 little in a still frame. NL is kept because it hides the line where one level hands over to
 the next while the camera moves (not measured, the frames are stills).
+
+## Lua sandbox: build cost and state size (2026-11-24, step S4 of decision 0014)
+
+`vox-mods` now depends on `mlua` 0.11.6 with Lua 5.4.8 compiled from source (`vendored`). The
+game does not link `vox-mods` yet (`cargo tree -p vox-game -i vox-mods` finds nothing), so
+the game's executable and its build are unchanged by this step. To see what the game will pay
+in step S5, a tiny probe binary outside the workspace was built with the workspace's release
+profile (`lto = "thin"`, `codegen-units = 1`) and the same `Cargo.lock`:
+
+- **before:** `vox-mods` at `main` (S1), `main` calls `discover` on a folder;
+- **after:** `vox-mods` of this step, `main` calls `discover`, then `ModHost::start`, and
+  prints the statuses, the memory of each state and the messages.
+
+Each build starts from an empty target folder with the crates already downloaded
+(`cargo build --release --offline`); before and after alternated, three runs each.
+
+| | Clean release build (3 runs) | Executable |
+|---|---|---|
+| before | 6.53, 6.45, 6.41 s | 333,824 bytes |
+| after | 10.49, 10.39, 10.33 s | 743,936 bytes |
+
+So Lua and `mlua` add about 3.9 s to a clean release build of a small binary and about
+410 KB to the executable. After the security review the sandbox wraps most library functions
+(and adds `memchr` for the plain `find`); one more clean build of the same probe took 11.07 s
+(one run) and the executable grew to 813,056 bytes, so about 480 KB over the S1 probe. A clean build of the whole game takes far longer, so the share
+will be smaller there; it is measured in S5, when the game links the crate. No CMake and no Lua
+installation is needed: `cc` finds the MSVC C compiler that the Rust MSVC toolchain
+requires, here without a developer command prompt (`cl` is not on the `PATH` of the shell
+that built it). Not checked on a freshly installed machine.
+
+**Memory of a state**, as counted by `mlua`'s allocator (`ModHost::used_memory`, the number
+the `MAX_MOD_MEMORY` cap applies to), right after the entry script ran, no collection forced:
+
+| Mod | Lua heap |
+|---|---|
+| empty entry script | 17,892 bytes (20,496 with the wrapped library of the first review) |
+| the `hello` fixture (one `print`, one handler) | 19,073 bytes (21,741 with the wrapped library of the first review) |
+
+This is the Lua heap only. The Rust side of each state (`mlua`'s bookkeeping, the hook and
+log closures) is not counted; it is a few small allocations, not measured. Fifty mods would
+need about 1 MB of Lua heap.
+
+New crates in `Cargo.lock`: `mlua`, `mlua-sys`, `lua-src`, `luajit-src`, `which`, `bstr`,
+`parking_lot`, `parking_lot_core`, `lock_api`, `scopeguard`, `rustc-hash`, `redox_syscall`.
+`luajit-src` and `which` are build dependencies of `mlua-sys`'s `vendored` feature and are
+compiled, but no LuaJIT is built; `redox_syscall` is only used on Redox and is not compiled
+on Windows.
+
+### Wall-clock overrun of single long-string instructions (2026-11-24, same machine)
+
+The count hook checks the clock every `HOOK_INTERVAL` (1,000) instructions, so one call can run
+past `MAX_CALL_WALL_TIME` (50 ms) by the time of that many instructions. That matters only for
+single VM instructions whose cost grows with string length, which the count does not weigh.
+Measured as one handler call after the strings were built at startup.
+
+First measurement, with the 16 MiB cap of the first S4 draft, three runs each, debug and
+release alike:
+
+| Loop | Stopped by | Time of the call |
+|---|---|---|
+| `while true do end` | instructions | 0.6 to 1.1 ms |
+| `local t = s .. s`, `s` of 2 MB | clock | 104 to 110 ms |
+| `local t = s .. s`, `s` of 4 MB | clock | 206 to 209 ms |
+
+The second review found a much worse instruction: `<` on two long strings full of `\0` bytes,
+which Lua compares piece by piece with `strcoll`. The cap was lowered to 4 MiB, which keeps
+every string under about 2 MB (building a string copies it). With the 4 MiB cap, three runs
+each:
+
+| Loop | Stopped by | Release | Debug |
+|---|---|---|---|
+| `while true do end` | instructions | 0.7 to 0.8 ms | 1.0 to 1.2 ms |
+| `local t = s .. s`, `s` of 1 MB | clock | 67 to 69 ms | 66 to 72 ms |
+| one `Z < Z`, `Z` = 0.95 M times `'a\0'` | (no loop) | 3.5 to 3.9 ms | 6.6 to 7.1 ms |
+| one `Z < Z`, `Z` = 1.9 M times `'\0'` | (no loop) | 6.5 to 6.7 ms | 11.5 to 12.8 ms |
+| `while true do local _ = Z < Z end`, `'a\0'` | clock | 0.69 to 0.70 s | 1.31 to 1.33 s |
+| `while true do local _ = Z < Z end`, `'\0'` | clock | **1.25 to 1.27 s** | 2.35 to 2.39 s |
+
+So the worst measured stall is about 1.3 s in a release build on this machine, about 25 times
+the limit, before the mod is disabled; an old CPU takes longer. It is a one-time stall (the mod
+is then off). The overrun is about `HOOK_INTERVAL` / (instructions per loop iteration) such
+instructions, so a lower `HOOK_INTERVAL` or a lower cap shrinks it in proportion. Documented
+as a residual risk for S7, which decides on the low-end device.

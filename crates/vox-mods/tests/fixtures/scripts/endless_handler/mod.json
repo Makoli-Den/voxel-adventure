@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "id": "endless_handler",
+  "version": "0.1.0",
+  "api": "1.0",
+  "entry": "endless_handler:scripts/main.lua"
+}

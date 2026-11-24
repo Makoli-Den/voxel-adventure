@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "id": "pcall_loop",
+  "version": "0.1.0",
+  "api": "1.0",
+  "entry": "pcall_loop:scripts/main.lua"
+}
