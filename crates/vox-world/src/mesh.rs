@@ -17,6 +17,7 @@ use crate::chunk::{
 };
 use crate::registry::{FaceTextures, TextureLayer};
 use crate::world::Neighbours;
+use std::ops::Range;
 
 /// Corners of one quad: every face of a block is a square.
 pub const VERTICES_PER_QUAD: usize = 4;
@@ -126,18 +127,63 @@ pub struct ChunkVertex {
 ///
 /// The vectors are public plain data; every quad is [`VERTICES_PER_QUAD`] vertices and
 /// [`INDICES_PER_QUAD`] indices.
+///
+/// The greedy mesher emits the quads grouped by direction in [`Face::ALL`] order: the
+/// vertices and the indices of all quads of the first face come first, then those of the
+/// second, and so on. The quads of one direction are therefore one contiguous range of the
+/// index buffer ([`ChunkMesh::face_index_range`]), so a renderer can skip the directions
+/// that point away from the camera with one ranged draw each. The vertices are grouped
+/// the same way, not only the indices, because the mesher already walks the faces in this
+/// order: grouping costs nothing, and the indices keep pointing into the whole vertex
+/// buffer, so a ranged draw needs no base vertex. The reference mesher of the tests
+/// emits in block order and does not group.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChunkMesh {
     /// Quad corners, four per quad (merged rectangle of faces).
     pub vertices: Vec<ChunkVertex>,
     /// Triangle list, six indices per quad.
     pub indices: Vec<u32>,
+    /// Quads per direction, in [`Face::ALL`] order. The entries sum to
+    /// [`ChunkMesh::quad_count`]. Filled by the mesher; a mesh built by hand must fill
+    /// it consistently with `indices`, or [`ChunkMesh::face_index_range`] is wrong.
+    pub face_quads: [u32; Face::COUNT],
 }
 
 impl ChunkMesh {
     /// Number of quads (merged rectangles of visible faces) in the mesh.
     pub fn quad_count(&self) -> usize {
         self.indices.len() / INDICES_PER_QUAD
+    }
+
+    /// The part of [`ChunkMesh::indices`] that holds the quads looking along `face`.
+    ///
+    /// The ranges of the six faces follow each other in [`Face::ALL`] order, do not
+    /// overlap and together cover all indices. A face without quads gives an empty range.
+    /// Only meshes from the greedy mesher are grouped this way.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vox_world::{BlockId, Chunk, Face, FaceTextures, LocalPos, build_mesh};
+    ///
+    /// let mut chunk = Chunk::new();
+    /// if let Some(pos) = LocalPos::new(1, 1, 1) {
+    ///     chunk.set(pos, BlockId(1));
+    /// }
+    /// let mesh = build_mesh(&chunk, &FaceTextures::default());
+    /// assert_eq!(mesh.face_index_range(Face::PosX), 0..6);
+    /// assert_eq!(mesh.face_index_range(Face::NegX), 6..12);
+    /// ```
+    pub fn face_index_range(&self, face: Face) -> Range<u32> {
+        debug_assert_eq!(
+            self.face_quads.iter().sum::<u32>() as usize,
+            self.quad_count(),
+            "face_quads must be filled to match the indices"
+        );
+        let face_index = usize::from(face.index());
+        let quads_before: u32 = self.face_quads[..face_index].iter().sum();
+        let start = quads_before * INDICES_PER_QUAD as u32;
+        start..start + self.face_quads[face_index] * INDICES_PER_QUAD as u32
     }
 }
 
@@ -232,15 +278,19 @@ pub fn build_mesh_with_neighbours_into(
     // chunk (almost all of them) takes the cheap in-chunk test; only a border face goes
     // through `neighbours`. One cheap pass first records which slices hold any solid block:
     // an empty (sky) chunk, the most common kind, ends there, and a sparse chunk skips the
-    // slices without blocks, because a face needs a solid block in its own slice.
+    // slices without blocks, because a face needs a solid block in its own slice. The
+    // outer loop is over the faces, which is what groups the quads by direction in the
+    // output (see `ChunkMesh`); the size of the index buffer before and after a face gives its quad count.
     mesh.vertices.clear();
     mesh.indices.clear();
+    mesh.face_quads = [0; Face::COUNT];
     let solid = solid_slices(chunk);
     if solid.iter().all(|&bits| bits == 0) {
         return;
     }
     let mut mask = [BlockId::AIR; MASK_CELLS];
     for face in Face::ALL {
+        let indices_before = mesh.indices.len();
         let solid_along_normal = solid[face.axes()[0]];
         for slice in 0..CHUNK_SIZE {
             if solid_along_normal & (1 << slice) == 0 {
@@ -250,6 +300,9 @@ pub fn build_mesh_with_neighbours_into(
                 emit_rectangles(mesh, &mut mask, textures, face, slice);
             }
         }
+        // The cast cannot truncate: a face has at most `CHUNK_VOLUME` quads.
+        mesh.face_quads[usize::from(face.index())] =
+            ((mesh.indices.len() - indices_before) / INDICES_PER_QUAD) as u32;
     }
 }
 
@@ -457,6 +510,17 @@ pub(crate) fn identity_textures() -> FaceTextures {
     )
 }
 
+/// Quads per face counted from the vertex `face` fields, four vertices per quad: the oracle
+/// for `face_quads`, independent of how the mesher fills it.
+#[cfg(test)]
+pub(crate) fn count_quads_by_face(mesh: &ChunkMesh) -> [u32; Face::COUNT] {
+    let mut counts = [0; Face::COUNT];
+    for quad in mesh.vertices.chunks(VERTICES_PER_QUAD) {
+        counts[usize::from(quad[0].face)] += 1;
+    }
+    counts
+}
+
 /// The simple mesher the greedy one replaced: one unit quad per visible face, with the
 /// same visibility rule. It stays as the reference the greedy mesher is checked against.
 #[cfg(test)]
@@ -478,6 +542,7 @@ pub(crate) fn naive_mesh(
             }
         }
     }
+    mesh.face_quads = count_quads_by_face(&mesh);
     mesh
 }
 
@@ -1251,6 +1316,14 @@ mod tests {
         }
     }
 
+    #[test]
+    fn face_all_order_is_the_index_order() {
+        // `face_quads` and `face_index_range` rely on `Face::ALL[i].index() == i`.
+        for (i, face) in Face::ALL.into_iter().enumerate() {
+            assert_eq!(usize::from(face.index()), i);
+        }
+    }
+
     /// A table where block 1 has a different layer on its top, its sides and its bottom,
     /// like grass, and block 2 has one layer everywhere.
     fn grass_textures() -> (FaceTextures, [TextureLayer; 3]) {
@@ -1354,6 +1427,100 @@ mod tests {
                 .iter()
                 .all(|v| v.texture == TextureLayer::MISSING)
         );
+    }
+
+    /// Meshes the tests check for face groups: plain shapes, noise and terrain, alone and
+    /// with all neighbours present.
+    fn grouped_meshes() -> Vec<ChunkMesh> {
+        let world = terrain_world();
+        let mut meshes: Vec<ChunkMesh> = random_chunks().iter().map(build_mesh).collect();
+        meshes.push(build_mesh(&solid_chunk()));
+        meshes.push(build_mesh(&checkerboard_chunk()));
+        meshes.push(build_mesh(&terrain_chunk(1)));
+        for (chunk_pos, chunk) in world.iter() {
+            meshes.push(mesh_with(chunk, &world.neighbours(chunk_pos)));
+        }
+        meshes
+    }
+
+    #[test]
+    fn face_quads_sum_to_the_quad_count() {
+        for mesh in grouped_meshes() {
+            let sum: u32 = mesh.face_quads.iter().sum();
+            assert_eq!(sum as usize, mesh.quad_count());
+        }
+    }
+
+    #[test]
+    fn face_index_ranges_are_contiguous_and_cover_all_indices_in_face_order() {
+        for mesh in grouped_meshes() {
+            let mut next = 0;
+            for face in Face::ALL {
+                let range = mesh.face_index_range(face);
+                assert_eq!(range.start, next, "{face:?} starts where the last ended");
+                assert_eq!(
+                    (range.end - range.start) as usize,
+                    mesh.face_quads[usize::from(face.index())] as usize * INDICES_PER_QUAD
+                );
+                next = range.end;
+            }
+            assert_eq!(next as usize, mesh.indices.len());
+        }
+    }
+
+    #[test]
+    fn every_quad_in_a_face_range_looks_that_way() {
+        let mut nonempty_ranges = [false; Face::COUNT];
+        for mesh in grouped_meshes() {
+            for face in Face::ALL {
+                let range = mesh.face_index_range(face);
+                let range = range.start as usize..range.end as usize;
+                nonempty_ranges[usize::from(face.index())] |= !range.is_empty();
+                for &index in &mesh.indices[range] {
+                    assert_eq!(mesh.vertices[index as usize].face, face.index());
+                }
+            }
+        }
+        assert!(nonempty_ranges.iter().all(|&filled| filled));
+    }
+
+    #[test]
+    fn vertices_are_grouped_by_face_too() {
+        for mesh in grouped_meshes() {
+            let faces: Vec<u8> = mesh.vertices.iter().map(|v| v.face).collect();
+            assert!(faces.is_sorted(), "vertices follow Face::ALL order");
+        }
+    }
+
+    #[test]
+    fn single_block_has_one_quad_per_face_in_its_own_range() {
+        let mesh = build_mesh(&single_block_chunk(10, 10, 10));
+        assert_eq!(mesh.face_quads, [1; Face::COUNT]);
+        for (i, face) in Face::ALL.into_iter().enumerate() {
+            let start = (i * INDICES_PER_QUAD) as u32;
+            assert_eq!(mesh.face_index_range(face), start..start + 6);
+        }
+        assert_eq!(ChunkMesh::default().face_index_range(Face::NegZ), 0..0);
+    }
+
+    #[test]
+    fn reused_scratch_resets_face_quads() {
+        let mut mesh = build_mesh(&terrain_chunk(1));
+        assert_ne!(mesh.face_quads, [0; Face::COUNT]);
+        build_mesh_into(&single_block_chunk(3, 3, 3), &mut mesh);
+        assert_eq!(mesh.face_quads, [1; Face::COUNT]);
+        build_mesh_into(&Chunk::new(), &mut mesh);
+        assert_eq!(mesh.face_quads, [0; Face::COUNT]);
+        assert_eq!(mesh.face_index_range(Face::PosY), 0..0);
+    }
+
+    #[test]
+    fn face_quads_match_the_faces_of_the_vertices() {
+        for mesh in grouped_meshes() {
+            assert_eq!(mesh.face_quads, count_quads_by_face(&mesh));
+        }
+        let naive = naive_mesh(&terrain_chunk(1), &Neighbours::none());
+        assert_eq!(naive.face_quads, count_quads_by_face(&naive));
     }
 
     #[test]
