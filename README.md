@@ -48,7 +48,9 @@ Fly over the generated terrain:
 | Space / Shift | go up / go down |
 | Right mouse button + mouse | look around |
 | Left mouse button | break the block under the crosshair (within a few blocks) |
-| F | place a stone block on the face under the crosshair |
+| F | place the selected block on the face under the crosshair (stone at the start) |
+| 1 to 9 (also on the numpad) | select the 1st to 9th placeable block (every block except air, in the order of `blocks.json`; with fewer blocks the extra keys do nothing; ignored while Ctrl, Alt, Shift or Super is held) |
+| Mouse wheel | cycle through all placeable blocks, wrapping around (the only way to reach blocks past the ninth) |
 | G | switch between flying and walking (walking has gravity and collision; Space jumps, Shift does nothing) |
 | L | turn the frame limit on or off |
 | F3 | show or hide the metrics panel |
@@ -59,7 +61,7 @@ Edits are not saved: a chunk that streams out of range and back in is generated 
 Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--pack DIR` layers a resource pack laid out like `assets/` over the built-in one (repeatable, a later pack wins; for example `DIR/base/textures/block/stone.png` replaces the stone texture and `DIR/core/shaders/chunk.frag` the terrain fragment shader; a texture that is missing or cannot be used shows a magenta and black checker and prints a warning), `--help` lists the options.
 
 ## Frame metrics
-A translucent panel in the top-left corner of the window shows live figures over the last ten seconds, refreshed twice a second: average FPS, the 1% and 0.1% lows (the average FPS of the slowest 1% and 0.1% of the frames, so they show stutter), the frame time, the time the game spent producing a frame, the GPU time (an upper bound, measured with timestamp queries) and how many chunks and triangles are drawn. F3 hides it. A summary of the whole run is printed when the game exits. The definitions are in `crates/vox-game/src/metrics.rs` and decision 0008.
+A translucent panel in the top-left corner of the window shows live figures over the last ten seconds, refreshed twice a second: average FPS, the 1% and 0.1% lows (the average FPS of the slowest 1% and 0.1% of the frames, so they show stutter), the frame time, the time the game spent producing a frame, the GPU time (an upper bound, measured with timestamp queries) and how many chunks and triangles are drawn, plus a `Place` line with the selected block. F3 hides it, and with it the selected block: there is no other display of it yet. A summary of the whole run is printed when the game exits. The definitions are in `crates/vox-game/src/metrics.rs` and decision 0008.
 
 The frame limit (about twice the monitor's refresh rate, at most 240 per second) is off by default, so the figures show what the game can really do and the GPU runs flat out; press L to turn the limit on, which spares the GPU and shows how much room is left.
 

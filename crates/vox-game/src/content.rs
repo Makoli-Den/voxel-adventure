@@ -14,6 +14,8 @@ use vox_content::{BlockTextures, Warning};
 use vox_resources::PackStack;
 use vox_world::{BlockId, BlockRegistry, FaceTextures, TerrainBlocks};
 
+use crate::selection::{Placeable, Selection};
+
 /// Registry name of the grass block.
 pub const GRASS_NAME: &str = "base:grass";
 /// Registry name of the dirt block.
@@ -21,8 +23,7 @@ pub const DIRT_NAME: &str = "base:dirt";
 /// Registry name of the stone block.
 pub const STONE_NAME: &str = "base:stone";
 
-/// Name of the block the place key puts down. Temporary: the base game mod will provide an
-/// inventory with a selected block.
+/// Name of the block that is selected at startup, before the player picks another.
 pub const PLACE_BLOCK_NAME: &str = STONE_NAME;
 
 /// Why the content could not be set up.
@@ -32,6 +33,8 @@ pub enum ContentError {
     Load(vox_content::ContentError),
     /// A block the game needs is not in the registry.
     MissingBlock(&'static str),
+    /// There is no block the player could place, or the block selected at startup is not one.
+    NoPlaceableBlocks,
 }
 
 impl fmt::Display for ContentError {
@@ -42,6 +45,11 @@ impl fmt::Display for ContentError {
                 f,
                 "the block `{name}` does not exist in base:blocks.json;                  check the packs given with --pack"
             ),
+            Self::NoPlaceableBlocks => write!(
+                f,
+                "no block can be placed: base:blocks.json has no block besides air, \
+                 or lacks the block selected at startup"
+            ),
         }
     }
 }
@@ -50,7 +58,7 @@ impl Error for ContentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Load(error) => Some(error),
-            Self::MissingBlock(_) => None,
+            Self::MissingBlock(_) | Self::NoPlaceableBlocks => None,
         }
     }
 }
@@ -61,6 +69,20 @@ impl From<vox_content::ContentError> for ContentError {
     }
 }
 
+/// Every registered block except air, in id order, with its name: what the player may place.
+fn placeable_blocks(registry: &BlockRegistry) -> Vec<Placeable> {
+    // Ids are handed out in registration order, so `0..len` covers them all; `try_from` only
+    // stops at the registry's own u16 limit, which it can not exceed.
+    (0..registry.len())
+        .filter_map(|id| u16::try_from(id).ok().map(BlockId))
+        .filter(|block| !block.is_air())
+        .filter_map(|id| {
+            let name = registry.name(id)?.to_owned();
+            Some(Placeable { id, name })
+        })
+        .collect()
+}
+
 /// The registry and the blocks the game uses by name.
 #[derive(Debug)]
 pub struct Content {
@@ -68,8 +90,9 @@ pub struct Content {
     pub registry: BlockRegistry,
     /// The blocks the terrain generator places.
     pub terrain: TerrainBlocks,
-    /// The block the place key puts down.
-    pub place_block: BlockId,
+    /// The blocks the player may place (every registered block except air) and the selected
+    /// one, which the place key puts down.
+    pub selection: Selection,
     /// The pixels of every block texture, one layer per texture; layer 0 is the missing
     /// picture.
     pub textures: BlockTextures,
@@ -90,11 +113,13 @@ impl Content {
             dirt: find(DIRT_NAME)?,
             stone: find(STONE_NAME)?,
         };
-        let place_block = find(PLACE_BLOCK_NAME)?;
+        let start = find(PLACE_BLOCK_NAME)?;
+        let selection = Selection::new(placeable_blocks(&registry), start)
+            .ok_or(ContentError::NoPlaceableBlocks)?;
         Ok(Self {
             registry,
             terrain,
-            place_block,
+            selection,
             textures,
             warnings,
         })
@@ -200,10 +225,47 @@ mod tests {
     }
 
     #[test]
-    fn the_place_block_is_stone() {
+    fn stone_is_selected_at_startup() {
         let content = content();
-        assert_eq!(content.place_block, content.terrain.stone);
-        assert!(!content.place_block.is_air());
+        assert_eq!(content.selection.selected(), content.terrain.stone);
+        assert!(!content.selection.selected().is_air());
+    }
+
+    #[test]
+    fn every_block_but_air_is_placeable() {
+        let content = content();
+        let mut selection = content.selection.clone();
+        let mut seen = Vec::new();
+        for _ in 0..content.registry.len() - 1 {
+            seen.push(selection.selected());
+            selection.cycle(1);
+        }
+        assert!(!seen.contains(&BlockId::AIR));
+        seen.sort_by_key(|block| block.0);
+        seen.dedup();
+        assert_eq!(seen.len(), content.registry.len() - 1);
+        // The wheel is back where it started.
+        assert_eq!(selection.selected(), content.terrain.stone);
+    }
+
+    #[test]
+    fn the_new_base_blocks_are_placeable_by_name() {
+        let content = content();
+        let mut selection = content.selection.clone();
+        for name in ["base:sand", "base:cobblestone", "base:planks", "base:log"] {
+            let id = content.registry.id(name).unwrap();
+            let before = selection.clone();
+            // Walk the wheel until the block is selected; a block that is not placeable would
+            // never come up and the loop would end with the starting block.
+            for _ in 0..content.registry.len() {
+                if selection.selected() == id {
+                    break;
+                }
+                selection.cycle(1);
+            }
+            assert_eq!(selection.selected(), id, "{name}");
+            selection = before;
+        }
     }
 
     #[test]
@@ -213,7 +275,14 @@ mod tests {
     }
 
     #[test]
+    fn the_selected_name_is_the_registry_name() {
+        let content = content();
+        assert_eq!(content.selection.selected_name(), STONE_NAME);
+    }
+
+    #[test]
     fn errors_describe_themselves() {
+        assert!(!ContentError::NoPlaceableBlocks.to_string().is_empty());
         assert!(
             ContentError::MissingBlock("base:x")
                 .to_string()

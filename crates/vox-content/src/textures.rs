@@ -796,14 +796,17 @@ mod tests {
     fn the_base_assets_load_without_warnings() {
         let (registry, textures, warnings) = load_content(&base_stack()).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        // Missing, grass top, grass side, dirt, stone.
-        assert_eq!(textures.layer_count, 5);
+        // Missing, grass top, grass side, dirt, stone, sand, cobblestone, planks, log side,
+        // log top.
+        assert_eq!(textures.layer_count, 10);
         assert_eq!(textures.size, DEFAULT_TILE_SIZE);
+        let layers = usize::try_from(textures.layer_count).unwrap();
         assert_eq!(
             textures.pixels.len(),
-            5 * side(textures.size) * side(textures.size) * BYTES_PER_PIXEL
+            layers * side(textures.size) * side(textures.size) * BYTES_PER_PIXEL
         );
-        assert_eq!(registry.len(), 4);
+        // Air, grass, dirt, stone, sand, cobblestone, planks, log.
+        assert_eq!(registry.len(), 8);
     }
 
     #[test]

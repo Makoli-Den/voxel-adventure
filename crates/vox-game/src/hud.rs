@@ -9,7 +9,13 @@ use font8x8::legacy::BASIC_LEGACY;
 use vox_render::{OverlayRect, RenderStats};
 
 use crate::metrics::{LOW_0_1_PERCENT_LABEL, LOW_1_PERCENT_LABEL, Summary, millis};
+use crate::selection::SLOT_KEYS;
 use crate::streaming::StreamStats;
+
+/// Separates the mod from the block in a registry name (`base:stone`).
+const NAMESPACE_SEPARATOR: char = ':';
+/// The first number key that selects a block; the last one is [`SLOT_KEYS`].
+const FIRST_SLOT_KEY: usize = 1;
 
 /// Pixels along each side of a font cell.
 const GLYPH_PIXELS: usize = 8;
@@ -162,14 +168,23 @@ fn line(label: &str, value: impl std::fmt::Display) -> String {
     format!("{label:<LABEL_WIDTH$}{value}")
 }
 
+/// The short name of a block for the panel: the registry name without its `mod:` prefix, since
+/// the panel is narrow and the mod is rarely what the player wants to read.
+pub fn block_label(registry_name: &str) -> &str {
+    registry_name
+        .split_once(NAMESPACE_SEPARATOR)
+        .map_or(registry_name, |(_, name)| name)
+}
+
 /// The text of the panel: the frame figures, what is drawn, how far streaming has come, and
-/// how to use the keys.
-/// `summary` is `None` until the first frames have been measured.
+/// how to use the keys. `selected_block` is the registry name of the block the place key puts
+/// down. `summary` is `None` until the first frames have been measured.
 pub fn lines(
     summary: Option<&Summary>,
     stats: &RenderStats,
     stream: &StreamStats,
     frame_limit: bool,
+    selected_block: &str,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     match summary {
@@ -226,6 +241,13 @@ pub fn lines(
     lines.push(line("Limit", if frame_limit { "on" } else { "off" }));
     lines.push(line("Keys", "L limit, F3 panel"));
     lines.push(line("Edit", "click break, F place"));
+    lines.push(line(
+        "Place",
+        format!(
+            "{} ({FIRST_SLOT_KEY}-{SLOT_KEYS} / wheel)",
+            block_label(selected_block)
+        ),
+    ));
     lines
 }
 
@@ -234,6 +256,58 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// The block the tests show as selected.
+    const SELECTED: &str = "base:stone";
+
+    /// [`super::lines`] with the selected block of the tests, for the many tests that do not
+    /// care which block it is.
+    fn lines(
+        summary: Option<&Summary>,
+        stats: &RenderStats,
+        stream: &StreamStats,
+        frame_limit: bool,
+    ) -> Vec<String> {
+        super::lines(summary, stats, stream, frame_limit, SELECTED)
+    }
+
+    #[test]
+    fn the_place_line_names_the_selected_block_and_the_keys() {
+        let text = super::lines(
+            None,
+            &RenderStats::default(),
+            &StreamStats::default(),
+            false,
+            "base:cobblestone",
+        )
+        .join("\n");
+        assert!(
+            text.contains("Place    cobblestone (1-9 / wheel)"),
+            "{text}"
+        );
+        assert!(text.contains("Edit     click break, F place"), "{text}");
+    }
+
+    #[test]
+    fn the_place_line_changes_with_the_selection() {
+        let line = |name| {
+            super::lines(
+                None,
+                &RenderStats::default(),
+                &StreamStats::default(),
+                false,
+                name,
+            )
+        };
+        assert_ne!(line("base:sand"), line("base:planks"));
+    }
+
+    #[test]
+    fn a_block_label_drops_the_mod_prefix() {
+        assert_eq!(block_label("base:stone"), "stone");
+        assert_eq!(block_label("mymod:red_brick"), "red_brick");
+        assert_eq!(block_label("bare"), "bare");
+    }
 
     #[test]
     fn the_crosshair_is_centred_and_symmetric() {

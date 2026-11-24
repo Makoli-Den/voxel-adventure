@@ -10,6 +10,17 @@
       }
     },
     { "name": "dirt", "textures": { "all": "base:textures/block/dirt.png" } },
-    { "name": "stone", "textures": { "all": "base:textures/block/stone.png" } }
+    { "name": "stone", "textures": { "all": "base:textures/block/stone.png" } },
+    { "name": "sand", "textures": { "all": "base:textures/block/sand.png" } },
+    { "name": "cobblestone", "textures": { "all": "base:textures/block/cobblestone.png" } },
+    { "name": "planks", "textures": { "all": "base:textures/block/planks.png" } },
+    {
+      "name": "log",
+      "textures": {
+        "all": "base:textures/block/log_side.png",
+        "top": "base:textures/block/log_top.png",
+        "bottom": "base:textures/block/log_top.png"
+      }
+    }
   ]
 }
