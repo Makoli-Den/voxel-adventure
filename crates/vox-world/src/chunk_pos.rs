@@ -1,10 +1,8 @@
 //! Position of a chunk in the world, counted in chunks.
 
-use crate::chunk::{AXIS_X, AXIS_Y, AXIS_Z, CHUNK_SIZE, LocalPos};
+use crate::bounds::{CHUNK_SIZE_I32, chunk_layer_of};
+use crate::chunk::{AXIS_X, AXIS_Y, AXIS_Z, LocalPos};
 use crate::mesh::Face;
-
-/// `CHUNK_SIZE` as the integer type of world coordinates (the size is 32, so it always fits).
-const CHUNK_SIZE_I32: i32 = CHUNK_SIZE as i32;
 
 /// Where a chunk sits in the world, in chunk units: chunk `(1, 0, 0)` lies right next to
 /// chunk `(0, 0, 0)` on the +X side. The world is cubic chunks in all three directions,
@@ -39,7 +37,7 @@ impl ChunkPos {
     pub const fn containing(block: [i32; 3]) -> (Self, LocalPos) {
         let chunk = Self::new(
             block[AXIS_X].div_euclid(CHUNK_SIZE_I32),
-            block[AXIS_Y].div_euclid(CHUNK_SIZE_I32),
+            chunk_layer_of(block[AXIS_Y]),
             block[AXIS_Z].div_euclid(CHUNK_SIZE_I32),
         );
         (chunk, LocalPos::from_block_coords(block))

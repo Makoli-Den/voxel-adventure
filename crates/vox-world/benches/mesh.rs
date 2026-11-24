@@ -15,7 +15,7 @@ use vox_world::{
     LocalPos, TextureLayer,
 };
 use vox_world::{Neighbours, build_mesh, build_mesh_into, build_mesh_with_neighbours_into};
-use vox_world::{TerrainBlocks, generate_chunk, generate_terrain};
+use vox_world::{TerrainBlocks, column_span, generate_chunk, generate_terrain};
 
 /// The terrain blocks of the benchmarks. Plain ids: the generator only writes numbers, so no
 /// registry is needed to time it.
@@ -23,12 +23,14 @@ const TERRAIN: TerrainBlocks = TerrainBlocks {
     grass: BlockId(1),
     dirt: BlockId(2),
     stone: BlockId(3),
+    bedrock: BlockId(4),
 };
-/// Blocks the benchmark table covers: air and every id up to stone, the highest terrain
+/// Blocks the benchmark table covers: air and every id up to bedrock, the highest terrain
 /// block (checked below); the solid and checkerboard cases use ids among them.
-const TABLE_BLOCKS: u16 = TERRAIN.stone.0 + 1;
+const TABLE_BLOCKS: u16 = TERRAIN.bedrock.0 + 1;
 
-const _: () = assert!(TERRAIN.grass.0 < TERRAIN.stone.0 && TERRAIN.dirt.0 < TERRAIN.stone.0);
+const _: () = assert!(TERRAIN.grass.0 < TERRAIN.bedrock.0 && TERRAIN.dirt.0 < TERRAIN.bedrock.0);
+const _: () = assert!(TERRAIN.stone.0 < TERRAIN.bedrock.0);
 
 /// A table where the layer of every face equals the block id, one array read per quad.
 fn textures() -> FaceTextures {
@@ -215,6 +217,10 @@ fn bench_terrain(c: &mut Criterion) {
                 &TERRAIN,
             )
         })
+    });
+    // The column span: 34 x 34 height samples, the worker's extra cost per column (decision 0015).
+    group.bench_function("column_span", |b| {
+        b.iter(|| column_span(black_box(SEED), black_box(3), black_box(-2)))
     });
     group.finish();
 }
