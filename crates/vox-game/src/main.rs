@@ -1,9 +1,9 @@
 //! Game entry point.
 //!
 //! This is where the layers are wired together: it stacks the resource packs, opens the
-//! window, creates the renderer with the shaders from the packs, streams terrain chunks in
-//! around the camera and runs the event loop, flying a camera over the terrain. Mods and
-//! networking will join later.
+//! window, creates the renderer with the shaders from the packs, starts the mods' scripts,
+//! streams terrain chunks in around the camera and runs the event loop, flying a camera over
+//! the terrain and sending the player's block edits to the mods. Networking will join later.
 
 mod camera;
 mod cli;
@@ -12,6 +12,7 @@ mod controls;
 mod editing;
 mod hud;
 mod metrics;
+mod mod_scripts;
 mod pacing;
 mod packs;
 mod physics;
@@ -29,10 +30,11 @@ use std::time::{Duration, Instant};
 
 use glam::Vec3;
 use vox_content::BlockTextures;
+use vox_mods::{DiscoveredMod, ModHost, ModStatus};
 use vox_render::{
     RenderError, RenderStats, Renderer, ShaderSources, TextureLayers, create_renderer,
 };
-use vox_world::{ChunkMesh, World, raycast};
+use vox_world::{BlockRegistry, ChunkMesh, World, raycast};
 use winit::application::ApplicationHandler;
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
@@ -45,7 +47,7 @@ use camera::{Camera, Movement};
 use cli::{Command, Options};
 use content::Content;
 use controls::Controls;
-use editing::{EditAction, REACH};
+use editing::{Edit, EditAction, REACH, StaleChunks};
 use metrics::FrameHistory;
 use pacing::MAX_FRAME_TIME;
 use physics::{Body, WalkInput};
@@ -142,6 +144,10 @@ struct App {
     terrain: Arc<Terrain>,
     /// The blocks the player may place and the one the place key puts down.
     selection: Selection,
+    /// Every registered block, so the mods can name the blocks of the world.
+    registry: BlockRegistry,
+    /// The running mod scripts; the player's block edits are sent to them.
+    mods: ModHost,
     /// Loads and unloads the terrain around the camera; set up with the renderer.
     streamer: Option<ChunkStreamer>,
     /// Progress of the first fill, for the log line.
@@ -188,7 +194,7 @@ struct App {
 }
 
 impl App {
-    fn new(options: Options, shaders: ShaderSources, content: Content) -> Self {
+    fn new(options: Options, shaders: ShaderSources, content: Content, mods: ModHost) -> Self {
         Self {
             terrain: Arc::new(Terrain::new(
                 WORLD_SEED,
@@ -196,6 +202,8 @@ impl App {
                 content.face_textures(),
             )),
             selection: content.selection,
+            registry: content.registry,
+            mods,
             options,
             shaders,
             block_textures: Some(content.textures),
@@ -363,8 +371,7 @@ impl App {
     }
 
     /// Carries out the edit the player asked for since the last frame, if any: casts a ray
-    /// from the eye along the look direction, writes the block the ray picks and rebuilds the
-    /// mesh of every chunk the write made out of date.
+    /// from the eye along the look direction and applies the edit the ray picks.
     ///
     /// The ray is only cast when an edit was asked for, since nothing shows the targeted block.
     fn edit(&mut self) -> Result<(), RenderError> {
@@ -379,14 +386,33 @@ impl App {
         let Some(edit) = editing::plan(action, &hit, &self.body, self.selection.selected()) else {
             return Ok(());
         };
+        self.apply_edit(action, edit)
+    }
+
+    /// Writes the player's `edit`, sends the event to the mods, writes what they asked for and
+    /// rebuilds the mesh of every chunk the writes made out of date, each once (decision 0014).
+    /// The mods see the world after the player's write and cannot undo it.
+    fn apply_edit(&mut self, action: EditAction, edit: Edit) -> Result<(), RenderError> {
         // `None` when the chunk of the cell is not loaded, for example above the terrain layer.
+        let Some(previous) = self.world.block_at(edit.position) else {
+            return Ok(());
+        };
         let Some(changed) = self.world.set_block(edit.position, edit.block) else {
             return Ok(());
         };
+        if changed.is_empty() {
+            // The cell already held the block: nothing happened, so there is no event.
+            return Ok(());
+        }
+        let mut stale = StaleChunks::default();
+        stale.add(&changed);
+        let event = editing::block_event(action, &edit, previous);
+        let mod_edits = self.mods.block_event(&event, &self.world, &self.registry);
+        editing::apply_mod_edits(&mut self.world, &mod_edits, &mut stale);
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        for pos in changed.as_slice() {
+        for pos in stale.as_slice() {
             if remesh(&self.terrain, &self.world, *pos, &mut self.edit_scratch) {
                 // An empty mesh removes the chunk's entry, so a chunk that was dug empty vanishes.
                 renderer.set_chunk_mesh(*pos, &self.edit_scratch)?;
@@ -426,6 +452,7 @@ impl App {
             self.fail(event_loop, error);
             return;
         }
+        print_mod_messages(&mut self.mods);
         let result = self
             .renderer
             .as_mut()
@@ -656,6 +683,31 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Prints the messages waiting in `mods` to the error output, each tagged with its mod's id.
+/// A closed error output is not a reason to stop the game (`eprintln!` would panic), so a
+/// write error is ignored.
+fn print_mod_messages(mods: &mut ModHost) {
+    let mut output = io::stderr().lock();
+    for message in mods.take_messages() {
+        let _ = writeln!(output, "{}", mod_scripts::message_line(&message));
+    }
+}
+
+/// Starts the scripts of `mods` (in load order), prints how each start ended, then what the
+/// scripts printed while they ran. A failing script only disables its own mod.
+fn start_mods(mods: &[DiscoveredMod]) -> ModHost {
+    let (mut host, statuses) = ModHost::start(mods);
+    for status in &statuses {
+        let line = mod_scripts::status_line(status, mods);
+        match status {
+            ModStatus::Loaded { .. } => println!("{line}"),
+            ModStatus::Disabled { .. } => eprintln!("warning: {line}"),
+        }
+    }
+    print_mod_messages(&mut host);
+    host
+}
+
 /// The renderer's borrowed view of the block textures the content loader built.
 fn texture_layers(textures: &BlockTextures) -> TextureLayers<'_> {
     TextureLayers {
@@ -730,7 +782,8 @@ fn main() -> ExitCode {
     };
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(options, shaders, content);
+    let mods = start_mods(&startup.mods);
+    let mut app = App::new(options, shaders, content, mods);
     let result = event_loop.run_app(&mut app);
     // The summary is printed however the loop ended. A closed standard output is not a
     // reason to fail (`println!` would panic), so a write error is ignored.

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use vox_resources::IdProblem;
 
-use crate::manifest::{ApiVersion, ModId};
+use crate::manifest::{ApiVersion, Capability, ModId};
 use crate::text::printable;
 
 /// Why one manifest is not valid.
@@ -389,6 +389,23 @@ pub enum ModFailure {
     },
     /// The script tried to use more memory than a mod may.
     Memory,
+    /// The script called a world function whose capability its manifest does not declare.
+    MissingCapability {
+        /// The function, as scripts call it (`get_block`).
+        function: &'static str,
+        /// The capability it needs.
+        capability: Capability,
+    },
+    /// The script asked to write a block name the registry does not know.
+    UnknownBlock {
+        /// The name as given, made printable and cut to [`MAX_FAILURE_MESSAGE_BYTES`].
+        name: String,
+    },
+    /// The script queued more block writes in one call than a call may.
+    TooManyEdits {
+        /// The most writes one call may queue.
+        limit: usize,
+    },
 }
 
 impl ModFailure {
@@ -449,6 +466,21 @@ impl fmt::Display for ModFailure {
                 "used more than the {} bytes of memory a mod may use",
                 crate::sandbox::MAX_MOD_MEMORY
             ),
+            Self::MissingCapability {
+                function,
+                capability,
+            } => write!(
+                f,
+                "`world:{function}` needs the capability `{}`, which the mod's {} does not declare",
+                capability.name(),
+                crate::discover::MANIFEST_FILE
+            ),
+            Self::UnknownBlock { name } => {
+                write!(f, "`world:set_block`: unknown block `{name}`")
+            }
+            Self::TooManyEdits { limit } => {
+                write!(f, "queued more than {limit} block writes in one call")
+            }
         }
     }
 }

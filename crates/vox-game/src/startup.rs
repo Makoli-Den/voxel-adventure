@@ -24,6 +24,8 @@ pub struct Startup {
     pub blocks_files: Vec<ResourceId>,
     /// The ids of the mods in load order.
     pub load_order: Vec<ModId>,
+    /// The mods themselves in load order, for starting their scripts.
+    pub mods: Vec<DiscoveredMod>,
     /// The `--pack` folders that are not directories, for a warning.
     pub missing_packs: Vec<PathBuf>,
 }
@@ -80,6 +82,7 @@ pub fn assemble(
         stack,
         blocks_files,
         load_order: order,
+        mods: ordered.into_iter().cloned().collect(),
         missing_packs,
     })
 }

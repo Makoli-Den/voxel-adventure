@@ -172,7 +172,7 @@ fn table_cost_of(name: &str) -> Cost {
 
 /// Runs `body` for a host function and passes its error through [`Budget::fail`], so a
 /// memory error stays fatal and a spent budget stops all further code at once.
-fn guarded<R>(
+pub(crate) fn guarded<R>(
     lua: &Lua,
     budget: &Rc<Budget>,
     body: impl FnOnce() -> mlua::Result<R>,
@@ -328,12 +328,12 @@ fn lua_index(position: usize) -> i64 {
 }
 
 /// A count as instructions, one each.
-fn count(items: usize) -> u64 {
+pub(crate) fn count(items: usize) -> u64 {
     u64::try_from(items).unwrap_or(u64::MAX)
 }
 
 /// Instructions charged for `bytes` bytes of work.
-fn bytes_cost(bytes: usize) -> u64 {
+pub(crate) fn bytes_cost(bytes: usize) -> u64 {
     count(bytes) / BYTES_PER_INSTRUCTION
 }
 

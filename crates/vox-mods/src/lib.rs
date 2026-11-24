@@ -2,15 +2,17 @@
 //! running their scripts in a Lua sandbox (decision 0014).
 //!
 //! A mod is a directory `<id>/` with a `mod.json` manifest and an `assets/` pack, whose entry
-//! script runs in a Lua 5.4 state of its own. This crate knows nothing about rendering. The game
-//! calls its manifest and load-order part at startup (`vox-game`, decision 0014 step S3); the
-//! scripts are not run by the game yet.
+//! script runs in a Lua 5.4 state of its own. This crate knows nothing about rendering; of the
+//! world it knows only `vox-world`'s `World` and `BlockRegistry`, which handlers read. The game
+//! resolves the mods at startup, starts their scripts and sends them the player's block edits
+//! (`vox-game`, decision 0014 steps S3 and S5).
 //!
 //! - [`manifest`]: [`ModManifest`], [`ModId`], [`ApiVersion`], [`Capability`] and their rules.
 //! - [`discover()`]: finds the mods of a folder.
 //! - [`resolve()`]: checks versions and dependencies and returns the load order (pure).
 //! - [`ModHost`]: runs the mods' scripts, each in its own sandbox with instruction, memory and
-//!   log limits, and disables a mod whose script fails.
+//!   log limits, sends them [`BlockEvent`]s, collects the [`BlockEdit`]s they queue, and
+//!   disables a mod whose script fails.
 //! - [`error`]: the error types.
 
 mod api;
@@ -23,6 +25,7 @@ pub mod manifest;
 mod resolve;
 mod sandbox;
 mod text;
+mod world_handle;
 
 pub use api::BlockEventKind;
 pub use budget::{
@@ -39,3 +42,4 @@ pub use manifest::{
 };
 pub use resolve::resolve;
 pub use sandbox::{MAX_LOG_LINE_BYTES, MAX_LOG_LINES_PER_CALL, MAX_MOD_MEMORY};
+pub use world_handle::{BlockEdit, BlockEvent, MAX_EDITS_PER_CALL};

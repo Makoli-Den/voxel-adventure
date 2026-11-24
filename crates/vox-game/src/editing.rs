@@ -2,10 +2,13 @@
 //!
 //! Pure code with no window, renderer or threads: given what the ray hit and what the player
 //! asked for, [`plan`] says which block to write where, and [`apply_streamed`] keeps the
-//! game's world in step with the chunk streaming. The game (`main.rs`) casts the ray, writes
-//! the block with `World::set_block` and rebuilds the meshes (decision 0011).
+//! game's world in step with the chunk streaming. After the player's write, [`block_event`]
+//! tells the mods what happened and [`apply_mod_edits`] writes what they asked for, collecting
+//! the chunks to rebuild in [`StaleChunks`], each once. The game (`main.rs`) casts the ray,
+//! writes the block with `World::set_block` and rebuilds the meshes (decisions 0011 and 0014).
 
-use vox_world::{BlockId, Chunk, ChunkPos, RayHit, World};
+use vox_mods::{BlockEdit, BlockEvent, BlockEventKind};
+use vox_world::{BlockId, ChangedChunks, Chunk, ChunkPos, RayHit, World};
 
 use crate::physics::Body;
 
@@ -51,6 +54,59 @@ pub fn plan(action: EditAction, hit: &RayHit, body: &Body, block: BlockId) -> Op
             let position = hit.adjacent();
             let inside_a_block = hit.distance <= 0.0;
             (!inside_a_block && !body.overlaps_cell(position)).then_some(Edit { position, block })
+        }
+    }
+}
+
+/// The event the mods get after the player's `edit`, made by `action`; `previous` is the block
+/// that was in the cell before the write. A broken block is reported as the block that was
+/// there, a placed one as the block that is there now.
+pub fn block_event(action: EditAction, edit: &Edit, previous: BlockId) -> BlockEvent {
+    let (kind, block) = match action {
+        EditAction::Break => (BlockEventKind::BlockBroken, previous),
+        EditAction::Place => (BlockEventKind::BlockPlaced, edit.block),
+    };
+    BlockEvent {
+        kind,
+        position: edit.position,
+        block,
+    }
+}
+
+/// The chunks whose mesh is out of date after one player edit and the mods' writes it caused,
+/// each listed once, so every chunk is rebuilt once however many writes touched it.
+///
+/// A `Vec` searched linearly: it holds at most the chunks of one player edit and
+/// `MAX_EDITS_PER_CALL` writes per mod, a few hundred positions at worst, and edits are rare.
+#[derive(Debug, Default)]
+pub struct StaleChunks {
+    chunks: Vec<ChunkPos>,
+}
+
+impl StaleChunks {
+    /// Adds the chunks one write changed, skipping those already listed.
+    pub fn add(&mut self, changed: &ChangedChunks) {
+        for pos in changed.as_slice() {
+            if !self.chunks.contains(pos) {
+                self.chunks.push(*pos);
+            }
+        }
+    }
+
+    /// The listed chunks, in the order they were first added.
+    pub fn as_slice(&self) -> &[ChunkPos] {
+        &self.chunks
+    }
+}
+
+/// Writes the mods' `edits` into `world` in their order, so a later write to the same cell
+/// wins, and adds the chunks they changed to `stale`. A write into a chunk that is not loaded
+/// is skipped. No event is sent for these writes: mods do not trigger each other (decision
+/// 0014).
+pub fn apply_mod_edits(world: &mut World, edits: &[BlockEdit], stale: &mut StaleChunks) {
+    for edit in edits {
+        if let Some(changed) = world.set_block(edit.position, edit.block) {
+            stale.add(&changed);
         }
     }
 }
@@ -228,5 +284,100 @@ mod tests {
         apply_streamed(&mut world, &[pos], vec![]);
         apply_streamed(&mut world, &[], vec![(pos, marked(1))]);
         assert_eq!(world.block_at([0, 0, 0]), Some(BlockId(1)));
+    }
+
+    #[test]
+    fn the_event_names_the_old_block_when_breaking_and_the_new_one_when_placing() {
+        let edit = Edit {
+            position: [3, -4, 5],
+            block: PLACE_BLOCK,
+        };
+        let previous = BlockId(9);
+        assert_eq!(
+            block_event(EditAction::Break, &edit, previous),
+            BlockEvent {
+                kind: BlockEventKind::BlockBroken,
+                position: [3, -4, 5],
+                block: previous
+            }
+        );
+        assert_eq!(
+            block_event(EditAction::Place, &edit, previous),
+            BlockEvent {
+                kind: BlockEventKind::BlockPlaced,
+                position: [3, -4, 5],
+                block: PLACE_BLOCK
+            }
+        );
+    }
+
+    /// A world of the chunks at `positions`, all air.
+    fn empty_world(positions: &[ChunkPos]) -> World {
+        let mut world = World::new();
+        for pos in positions {
+            world.insert(*pos, Chunk::new());
+        }
+        world
+    }
+
+    #[test]
+    fn the_player_edit_and_the_mod_edits_remesh_each_chunk_once() {
+        let origin = ChunkPos::ORIGIN;
+        let east = ChunkPos::new(1, 0, 0);
+        let up = ChunkPos::new(0, 1, 0);
+        let mut world = empty_world(&[origin, east, up]);
+        let last = CHUNK_SIZE as i32 - 1;
+        let mut stale = StaleChunks::default();
+        // The player's write in the middle of the origin chunk.
+        stale.add(&world.set_block([4, 4, 4], PLACE_BLOCK).unwrap());
+        let edits = [
+            // Same chunk again, twice on one cell.
+            BlockEdit {
+                position: [5, 4, 4],
+                block: PLACE_BLOCK,
+            },
+            BlockEdit {
+                position: [5, 4, 4],
+                block: BlockId(7),
+            },
+            // On the east border: the origin chunk and its east neighbour.
+            BlockEdit {
+                position: [last, 4, 4],
+                block: PLACE_BLOCK,
+            },
+            // Inside the east chunk.
+            BlockEdit {
+                position: [last + 2, 4, 4],
+                block: PLACE_BLOCK,
+            },
+            // Inside the chunk above.
+            BlockEdit {
+                position: [4, last + 3, 4],
+                block: PLACE_BLOCK,
+            },
+            // A chunk that is not loaded: skipped.
+            BlockEdit {
+                position: [-4, 4, 4],
+                block: PLACE_BLOCK,
+            },
+        ];
+        apply_mod_edits(&mut world, &edits, &mut stale);
+        assert_eq!(stale.as_slice(), [origin, east, up]);
+        // Applied in order: the later write to (5, 4, 4) won.
+        assert_eq!(world.block_at([5, 4, 4]), Some(BlockId(7)));
+        assert_eq!(world.block_at([last + 2, 4, 4]), Some(PLACE_BLOCK));
+        assert_eq!(world.block_at([-4, 4, 4]), None);
+    }
+
+    #[test]
+    fn a_write_that_changes_nothing_remeshes_nothing() {
+        let mut world = empty_world(&[ChunkPos::ORIGIN]);
+        let mut stale = StaleChunks::default();
+        let air = BlockEdit {
+            position: [1, 1, 1],
+            block: BlockId::AIR,
+        };
+        apply_mod_edits(&mut world, &[air], &mut stale);
+        assert!(stale.as_slice().is_empty());
     }
 }
