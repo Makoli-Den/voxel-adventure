@@ -7,6 +7,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 
 use glam::Vec3;
 use glam::camera::rh::{proj::vulkan, view};
+use vox_world::{CHUNK_SIZE, WORLD_CEILING_Y, WORLD_FLOOR_Y};
 
 /// Vertical field of view of the projection, in degrees.
 const FIELD_OF_VIEW_DEGREES: f32 = 70.0;
@@ -17,6 +18,13 @@ const NEAR: f32 = 0.1;
 const PITCH_MARGIN_DEGREES: f32 = 1.0;
 /// Largest pitch, one degree short of straight up or down, where "up" would become ambiguous.
 const MAX_PITCH: f32 = FRAC_PI_2 - PITCH_MARGIN_DEGREES.to_radians();
+
+/// The lowest height the flying camera may reach, in blocks: the floor of the world, so the
+/// camera is never under it (decision 0015).
+pub const FLY_FLOOR: f32 = WORLD_FLOOR_Y as f32;
+/// The highest height the flying camera may reach, in blocks: one chunk above the build limit,
+/// room to look down on the highest builds without leaving the world far behind.
+pub const FLY_CEILING: f32 = (WORLD_CEILING_Y + CHUNK_SIZE as i32) as f32;
 
 /// Which way the player wants to move, each axis from -1 to 1, relative to the camera.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -115,6 +123,11 @@ impl Camera {
             + self.right() * movement.right
             + Vec3::Y * movement.up;
         self.position += direction.normalize_or_zero() * distance;
+    }
+
+    /// Keeps the eye's height within `lowest..=highest` blocks; the other coordinates stay.
+    pub fn clamp_height(&mut self, lowest: f32, highest: f32) {
+        self.position.y = self.position.y.clamp(lowest, highest);
     }
 
     /// The view-projection matrix for a window of `width` by `height` pixels with the far
@@ -361,6 +374,21 @@ mod tests {
     fn world_right_points_right_on_screen() {
         let camera = Camera::new(Vec3::ZERO, 0.0, 0.0);
         assert!(ndc(&camera, Vec3::new(1.0, 0.0, -10.0)).x > 0.0);
+    }
+
+    #[test]
+    fn the_height_is_clamped_to_the_flying_range() {
+        let mut camera = Camera::new(Vec3::new(3.0, -2000.0, 4.0), 0.0, 0.0);
+        camera.clamp_height(FLY_FLOOR, FLY_CEILING);
+        assert!(close(camera.position, Vec3::new(3.0, FLY_FLOOR, 4.0)));
+        camera.set_position(Vec3::new(3.0, 5000.0, 4.0));
+        camera.clamp_height(FLY_FLOOR, FLY_CEILING);
+        assert!(close(camera.position, Vec3::new(3.0, FLY_CEILING, 4.0)));
+        camera.set_position(Vec3::new(3.0, 60.0, 4.0));
+        camera.clamp_height(FLY_FLOOR, FLY_CEILING);
+        assert!(close(camera.position, Vec3::new(3.0, 60.0, 4.0)));
+        // Literal range of decision 0015: the floor and one chunk above the ceiling.
+        assert_eq!((FLY_FLOOR, FLY_CEILING), (-512.0, 544.0));
     }
 
     #[test]

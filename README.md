@@ -2,7 +2,7 @@
 
 A voxel game: the open world, freedom of action and world generation of Minecraft, combined with the adventure, difficulty and boss fights of Terraria. The top priority is speed: the game must be extremely fast and run on old devices. Mods, texture packs and shader packs are part of the core.
 
-> Status: very early. The game opens a window, picks a GPU through Vulkan, streams a circle of hilly terrain chunks around the camera (generated and meshed on worker threads, faces between chunks hidden, chunks outside the view skipped), draws it textured (with mipmaps, so distant terrain does not shimmer) and fades it into the sky with distance fog, so the edge of the loaded area is never seen, and lets you fly or walk over it (depth buffer, per-face shading), with block definitions, textures and shaders read through layered resource packs at startup (shaders compiled then). Mods are still to come.
+> Status: very early. The game opens a window, picks a GPU through Vulkan, streams a circle of hilly terrain columns around the camera (only the chunk layers of a column that can show a face) (generated and meshed on worker threads, faces between chunks hidden, chunks outside the view skipped), draws it textured (with mipmaps, so distant terrain does not shimmer) and fades it into the sky with distance fog, so the edge of the loaded area is never seen, and lets you fly or walk over it (depth buffer, per-face shading), with block definitions, textures and shaders read through layered resource packs at startup (shaders compiled then). Mods are still to come.
 
 ## Stack
 - A custom engine in **Rust**, graphics on **Vulkan** (`ash`). The decision and its reasons: [docs/decisions/0001-rust-vulkan-own-engine.md](docs/decisions/0001-rust-vulkan-own-engine.md)
@@ -52,7 +52,7 @@ Fly over the generated terrain:
 | Mouse | look around (the cursor is hidden and captured while you play; no button needed) |
 | Left mouse button | break the block under the crosshair (within a few blocks) |
 | F | place the selected block on the face under the crosshair (stone at the start) |
-| 1 to 9 (also on the numpad) | select the 1st to 9th placeable block (every block except air, in the order of `blocks.json`; with fewer blocks the extra keys do nothing; ignored while Ctrl, Alt, Shift or Super is held) |
+| 1 to 9 (also on the numpad) | select the 1st to 9th placeable block (every block except air and bedrock, in the order of `blocks.json`; with fewer blocks the extra keys do nothing; ignored while Ctrl, Alt, Shift or Super is held) |
 | Mouse wheel | cycle through all placeable blocks, wrapping around (the only way to reach blocks past the ninth) |
 | G | switch between flying and walking (walking has gravity and collision; Space jumps, Shift does nothing) |
 | L | turn the frame limit on or off |
@@ -61,7 +61,7 @@ Fly over the generated terrain:
 
 The pause menu (Resume, Quit) frees the cursor and stops the game's input and the walking body (the world keeps drawing); choose with Up/Down or W/S and Enter, or click. The window closing also quits. Losing the window focus opens the menu, and gaining it back does not close it, so the click that focuses the window never breaks a block: click Resume or press Esc or Enter. A movement key held while the menu opens is forgotten, so press it again after Resume. The right mouse button is unused for now.
 
-Edits are not saved: a chunk that streams out of range and back in is generated again (decision 0011). Blocks can only be placed in the loaded terrain layer.
+Edits are not saved: a chunk that streams out of range and back in is generated again (decision 0011). The world is 1024 blocks deep: you can dig down to the bedrock floor at height -512 (it cannot be broken) and build up to height 511; the chunks under the terrain are created when a dig first reaches them (decision 0015). Flying is limited to the same heights, plus one chunk above the build limit.
 
 Options: `--background` opens the window without taking the keyboard focus (useful for scripted checks; the cursor is not captured and no menu is shown until the window is focused for the first time), `--view-radius N` sets how many chunks are streamed around the camera (0 to 30), `--fly SECONDS` flies the camera sideways by itself and then quits (for measuring streaming), `--pack DIR` layers a resource pack laid out like `assets/` over the built-in one (repeatable, a later pack wins; for example `DIR/base/textures/block/stone.png` replaces the stone texture and `DIR/core/shaders/chunk.frag` the terrain fragment shader; a texture that is missing or cannot be used shows a magenta and black checker and prints a warning), `--mods DIR` loads the mods found in `DIR` instead of the built-in `mods/` folder (repeatable; it replaces the built-in folder, so leave out the `base` mod and the game stops; a mod id may appear in only one folder; the mods load in dependency order and their assets sit between the engine's `assets/` and the `--pack` directories; the load order is printed at startup, and a missing dependency, a cycle or a broken manifest stops the game with every problem listed), `--help` lists the options.
 

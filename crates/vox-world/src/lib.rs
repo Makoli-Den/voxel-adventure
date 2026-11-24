@@ -24,9 +24,9 @@ pub use mesh::{
     ChunkMesh, ChunkVertex, Face, INDICES_PER_QUAD, VERTICES_PER_QUAD, build_mesh, build_mesh_into,
     build_mesh_with_neighbours_into,
 };
-pub use raycast::{RayHit, raycast};
+pub use raycast::{RayHit, raycast, raycast_with};
 pub use registry::{AIR_NAME, BlockRegistry, FaceTextures, RegistryError, TextureLayer};
 pub use terrain::{
     MAX_SURFACE, MIN_SURFACE, TerrainBlocks, column_span, generate_chunk, generate_terrain,
 };
-pub use world::{ChangedChunks, MAX_CHANGED_CHUNKS, Neighbours, World};
+pub use world::{ChangedChunks, MAX_CHANGED_CHUNKS, Neighbours, World, chunks_touching};

@@ -642,3 +642,43 @@ About 2.1 ns more per mesh, 0.4 us per frame for 197 meshes, 0.2 percent of the 
 the driver's cost of the extra `vkCmdDrawIndexed` calls (99 draws instead of 69 here, about
 43 percent more). That part is only bounded by the frame figures above (`work` fell); it is
 re-measured on a CPU-bound low-end device in S9.
+
+## Vertical streaming by column span (2026-11-24, step S3b of decision 0015)
+
+Development machine (RTX 4070 SUPER), release builds of `main` (before) and this step (after),
+start view, 1280x720 window as the game opens it, alternating runs of 8 s each.
+
+**Unchanged picture.** Every span is layer 0 today, so the loaded set and the meshes must not
+change. The screenshots at the start view are pixel-identical outside the HUD panel at radius 8
+and 12 (0 of 356,700 pixels differ). Drawn at the start view, before and after: radius 8, 59
+chunks and 51,810 triangles; radius 12, 132 chunks and 111,650 triangles; loaded 197 and 441.
+
+**Frame rate at radius 12** (three runs each):
+
+| Case | FPS before | FPS after | `work` before | `work` after |
+|---|---|---|---|---|
+| standing | 3053 (3032, 3075, 3053) | 3075 (3026, 3075, 3081) | 0.25 ms | 0.25 ms |
+| `--fly 8` | 2787 (2787, 2784, 2884) | 2848 (2848, 2839, 2885) | 0.27 ms | 0.27 ms |
+
+Within the run spread. The column job (one layer plus the span scan) averaged 0.629 ms in a
+`--fly 8` run at radius 12 with 15 workers.
+
+**Edit that creates chunks.** An ignored timing test,
+`cargo test -p vox-game --release -- --ignored the_cost_of_an_edit_that_creates_four_chunks --nocapture`
+(`vox-game/src/editing.rs`), breaks block (0, -32, 0) under a streamed 3 x 3 area: the corner of
+chunk (0, -1, 0), so the edit creates that chunk and the three behind its -X, -Y and -Z borders,
+writes the block and remeshes the four chunks, as the game does on the main thread. Four is a
+deliberate upper bound: in the game an edit creates at most 3 chunks (the hit block's chunk is
+always present), so the game's worst case is cheaper than this. Median and
+worst of 20 runs, three runs:
+
+| Remesh of a missing neighbour | median | worst |
+|---|---|---|
+| generated (first version) | 1.69, 1.64, 1.65 ms | 1.95, 2.63, 2.11 ms |
+| solid or air from the column's span, generated only outside the loaded columns | 0.91, 0.92, 0.86 ms | 1.10, 1.37, 1.13 ms |
+
+The budget of decision 0015 is 2 ms, checked here on the development machine only; S9
+re-measures it on the low-end device. Generating the up to five missing neighbours of each of
+the four remeshed chunks (about 14 generations) was nearly half of the edit; reading the span
+instead keeps the edit near 0.9 ms. The game logs every edit that created chunks
+(`Edit: N chunks created, M remeshed in T ms`).

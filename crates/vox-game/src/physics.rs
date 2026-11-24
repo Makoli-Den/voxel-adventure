@@ -7,16 +7,16 @@
 //! then X, then Z, and an axis that is blocked only loses its own velocity, so the body slides
 //! along walls.
 //!
-//! What counts as solid: any block that is not air, a cell of a chunk that is not loaded in
-//! or below the terrain layer (so the player never falls into the void while chunks stream in,
-//! and cannot walk out of the loaded area), and nothing above the terrain layer, which is air
-//! (as in `streaming::job`). Without the last rule a body that starts above the terrain would
-//! be inside "solid" cells and could not move sideways while it falls.
+//! What counts as solid (decision 0015): everything below the world's floor; every cell of a
+//! column that is not loaded, at any height, so the player never falls into the void while
+//! chunks stream in and cannot leave the loaded area; in a loaded column nothing at or above
+//! the ceiling, any block that is not air, and in a chunk that is not in the world solid below
+//! the column's span and air above it, which is what the generator has there.
 
-use vox_world::{BlockId, ChunkPos, World};
+use vox_world::{BlockId, ChunkPos, WORLD_CEILING_Y, WORLD_FLOOR_Y, World};
 
 use crate::pacing::MAX_FRAME_TIME;
-use crate::streaming::area::TERRAIN_LAYER;
+use crate::streaming::{Column, ColumnSpans};
 
 /// Width of the box along X and Z, in blocks. Under one block so the player fits through
 /// one-block gaps, wide enough to stand on a ledge edge: the proportions of a person.
@@ -61,6 +61,16 @@ pub const TERMINAL_VELOCITY: f32 = 50.0;
 /// Longest time of one integration sub-step, in seconds. Splitting a frame in equal parts
 /// no longer than this makes the height of a jump nearly the same at every frame rate.
 const MAX_SUBSTEP_TIME: f32 = 1.0 / 60.0;
+
+/// What the body moves through: the chunks of the game's world and the spans of the loaded
+/// columns, which tell what the layers missing from the world hold.
+#[derive(Clone, Copy, Debug)]
+pub struct Space<'a> {
+    /// The chunks the game holds.
+    pub world: &'a World,
+    /// The span of every loaded column.
+    pub spans: &'a ColumnSpans,
+}
 
 /// What the player asks of the body in one step.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -108,10 +118,10 @@ impl Body {
 
     /// Whether no solid cell overlaps the box. Walking from inside solid blocks would leave
     /// the player stuck, so the game only starts walking when this holds.
-    pub fn is_free(&self, world: &World) -> bool {
+    pub fn is_free(&self, space: Space<'_>) -> bool {
         let [x, y, z] = [0, 1, 2].map(|axis| covered_cells(self.min[axis], SIZE[axis]));
         (x.0..=x.1)
-            .all(|cx| (y.0..=y.1).all(|cy| (z.0..=z.1).all(|cz| !is_solid(world, [cx, cy, cz]))))
+            .all(|cx| (y.0..=y.1).all(|cy| (z.0..=z.1).all(|cz| !is_solid(space, [cx, cy, cz]))))
     }
 
     /// Whether the body stands on a block. Only the tests read it for now; the jump uses the
@@ -134,7 +144,7 @@ impl Body {
     /// A `dt` that is not a positive finite number does nothing; a long one is cut to
     /// [`MAX_FRAME_TIME`]. The time is split into equal sub-steps of at most
     /// [`MAX_SUBSTEP_TIME`].
-    pub fn step(&mut self, world: &World, input: WalkInput, dt: f32) {
+    pub fn step(&mut self, space: Space<'_>, input: WalkInput, dt: f32) {
         if !(dt.is_finite() && dt > 0.0) {
             return;
         }
@@ -142,12 +152,12 @@ impl Body {
         let substeps = (dt / MAX_SUBSTEP_TIME).ceil().max(1.0);
         let sub_dt = dt / substeps;
         for _ in 0..substeps as u32 {
-            self.substep(world, input, sub_dt);
+            self.substep(space, input, sub_dt);
         }
     }
 
     /// One integration step: velocities first, then the three swept moves.
-    fn substep(&mut self, world: &World, input: WalkInput, dt: f32) {
+    fn substep(&mut self, space: Space<'_>, input: WalkInput, dt: f32) {
         if self.on_ground && input.jump {
             self.velocity[1] = JUMP_SPEED;
         }
@@ -156,15 +166,15 @@ impl Body {
         self.velocity[2] = input.direction[1] * WALK_SPEED;
 
         // Y first, so `on_ground` describes this step before the sideways moves.
-        if self.move_axis(world, 1, self.velocity[1] * dt) {
+        if self.move_axis(space, 1, self.velocity[1] * dt) {
             self.velocity[1] = 0.0;
         }
         // Standing is a probe below the box, not "the last move was blocked": at a high frame
         // rate a fall is shorter than the gap to the ground and is never blocked. A body
         // that is still rising is not standing, even right after it left the ground.
-        self.on_ground = self.velocity[1] <= 0.0 && self.ground_below(world);
+        self.on_ground = self.velocity[1] <= 0.0 && self.ground_below(space);
         for axis in [0, 2] {
-            if self.move_axis(world, axis, self.velocity[axis] * dt) {
+            if self.move_axis(space, axis, self.velocity[axis] * dt) {
                 self.velocity[axis] = 0.0;
             }
         }
@@ -177,7 +187,7 @@ impl Body {
     /// occupies, so a box that starts inside solid blocks (after a block was placed on it, or
     /// above the loaded area) can move out and is never pushed. A box touching a face
     /// exactly does not overlap the block behind that face.
-    fn move_axis(&mut self, world: &World, axis: usize, delta: f32) -> bool {
+    fn move_axis(&mut self, space: Space<'_>, axis: usize, delta: f32) -> bool {
         if delta == 0.0 {
             return false;
         }
@@ -190,7 +200,7 @@ impl Body {
             let first = front.ceil() as i32;
             let last = (target + SIZE[axis]).ceil() as i32 - 1;
             for cell in first..=last {
-                if self.slab_is_solid(world, axis, cell) {
+                if self.slab_is_solid(space, axis, cell) {
                     let stop = cell as f32 - SKIN - SIZE[axis];
                     // Never move against the requested direction to reach the gap.
                     self.min[axis] = stop.max(self.min[axis]);
@@ -202,7 +212,7 @@ impl Body {
             let first = front.floor() as i32 - 1;
             let last = target.floor() as i32;
             for cell in (last..=first).rev() {
-                if self.slab_is_solid(world, axis, cell) {
+                if self.slab_is_solid(space, axis, cell) {
                     let stop = (cell + 1) as f32 + SKIN;
                     self.min[axis] = stop.min(self.min[axis]);
                     return true;
@@ -214,13 +224,13 @@ impl Body {
     }
 
     /// Whether a solid block lies within [`GROUND_PROBE`] below the box.
-    fn ground_below(&self, world: &World) -> bool {
-        self.slab_is_solid(world, 1, (self.min[1] - GROUND_PROBE).floor() as i32)
+    fn ground_below(&self, space: Space<'_>) -> bool {
+        self.slab_is_solid(space, 1, (self.min[1] - GROUND_PROBE).floor() as i32)
     }
 
     /// Whether any solid cell of the layer `cell` along `axis` lies under the box, that is
     /// among the cells the box covers on the two other axes.
-    fn slab_is_solid(&self, world: &World, axis: usize, cell: i32) -> bool {
+    fn slab_is_solid(&self, space: Space<'_>, axis: usize, cell: i32) -> bool {
         let (u, v) = other_axes(axis);
         let (u_first, u_last) = covered_cells(self.min[u], SIZE[u]);
         let (v_first, v_last) = covered_cells(self.min[v], SIZE[v]);
@@ -230,7 +240,7 @@ impl Body {
                 position[axis] = cell;
                 position[u] = cu;
                 position[v] = cv;
-                if is_solid(world, position) {
+                if is_solid(space, position) {
                     return true;
                 }
             }
@@ -255,11 +265,26 @@ fn covered_cells(start: f32, length: f32) -> (i32, i32) {
 }
 
 /// Whether the body cannot enter the cell at `position`: see the module documentation.
-pub fn is_solid(world: &World, position: [i32; 3]) -> bool {
-    match world.block_at(position) {
-        Some(block) => block != BlockId::AIR,
-        None => ChunkPos::containing(position).0.y <= TERRAIN_LAYER,
+pub fn is_solid(space: Space<'_>, position: [i32; 3]) -> bool {
+    let y = position[1];
+    if y < WORLD_FLOOR_Y {
+        return true;
     }
+    let chunk = ChunkPos::containing(position).0;
+    // Checked before the ceiling, so the edge of the loaded area is a wall at every height and
+    // a player above the build limit cannot leave the area either.
+    let Some(span) = space.spans.get(Column::of(chunk)) else {
+        return true;
+    };
+    if y >= WORLD_CEILING_Y {
+        return false;
+    }
+    if let Some(block) = space.world.block_at(position) {
+        return block != BlockId::AIR;
+    }
+    // A layer inside the span is always in the world once the column is loaded; were one
+    // missing, solid keeps the player from falling through it.
+    chunk.y <= *span.end()
 }
 
 #[cfg(test)]
@@ -277,10 +302,37 @@ mod tests {
     /// Tolerance for positions that went through float arithmetic.
     const EPS: f32 = 1e-3;
 
-    /// A world of the terrain-layer chunks around the origin (-1..=1 in X and Z), each filled
-    /// by `fill(world_x, world_y, world_z)`.
-    fn world_with(fill: impl Fn(i32, i32, i32) -> bool) -> World {
+    /// A world and the spans of its loaded columns, as the game keeps them.
+    struct Scene {
+        world: World,
+        spans: ColumnSpans,
+    }
+
+    impl Scene {
+        /// No chunk and no loaded column.
+        fn empty() -> Self {
+            Self {
+                world: World::new(),
+                spans: ColumnSpans::default(),
+            }
+        }
+
+        fn space(&self) -> Space<'_> {
+            Space {
+                world: &self.world,
+                spans: &self.spans,
+            }
+        }
+    }
+
+    /// The layer the test terrain lies in: the span of every loaded column of the tests.
+    const TERRAIN_LAYER: i32 = 0;
+
+    /// The layer-0 chunks of the columns around the origin (-1..=1 in X and Z), each filled by
+    /// `fill(world_x, world_y, world_z)`, with every such column loaded with the span of layer 0.
+    fn world_with(fill: impl Fn(i32, i32, i32) -> bool) -> Scene {
         let mut world = World::new();
+        let mut spans = ColumnSpans::default();
         for cx in -1..=1 {
             for cz in -1..=1 {
                 let mut chunk = Chunk::new();
@@ -298,13 +350,14 @@ mod tests {
                     }
                 }
                 world.insert(ChunkPos::new(cx, TERRAIN_LAYER, cz), chunk);
+                spans.insert(Column::new(cx, cz), TERRAIN_LAYER..=TERRAIN_LAYER);
             }
         }
-        world
+        Scene { world, spans }
     }
 
     /// Stone for every block below height 10: the floor's top face is at y = 10.
-    fn flat() -> World {
+    fn flat() -> Scene {
         world_with(|_, y, _| y < 10)
     }
 
@@ -321,10 +374,10 @@ mod tests {
         ]
     }
 
-    fn run(body: &mut Body, world: &World, input: WalkInput, seconds: f32) {
+    fn run(body: &mut Body, world: &Scene, input: WalkInput, seconds: f32) {
         let frames = (seconds / FRAME).round() as u32;
         for _ in 0..frames {
-            body.step(world, input, FRAME);
+            body.step(world.space(), input, FRAME);
         }
     }
 
@@ -359,7 +412,7 @@ mod tests {
     fn falls_and_lands() {
         let world = flat();
         let mut body = body_at([0.5, 15.0, 0.5]);
-        body.step(&world, WalkInput::default(), FRAME);
+        body.step(world.space(), WalkInput::default(), FRAME);
         assert!(!body.on_ground() && feet(&body)[1] < 15.0);
         run(&mut body, &world, WalkInput::default(), 2.0);
         assert!(body.on_ground());
@@ -415,14 +468,14 @@ mod tests {
             direction: [0.0, 0.0],
             jump: true,
         };
-        body.step(&world, WalkInput::default(), FRAME);
+        body.step(world.space(), WalkInput::default(), FRAME);
         assert!(body.on_ground());
         let mut peak = 0.0_f32;
         // Hold the key for one frame only, then watch the arc.
-        body.step(&world, jump, FRAME);
+        body.step(world.space(), jump, FRAME);
         for _ in 0..120 {
             peak = peak.max(feet(&body)[1] - 10.0);
-            body.step(&world, WalkInput::default(), FRAME);
+            body.step(world.space(), WalkInput::default(), FRAME);
         }
         // About 1.2 blocks, as the constants' documentation says: the continuous v^2 / 2g
         // is 1.27, and gravity already acts in the step of the jump (measured: 1.19).
@@ -447,16 +500,16 @@ mod tests {
         let world = flat();
         let peak_at = |dt: f32| {
             let mut body = body_at([0.5, 10.0, 0.5]);
-            body.step(&world, WalkInput::default(), dt);
+            body.step(world.space(), WalkInput::default(), dt);
             let jump = WalkInput {
                 direction: [0.0, 0.0],
                 jump: true,
             };
-            body.step(&world, jump, dt);
+            body.step(world.space(), jump, dt);
             let mut peak = 0.0_f32;
             for _ in 0..(2.0 / dt) as u32 {
                 peak = peak.max(feet(&body)[1] - 10.0);
-                body.step(&world, WalkInput::default(), dt);
+                body.step(world.space(), WalkInput::default(), dt);
             }
             peak
         };
@@ -469,7 +522,7 @@ mod tests {
         let dt = 1.0 / 500.0;
         let mut body = body_at([0.5, 10.0, 0.5]);
         for frame in 0..1000 {
-            body.step(&world, WalkInput::default(), dt);
+            body.step(world.space(), WalkInput::default(), dt);
             assert!(body.on_ground(), "frame {frame}");
         }
         assert!((feet(&body)[1] - 10.0).abs() < 2.0 * SKIN);
@@ -482,17 +535,17 @@ mod tests {
         let mut body = body_at([0.5, 10.0, 0.5]);
         // Settle, then tap for one frame.
         for _ in 0..300 {
-            body.step(&world, WalkInput::default(), dt);
+            body.step(world.space(), WalkInput::default(), dt);
         }
         let tap = WalkInput {
             direction: [0.0, 0.0],
             jump: true,
         };
-        body.step(&world, tap, dt);
+        body.step(world.space(), tap, dt);
         let mut peak = 0.0_f32;
         for _ in 0..300 {
             peak = peak.max(feet(&body)[1] - 10.0);
-            body.step(&world, WalkInput::default(), dt);
+            body.step(world.space(), WalkInput::default(), dt);
         }
         assert!(peak > 1.15 && peak < 1.3, "{peak}");
     }
@@ -504,14 +557,14 @@ mod tests {
             let dt = 1.0 / fps;
             let mut body = body_at([0.5, 10.0, 0.5]);
             for _ in 0..(fps as u32) {
-                body.step(&world, WalkInput::default(), dt);
+                body.step(world.space(), WalkInput::default(), dt);
             }
             let tap = WalkInput {
                 direction: [0.0, 0.0],
                 jump: true,
             };
-            body.step(&world, tap, dt);
-            body.step(&world, WalkInput::default(), dt);
+            body.step(world.space(), tap, dt);
+            body.step(world.space(), WalkInput::default(), dt);
             assert!(feet(&body)[1] > 10.0 + 0.5 * dt * JUMP_SPEED, "{fps} fps");
         }
     }
@@ -531,8 +584,8 @@ mod tests {
                 velocity: [0.0; 3],
                 on_ground: true,
             };
-            body.move_axis(&world, 0, next() * 0.3);
-            body.move_axis(&world, 0, next() * 0.01);
+            body.move_axis(world.space(), 0, next() * 0.3);
+            body.move_axis(world.space(), 0, next() * 0.01);
             assert!(!body.overlaps_cell([5, 10, 0]), "min x = {}", body.min[0]);
             assert!(!body.overlaps_cell([5, 11, 0]), "min x = {}", body.min[0]);
         }
@@ -541,18 +594,19 @@ mod tests {
     #[test]
     fn a_body_is_free_only_outside_solid_blocks() {
         let world = flat();
-        assert!(body_at([0.5, 10.0, 0.5]).is_free(&world));
+        assert!(body_at([0.5, 10.0, 0.5]).is_free(world.space()));
         // Feet one block into the floor.
-        assert!(!body_at([0.5, 9.0, 0.5]).is_free(&world));
+        assert!(!body_at([0.5, 9.0, 0.5]).is_free(world.space()));
         // Head into a block placed beside the box's column, on a corner cell.
         let corner = world_with(|x, y, z| y < 10 || (x == 1 && z == 0 && y == 11));
-        assert!(!body_at([0.9, 10.0, 0.5]).is_free(&corner));
-        assert!(body_at([0.5, 10.0, 0.5]).is_free(&corner));
-        // Negative coordinates and an unloaded chunk (solid in the terrain layer).
-        assert!(body_at([-0.5, 10.0, -0.5]).is_free(&flat()));
-        assert!(!body_at([0.5, 10.0, 0.5]).is_free(&World::new()));
-        // Above the terrain layer is air, even unloaded.
-        assert!(body_at([0.5, 60.0, 0.5]).is_free(&World::new()));
+        assert!(!body_at([0.9, 10.0, 0.5]).is_free(corner.space()));
+        assert!(body_at([0.5, 10.0, 0.5]).is_free(corner.space()));
+        // Negative coordinates, and a column that is not loaded (solid at any height).
+        assert!(body_at([-0.5, 10.0, -0.5]).is_free(flat().space()));
+        assert!(!body_at([0.5, 10.0, 0.5]).is_free(Scene::empty().space()));
+        assert!(!body_at([0.5, 60.0, 0.5]).is_free(Scene::empty().space()));
+        // Above the span of a loaded column is air, though that layer is not in the world.
+        assert!(body_at([0.5, 60.0, 0.5]).is_free(flat().space()));
     }
 
     #[test]
@@ -560,9 +614,9 @@ mod tests {
         // A ceiling at y = 12 (cells 12 and up) above the floor.
         let world = world_with(|_, y, _| !(10..12).contains(&y));
         let mut body = body_at([0.5, 10.0, 0.5]);
-        body.step(&world, WalkInput::default(), FRAME);
+        body.step(world.space(), WalkInput::default(), FRAME);
         body.step(
-            &world,
+            world.space(),
             WalkInput {
                 direction: [0.0, 0.0],
                 jump: true,
@@ -572,7 +626,7 @@ mod tests {
         let mut highest = 0.0_f32;
         for _ in 0..30 {
             highest = highest.max(feet(&body)[1] + PLAYER_HEIGHT);
-            body.step(&world, WalkInput::default(), FRAME);
+            body.step(world.space(), WalkInput::default(), FRAME);
         }
         assert!(highest <= 12.0, "{highest}");
     }
@@ -624,21 +678,87 @@ mod tests {
     }
 
     #[test]
-    fn unloaded_chunks_in_the_terrain_layer_are_solid() {
-        let world = World::new();
-        assert!(is_solid(&world, [0, 5, 0]));
-        assert!(is_solid(&world, [100, 0, -100]));
-        // Below the layer too, but above it is air.
-        assert!(is_solid(&world, [0, -1, 0]));
-        assert!(!is_solid(&world, [0, SIDE, 0]));
-        assert!(!is_solid(&world, [0, 3 * SIDE, 0]));
+    fn chunks_missing_from_a_loaded_column_are_solid_below_its_span_and_air_above() {
+        // Column (0, 0) is loaded with the span of layer 0 but holds no chunk at all.
+        let mut world = Scene::empty();
+        world
+            .spans
+            .insert(Column::new(0, 0), TERRAIN_LAYER..=TERRAIN_LAYER);
+        let space = world.space();
+        // Inside the span (missing only by mistake) and below it: solid.
+        assert!(is_solid(space, [0, 5, 0]));
+        assert!(is_solid(space, [0, -1, 0]));
+        assert!(is_solid(space, [SIDE - 1, -5 * SIDE, SIDE - 1]));
+        // Above the span: air.
+        assert!(!is_solid(space, [0, SIDE, 0]));
+        assert!(!is_solid(space, [0, 3 * SIDE, 0]));
+        // A span lower down moves the border with it.
+        world.spans.insert(Column::new(0, 0), -3..=-2);
+        assert!(!is_solid(world.space(), [0, -SIDE, 0]));
+        assert!(is_solid(world.space(), [0, -2 * SIDE, 0]));
+    }
+
+    #[test]
+    fn every_cell_of_a_column_that_is_not_loaded_is_solid() {
+        let world = flat();
+        // Column (3, -4) is not among the loaded 3 x 3; above the ceiling too.
+        for y in [
+            -SIDE,
+            0,
+            5,
+            SIDE,
+            3 * SIDE,
+            WORLD_CEILING_Y,
+            WORLD_CEILING_Y + SIDE,
+        ] {
+            assert!(is_solid(world.space(), [100, y, -100]), "y {y}");
+        }
+    }
+
+    #[test]
+    fn below_the_floor_is_solid_and_from_the_ceiling_up_is_air() {
+        // Literal bounds of decision 0015.
+        let world = flat();
+        for x in [0, 1000] {
+            assert!(is_solid(world.space(), [x, -513, 0]));
+            assert!(is_solid(world.space(), [x, i32::MIN, 0]));
+        }
+        // From the ceiling up a loaded column is air, a column that is not loaded stays solid.
+        assert!(!is_solid(world.space(), [0, 512, 0]));
+        assert!(!is_solid(world.space(), [0, i32::MAX, 0]));
+        assert!(is_solid(world.space(), [1000, 512, 0]));
+        assert!(is_solid(world.space(), [1000, i32::MAX, 0]));
+        // The last row inside is decided by the span (a loaded column, above its span: air).
+        assert!(!is_solid(world.space(), [0, 511, 0]));
+        // The floor row is bedrock, below the span: solid.
+        assert!(is_solid(world.space(), [0, -512, 0]));
+    }
+
+    #[test]
+    fn a_body_cannot_fall_below_the_floor() {
+        // The two lowest layers of a loaded column are all air, even the bedrock row (the game
+        // never allows that, but the rule must not depend on it): the body stands on the floor.
+        let mut world = Scene::empty();
+        for layer in -16..=-15 {
+            world.world.insert(ChunkPos::new(0, layer, 0), Chunk::new());
+        }
+        world.spans.insert(Column::new(0, 0), -16..=-15);
+        let mut body = body_at([16.0, -500.0, 16.0]);
+        run(&mut body, &world, WalkInput::default(), 2.0);
+        assert!(body.on_ground());
+        assert!((feet(&body)[1] - WORLD_FLOOR_Y as f32).abs() < 2.0 * SKIN);
     }
 
     #[test]
     fn a_body_does_not_fall_into_an_unloaded_chunk() {
         // Only chunk (0, 0, 0) is loaded, and it is empty; beyond it nothing is loaded.
-        let mut world = World::new();
-        world.insert(ChunkPos::new(0, TERRAIN_LAYER, 0), Chunk::new());
+        let mut world = Scene::empty();
+        world
+            .world
+            .insert(ChunkPos::new(0, TERRAIN_LAYER, 0), Chunk::new());
+        world
+            .spans
+            .insert(Column::new(0, 0), TERRAIN_LAYER..=TERRAIN_LAYER);
         let mut body = body_at([SIDE as f32 / 2.0, 20.0, SIDE as f32 / 2.0]);
         run(&mut body, &world, walk(1.0, 0.0), 3.0);
         // Falls to the bottom of the loaded chunk (the layer below is unloaded, so solid)...
@@ -663,16 +783,16 @@ mod tests {
         // The frame is cut to MAX_FRAME_TIME, and a thin floor is still not crossed.
         let thin = world_with(|_, y, _| y == 10);
         let mut body = body_at([0.5, 12.0, 0.5]);
-        body.step(&thin, WalkInput::default(), 1000.0);
-        body.step(&thin, WalkInput::default(), 1000.0);
+        body.step(thin.space(), WalkInput::default(), 1000.0);
+        body.step(thin.space(), WalkInput::default(), 1000.0);
         assert!(feet(&body)[1] >= 11.0 - EPS);
         // The sweep itself is exact for any distance.
         let mut body = body_at([0.5, 20.0, 0.5]);
-        assert!(body.move_axis(&world, 1, -1000.0));
+        assert!(body.move_axis(world.space(), 1, -1000.0));
         assert!((feet(&body)[1] - (10.0 + SKIN)).abs() < 1e-5);
         let wall = world_with(|x, y, _| y < 10 || (x == 7 && y < 12));
         let mut body = body_at([0.5, 10.0, 0.5]);
-        assert!(body.move_axis(&wall, 0, 1000.0));
+        assert!(body.move_axis(wall.space(), 0, 1000.0));
         assert!(body.min[0] + PLAYER_WIDTH <= 7.0);
     }
 
@@ -682,7 +802,7 @@ mod tests {
         let start = body_at([0.5, 12.0, 0.5]);
         for dt in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             let mut body = start;
-            body.step(&world, WalkInput::default(), dt);
+            body.step(world.space(), WalkInput::default(), dt);
             assert_eq!(body, start);
         }
     }
@@ -702,17 +822,17 @@ mod tests {
         assert!(body.overlaps_cell([4, 10, 0]));
         // Moving on X into the touching block does not move the box at all.
         let before = body.min;
-        assert!(body.move_axis(&world, 0, 1.0));
+        assert!(body.move_axis(world.space(), 0, 1.0));
         assert_eq!(body.min, before);
         // Moving on Z, parallel to the face, is free.
-        assert!(!body.move_axis(&world, 2, 1.0));
+        assert!(!body.move_axis(world.space(), 2, 1.0));
         // Moving down onto the floor with feet exactly at its top does not move it.
         let mut resting = Body {
             min: [0.2, 10.0, 0.2],
             velocity: [0.0; 3],
             on_ground: false,
         };
-        assert!(resting.move_axis(&world, 1, -1.0));
+        assert!(resting.move_axis(world.space(), 1, -1.0));
         assert_eq!(resting.min[1], 10.0);
     }
 
@@ -722,10 +842,10 @@ mod tests {
         let mut body = body_at([0.5, 10.0, 0.5]);
         let before = body.min;
         // Standing in a block placed on it: no push on a zero move.
-        assert!(!body.move_axis(&world, 0, 0.0));
+        assert!(!body.move_axis(world.space(), 0, 0.0));
         assert_eq!(body.min, before);
         // Moving sideways out of it is possible (the cells already covered are not tested).
-        assert!(!body.move_axis(&world, 0, 1.0));
+        assert!(!body.move_axis(world.space(), 0, 1.0));
         assert!(body.min[0] > before[0]);
     }
 

@@ -50,7 +50,7 @@ impl fmt::Display for ContentError {
             ),
             Self::NoPlaceableBlocks => write!(
                 f,
-                "no block can be placed: the mods register no block besides air, \
+                "no block can be placed: the mods register no block besides air and bedrock, \
                  or lack the block selected at startup"
             ),
         }
@@ -72,13 +72,15 @@ impl From<vox_content::ContentError> for ContentError {
     }
 }
 
-/// Every registered block except air, in id order, with its name: what the player may place.
-fn placeable_blocks(registry: &BlockRegistry) -> Vec<Placeable> {
+/// Every registered block except air and `bedrock`, in id order, with its name: what the player
+/// may place. Bedrock is the floor of the world that nobody can break (decision 0015), so it
+/// cannot be placed either.
+fn placeable_blocks(registry: &BlockRegistry, bedrock: BlockId) -> Vec<Placeable> {
     // Ids are handed out in registration order, so `0..len` covers them all; `try_from` only
     // stops at the registry's own u16 limit, which it can not exceed.
     (0..registry.len())
         .filter_map(|id| u16::try_from(id).ok().map(BlockId))
-        .filter(|block| !block.is_air())
+        .filter(|block| !block.is_air() && *block != bedrock)
         .filter_map(|id| {
             let name = registry.name(id)?.to_owned();
             Some(Placeable { id, name })
@@ -93,7 +95,7 @@ pub struct Content {
     pub registry: BlockRegistry,
     /// The blocks the terrain generator places.
     pub terrain: TerrainBlocks,
-    /// The blocks the player may place (every registered block except air) and the selected
+    /// The blocks the player may place (every registered block except air and bedrock) and the selected
     /// one, which the place key puts down.
     pub selection: Selection,
     /// The pixels of every block texture, one layer per texture; layer 0 is the missing
@@ -119,7 +121,7 @@ impl Content {
             bedrock: find(BEDROCK_NAME)?,
         };
         let start = find(PLACE_BLOCK_NAME)?;
-        let selection = Selection::new(placeable_blocks(&registry), start)
+        let selection = Selection::new(placeable_blocks(&registry, terrain.bedrock), start)
             .ok_or(ContentError::NoPlaceableBlocks)?;
         Ok(Self {
             registry,
@@ -242,18 +244,21 @@ mod tests {
     }
 
     #[test]
-    fn every_block_but_air_is_placeable() {
+    fn every_block_but_air_and_bedrock_is_placeable() {
         let content = content();
         let mut selection = content.selection.clone();
         let mut seen = Vec::new();
-        for _ in 0..content.registry.len() - 1 {
+        // Air and bedrock are left out.
+        let placeable = content.registry.len() - 2;
+        for _ in 0..placeable {
             seen.push(selection.selected());
             selection.cycle(1);
         }
         assert!(!seen.contains(&BlockId::AIR));
+        assert!(!seen.contains(&content.terrain.bedrock));
         seen.sort_by_key(|block| block.0);
         seen.dedup();
-        assert_eq!(seen.len(), content.registry.len() - 1);
+        assert_eq!(seen.len(), placeable);
         // The wheel is back where it started.
         assert_eq!(selection.selected(), content.terrain.stone);
     }
