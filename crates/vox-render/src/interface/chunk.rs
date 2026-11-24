@@ -21,22 +21,44 @@
 //! `chunk.vert`).
 //!
 //! # Shader contract
+//! Positions reach the shaders **relative to the camera** (decision 0015): the renderer
+//! subtracts the camera position from each chunk origin on the CPU and pushes a matrix
+//! without the camera's translation, so the numbers the GPU sees stay small and `f32`
+//! keeps sub-block precision however far the camera is from the world origin.
+//!
 //! The renderer skips chunks whose box (the chunk's 32-block cube at its origin) lies outside
 //! the view, so a vertex shader must place every vertex inside that box:
 //! `chunk_origin + position` with no displacement. A shader pack that moves vertices
 //! (waves, wind) must keep them within the box, or chunks will disappear at the screen edges.
 //!
 //! # Push constants
-//! One range for the vertex stage only, 80 bytes at offset 0, pushed once per chunk
-//! drawn. Floats are little-endian `f32`:
+//! One range for the vertex and the fragment stage, 112 bytes at offset 0. Floats are
+//! little-endian `f32`. Every push names both stages, so either shader may declare the
+//! whole block (or a prefix of it):
 //!
-//! | byte   | content                                             | GLSL   |
-//! |--------|-----------------------------------------------------|--------|
-//! | 0..64  | the camera's view-projection, column-major          | `mat4` |
-//! | 64..80 | the chunk's origin in blocks in `xyz`, `w` is 0     | `vec4` |
+//! | byte    | content                                                         | GLSL   |
+//! |---------|-----------------------------------------------------------------|--------|
+//! | 0..64   | the camera's view-projection without its translation, column-major | `mat4` |
+//! | 64..80  | the chunk's origin relative to the camera in `xyz`; `w` the cell size | `vec4` |
+//! | 80..96  | fog: `x` start, `y` end (blocks from the camera), `z` `1 / (end - start)`, `w` 0 | `vec4` |
+//! | 96..112 | fog colour, `rgb` the sky colour the frame is cleared to, `a` 1  | `vec4` |
 //!
-//! A `mat4` followed by a `vec4` has these offsets under the std430 rules push
-//! constants use, so a shader can declare the block as written in the table.
+//! The matrix and the fog are pushed once per frame, the origin once per chunk drawn.
+//!
+//! - **Cell size:** the edge of one mesh cell in blocks; always 1.0 today (chunk meshes are
+//!   made of blocks). The built-in shaders ignore it; coarser level-of-detail tiles will use
+//!   it (decision 0015, S5).
+//! - **Fog:** the fraction of a fragment's colour replaced by the fog colour is
+//!   `smoothstep(start, end, distance)`, with `distance` the straight-line (radial) distance
+//!   from the camera, so the fog does not change when the camera turns. `z` saves the
+//!   division and is 0 while fog is off (`start` and `end` are 0 then): a shader that
+//!   computes `clamp((distance - x) * z, 0, 1)` needs no special case. Do not call GLSL
+//!   `smoothstep(x, y, ...)` directly, it is undefined while fog is off.
+//! - **Fog colour:** equal to the clear colour, so a fully fogged face cannot be told from
+//!   the sky and the end of the loaded terrain is invisible.
+//!
+//! A `mat4` followed by `vec4`s has these offsets under the std430 rules push constants
+//! use, so a shader can declare the block as written in the table.
 //!
 //! # Descriptor resources
 //! One descriptor set (set 0) for the fragment stage only, holding the block textures
@@ -76,9 +98,15 @@ const MAT4_SIZE: u32 = VEC4_FLOATS * VEC4_SIZE;
 /// Byte offset of the chunk origin inside the push constants, right after the matrix.
 pub(crate) const CHUNK_ORIGIN_OFFSET: u32 = MAT4_SIZE;
 
-/// Size of the push constants, see the table in the module docs: the matrix, then the
-/// origin `vec4` filling the rest of the block.
-pub(crate) const PUSH_CONSTANT_SIZE: u32 = CHUNK_ORIGIN_OFFSET + VEC4_SIZE;
+/// Byte offset of the fog distances inside the push constants, right after the origin.
+pub(crate) const FOG_OFFSET: u32 = CHUNK_ORIGIN_OFFSET + VEC4_SIZE;
+
+/// Byte offset of the fog colour inside the push constants, right after the distances.
+pub(crate) const FOG_COLOR_OFFSET: u32 = FOG_OFFSET + VEC4_SIZE;
+
+/// Size of the push constants, see the table in the module docs: the matrix, the origin,
+/// the fog distances and the fog colour.
+pub(crate) const PUSH_CONSTANT_SIZE: u32 = FOG_COLOR_OFFSET + VEC4_SIZE;
 
 // Staying within the guaranteed size means no capability check is needed.
 const _: () = assert!(PUSH_CONSTANT_SIZE <= GUARANTEED_PUSH_CONSTANT_SIZE);
@@ -124,7 +152,8 @@ pub(crate) const INTERFACE: PipelineInterface = PipelineInterface {
     vertex_stride: VERTEX_STRIDE,
     attributes: &ATTRIBUTES,
     push_constants: PushConstants {
-        stage: Stage::Vertex,
+        // The vertex stage places the chunk, the fragment stage fogs it.
+        stages: &[Stage::Vertex, Stage::Fragment],
         size: PUSH_CONSTANT_SIZE,
     },
     resources: &RESOURCES,
@@ -141,9 +170,18 @@ mod tests {
     }
 
     #[test]
-    fn push_constants_are_a_matrix_then_a_vec4() {
-        assert_eq!(CHUNK_ORIGIN_OFFSET, 16 * 4);
-        assert_eq!(PUSH_CONSTANT_SIZE, CHUNK_ORIGIN_OFFSET + 4 * 4);
+    fn push_constants_are_a_matrix_then_three_vec4s() {
+        assert_eq!(CHUNK_ORIGIN_OFFSET, 64);
+        assert_eq!(FOG_OFFSET, 80);
+        assert_eq!(FOG_COLOR_OFFSET, 96);
+        assert_eq!(PUSH_CONSTANT_SIZE, 112);
+    }
+
+    #[test]
+    fn both_stages_read_the_push_constants() {
+        let push = INTERFACE.push_constants;
+        assert!(push.visible_to(Stage::Vertex) && push.visible_to(Stage::Fragment));
+        assert_eq!(push.stage_names(), "vertex and fragment");
     }
 
     #[test]

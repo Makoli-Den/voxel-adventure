@@ -1,6 +1,6 @@
 # 0007. Drawing many chunk meshes
 
-Status: accepted.
+Status: accepted; the push constants were changed by decision 0015 S1 (112 bytes for the vertex and fragment stages, origins relative to the camera, fog).
 
 ## Context
 Decision 0004 drew one chunk mesh at the world origin and freed a replaced mesh after `vkDeviceWaitIdle`. A world is many chunks, each at its own place, and chunks are meshed and replaced all the time while the player moves. The renderer must draw many meshes, place each one, and swap meshes without stalling, while staying on plain Vulkan 1.0.

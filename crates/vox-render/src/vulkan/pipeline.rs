@@ -324,7 +324,7 @@ impl ShaderModule {
         // pipeline's own description in `crate::interface`, the same one its layout's
         // push-constant range, its descriptor set layout and its vertex input state are
         // built from: only the descriptor resources it lists, of their kind, in their
-        // stage; push constants only in the described stage and within the range,
+        // stage; push constants only in the described stages and within the range,
         // only the vertex attributes the pipeline feeds with their exact types, and
         // fragment inputs that the vertex stage writes. Do not widen either without
         // changing the device features or the pipeline.

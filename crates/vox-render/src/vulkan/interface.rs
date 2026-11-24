@@ -45,7 +45,13 @@ pub fn push_constant_ranges(interface: &PipelineInterface) -> [vk::PushConstantR
 /// The stage flags a `vkCmdPushConstants` for this pipeline must name: exactly those of
 /// the range.
 pub fn push_constant_stages(interface: &PipelineInterface) -> vk::ShaderStageFlags {
-    stage_flags(interface.push_constants.stage)
+    interface
+        .push_constants
+        .stages
+        .iter()
+        .fold(vk::ShaderStageFlags::empty(), |flags, &stage| {
+            flags | stage_flags(stage)
+        })
 }
 
 /// The bindings of the pipeline's descriptor set layout (set `RESOURCE_SET`), one
@@ -121,8 +127,11 @@ mod tests {
     #[test]
     fn push_constant_ranges_follow_the_interface() {
         let [chunk_range] = push_constant_ranges(&chunk::INTERFACE);
-        assert_eq!(chunk_range.stage_flags, vk::ShaderStageFlags::VERTEX);
-        assert_eq!((chunk_range.offset, chunk_range.size), (0, 80));
+        assert_eq!(
+            chunk_range.stage_flags,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
+        );
+        assert_eq!((chunk_range.offset, chunk_range.size), (0, 112));
         let [overlay_range] = push_constant_ranges(&overlay::INTERFACE);
         assert_eq!(overlay_range.stage_flags, vk::ShaderStageFlags::VERTEX);
         assert_eq!((overlay_range.offset, overlay_range.size), (0, 8));
