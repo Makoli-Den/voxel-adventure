@@ -1,118 +1,139 @@
-//! Demo terrain: rolling hills from deterministic value noise, generated per chunk.
+//! Terrain: turns the landscape (heights, water, biomes) and the trees into chunks, and
+//! tells streaming which layers of a column of chunks can hold anything to see.
 //!
-//! Everything here is integer hashing plus plain `f32` arithmetic (`+`, `-`, `*`, `/`
-//! are exactly specified by IEEE 754), with no `sin` or other libm functions, so a seed
-//! produces the same chunk on every platform. The noise is sampled at world coordinates,
-//! so chunks next to each other fit together. It is neither optimized nor measured beyond
-//! `docs/benchmarks.md`.
+//! The shape itself lives in [`crate::landscape`] and the trees in [`crate::trees`]; this
+//! module writes blocks. Everything is a pure function of the seed and the world position,
+//! so a seed produces the same chunk on every platform and chunks next to each other agree.
 
 use std::ops::RangeInclusive;
 
 use crate::block::BlockId;
 use crate::bounds::{
-    CHUNK_SIZE_I32, HIGHEST_CHUNK_LAYER, LOWEST_CHUNK_LAYER, WORLD_FLOOR_Y, chunk_layer_of,
+    CHUNK_SIZE_I32, HIGHEST_CHUNK_LAYER, LOWEST_CHUNK_LAYER, WORLD_CEILING_Y, WORLD_FLOOR_Y,
+    chunk_layer_of,
 };
 use crate::chunk::{CHUNK_SIZE, Chunk, LocalPos};
 use crate::chunk_pos::ChunkPos;
+use crate::landscape::{ColumnInfo, FILLER_DEPTH, Landscape, SAND_DEPTH, SNOW_LINE, spawn_point};
+pub use crate::landscape::{MAX_SURFACE, MIN_SURFACE, SEA_LEVEL};
+use crate::lod::solid_chunk;
+use crate::trees::{
+    TREE_MARGIN, TREE_MAX_HEIGHT, Tree, may_hold_trees, stamp, top_with_tree, trees_around,
+};
 
 /// The blocks the terrain generator places, as ids.
 ///
 /// The generator names no content: whoever owns the [`BlockRegistry`](crate::BlockRegistry)
-/// looks the four blocks up by name and passes their ids in (decision 0013).
+/// looks the blocks up by name and passes their ids in (decision 0013).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerrainBlocks {
-    /// The top block of every column.
+    /// The top block of grassy ground (plains and forests).
     pub grass: BlockId,
     /// The layer right below the grass.
     pub dirt: BlockId,
-    /// Everything below the dirt.
+    /// Everything below the filler layer, and the surface of mountains.
     pub stone: BlockId,
+    /// The surface of beaches and deserts, and of shallow sea, river and lake floors.
+    pub sand: BlockId,
+    /// The floor of the deep sea.
+    pub gravel: BlockId,
+    /// The cover of the highest peaks.
+    pub snow: BlockId,
+    /// Fills the air under the sea level, rivers and lakes.
+    pub water: BlockId,
+    /// The trunks of trees.
+    pub log: BlockId,
+    /// The crowns of trees.
+    pub leaves: BlockId,
     /// The row at [`WORLD_FLOOR_Y`] (and everything below it, which is never meshed).
     pub bedrock: BlockId,
 }
 
-/// Ids 1 to 3 as the game's registry hands out, and 4 for bedrock (a test-only choice: the
-/// game's bedrock id is later in the blocks file), for tests in this crate.
+/// Ids 1 to 9 in the order of the fields and 10 for bedrock (a test-only choice: the game's
+/// ids come from its blocks file), for tests in this crate.
 #[cfg(test)]
 pub(crate) const TEST_BLOCKS: TerrainBlocks = TerrainBlocks {
     grass: BlockId(1),
     dirt: BlockId(2),
     stone: BlockId(3),
-    bedrock: BlockId(4),
+    sand: BlockId(4),
+    gravel: BlockId(5),
+    snow: BlockId(6),
+    water: BlockId(7),
+    log: BlockId(8),
+    leaves: BlockId(9),
+    bedrock: BlockId(10),
 };
 
-/// Lowest possible surface height (the `y` of the grass block).
-pub const MIN_SURFACE: usize = 8;
-/// Highest possible surface height (the `y` of the grass block).
-pub const MAX_SURFACE: usize = 24;
+/// Highest block that is stone in every column: the lowest ground minus the filler layer
+/// minus one. A chunk whose top is at or below it is all stone, without any noise.
+const ALWAYS_STONE_Y: i32 = MIN_SURFACE - FILLER_DEPTH - 1;
 
-// The columns are filled up to `MAX_SURFACE`, so it must lie inside the chunk.
-const _: () = assert!(MAX_SURFACE < CHUNK_SIZE);
+/// Highest block that can be anything but air: the highest ground plus the tallest tree.
+/// Water never rises that high. A chunk above it is all air, without any noise.
+const HIGHEST_BLOCK_Y: i32 = MAX_SURFACE + TREE_MAX_HEIGHT;
 
-// The surface lies above the bedrock row, with room for the dirt layer, so the bedrock row
-// is always inside the stone.
-const _: () = assert!(MIN_SURFACE as i32 - DIRT_DEPTH as i32 > WORLD_FLOOR_Y);
+const _: () = assert!(HIGHEST_BLOCK_Y < WORLD_CEILING_Y);
 
-// `smooth_noise` splits coordinates with a shift and a mask, which needs power-of-two cells.
-const _: () = assert!(cells_are_powers_of_two());
+/// The blocks of the layers of one column: what is on top, what is under it, and the stone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Layers {
+    /// The block at the ground height.
+    pub surface: BlockId,
+    /// The [`FILLER_DEPTH`] blocks below the surface.
+    pub filler: BlockId,
+    /// Everything deeper.
+    pub stone: BlockId,
+}
 
-/// Number of dirt blocks between the grass and the stone.
-const DIRT_DEPTH: usize = 3;
-
-/// Cell size in blocks and weight of each noise octave.
-/// Large hills first, finer detail on top with less influence.
-const OCTAVES: [(i32, f32); 3] = [(16, 4.0), (8, 2.0), (4, 1.0)];
-
-/// Sum of the octave weights, the divisor that normalizes the noise to `0.0..=1.0`.
-/// Computed from [`OCTAVES`], so the two cannot drift apart.
-const WEIGHT_SUM: f32 = weight_sum();
-
-const fn cells_are_powers_of_two() -> bool {
-    let mut index = 0;
-    while index < OCTAVES.len() {
-        if OCTAVES[index].0.count_ones() != 1 {
-            return false;
+impl Layers {
+    /// The layers of a column: grass over dirt on grassland, sand on beaches, deserts and
+    /// shallow water, gravel on the deep sea floor, stone (snow-capped on the peaks) on
+    /// mountains.
+    pub(crate) fn of(info: &ColumnInfo, blocks: &TerrainBlocks) -> Self {
+        use crate::landscape::Biome;
+        let stone = blocks.stone;
+        let (surface, filler) = match info.biome {
+            Biome::Ocean | Biome::River | Biome::Lake => {
+                let floor = if info.ground >= SEA_LEVEL - SAND_DEPTH {
+                    blocks.sand
+                } else {
+                    blocks.gravel
+                };
+                (floor, floor)
+            }
+            Biome::Beach | Biome::Desert => (blocks.sand, blocks.sand),
+            Biome::Plains | Biome::Forest => (blocks.grass, blocks.dirt),
+            Biome::Mountains if info.ground >= SNOW_LINE => (blocks.snow, stone),
+            Biome::Mountains => (stone, stone),
+        };
+        Self {
+            surface,
+            filler,
+            stone,
         }
-        index += 1;
     }
-    true
 }
 
-const fn weight_sum() -> f32 {
-    let mut sum = 0.0;
-    let mut index = 0;
-    while index < OCTAVES.len() {
-        sum += OCTAVES[index].1;
-        index += 1;
-    }
-    sum
-}
-
-/// [`DIRT_DEPTH`] as a world height difference.
-const DIRT_DEPTH_I32: i32 = DIRT_DEPTH as i32;
-
-/// The block `depth` blocks below the surface of a column (`depth == 0` is the grass block,
+/// The block `depth` blocks below the surface of a column (`depth == 0` is the surface block,
 /// a negative depth is above it: air). This is the layer rule of [`fill_column`] for one
 /// block, for callers that classify single blocks (level-of-detail cells); a test checks
 /// that both agree.
-pub(crate) const fn block_at_depth(depth: i32, blocks: &TerrainBlocks) -> BlockId {
+pub(crate) const fn block_at_depth(depth: i32, layers: &Layers) -> BlockId {
     if depth < 0 {
         BlockId::AIR
     } else if depth == 0 {
-        blocks.grass
-    } else if depth <= DIRT_DEPTH_I32 {
-        blocks.dirt
+        layers.surface
+    } else if depth <= FILLER_DEPTH {
+        layers.filler
     } else {
-        blocks.stone
+        layers.stone
     }
 }
 
-/// Generates the chunk at the origin: rolling hills. The same `seed` always gives the same
-/// chunk. It is [`generate_chunk`] at [`ChunkPos::ORIGIN`].
-///
-/// Every column has one `blocks.grass` block at a height in
-/// [`MIN_SURFACE`]`..=`[`MAX_SURFACE`], `blocks.dirt` below it, `blocks.stone` under that and
-/// air above.
+/// A chunk with a surface in it: the chunk that holds the [`spawn_point`] of `seed`. A
+/// representative chunk for examples, benchmarks and tests; the same `seed` always gives the
+/// same chunk. It is [`generate_chunk`] there.
 ///
 /// # Example
 ///
@@ -123,34 +144,43 @@ pub(crate) const fn block_at_depth(depth: i32, blocks: &TerrainBlocks) -> BlockI
 ///     grass: BlockId(1),
 ///     dirt: BlockId(2),
 ///     stone: BlockId(3),
-///     bedrock: BlockId(4),
+///     sand: BlockId(4),
+///     gravel: BlockId(5),
+///     snow: BlockId(6),
+///     water: BlockId(7),
+///     log: BlockId(8),
+///     leaves: BlockId(9),
+///     bedrock: BlockId(10),
 /// };
 /// let chunk = generate_terrain(1, &blocks);
 /// let has_grass = LocalPos::all().any(|pos| chunk.get(pos) == blocks.grass);
 /// assert!(has_grass);
 /// ```
 pub fn generate_terrain(seed: u32, blocks: &TerrainBlocks) -> Chunk {
-    generate_chunk(seed, ChunkPos::ORIGIN, blocks)
+    let (pos, _) = ChunkPos::containing(spawn_point(seed));
+    generate_chunk(seed, pos, blocks)
 }
 
-/// Generates the terrain of the chunk at `pos`. The same `seed` and `pos` always give the
-/// same chunk.
+/// Generates the terrain of the chunk at `pos`, trees included. The same `seed` and `pos`
+/// always give the same chunk.
 ///
-/// The surface height of a column depends only on its world column `(x, z)`, never on the
-/// chunk, so neighbouring chunks agree along their borders and the hills continue across
-/// them. For a block at world height `y` and a column with surface height `h` (in
-/// [`MIN_SURFACE`]`..=`[`MAX_SURFACE`]): above `h` is air, `y == h` is `blocks.grass`, the
-/// three blocks below are `blocks.dirt`, everything deeper is `blocks.stone`.
+/// The ground height, the water and the biome of a column depend only on its world column
+/// `(x, z)`, never on the chunk, and a tree is placed from hashes around the chunk, so
+/// neighbouring chunks agree along their borders and everything continues across them. For a
+/// block at world height `y` of a column with ground height `h` and water level `w`: above
+/// `max(h, w)` is air (or a tree), above `h` up to `w` is `blocks.water`, `y == h` is the
+/// biome's surface block, the three blocks below are its filler and everything deeper is
+/// `blocks.stone`, with `blocks.bedrock` in the row at [`WORLD_FLOOR_Y`].
 ///
-/// Consequently every chunk with `pos.y >= 1` is all air (its lowest block is at height 32,
-/// above [`MAX_SURFACE`]) and every chunk between the floor layer and layer 0 is all stone
-/// (its highest block is at height -1, more than three below [`MIN_SURFACE`]), except for
-/// the row at [`WORLD_FLOOR_Y`], which is `blocks.bedrock`.
+/// Consequently every chunk above the highest mountain and tree is all air and every chunk
+/// below the lowest sea floor is all stone (bedrock in the floor row), and both are made
+/// without sampling any noise.
 ///
-/// Outside the world's layers ([`contains_chunk_layer`](crate::contains_chunk_layer)) the answer is a stand-in, so the
-/// function stays total: above the highest layer the chunk is all air, below the lowest
-/// layer it is all `blocks.bedrock`. A mesh of the lowest layer that is given a chunk of this
-/// kind below it therefore has no bottom faces. Nothing is ever stored there.
+/// Outside the world's layers ([`contains_chunk_layer`](crate::contains_chunk_layer)) the
+/// answer is a stand-in, so the function stays total: above the highest layer the chunk is
+/// all air, below the lowest layer it is all `blocks.bedrock`. A mesh of the lowest layer that
+/// is given a chunk of this kind below it therefore has no bottom faces. Nothing is ever
+/// stored there.
 ///
 /// # Example
 ///
@@ -161,37 +191,182 @@ pub fn generate_terrain(seed: u32, blocks: &TerrainBlocks) -> Chunk {
 ///     grass: BlockId(1),
 ///     dirt: BlockId(2),
 ///     stone: BlockId(3),
-///     bedrock: BlockId(4),
+///     sand: BlockId(4),
+///     gravel: BlockId(5),
+///     snow: BlockId(6),
+///     water: BlockId(7),
+///     log: BlockId(8),
+///     leaves: BlockId(9),
+///     bedrock: BlockId(10),
 /// };
-/// let chunk = generate_chunk(1, ChunkPos::new(-1, 0, 2), &blocks);
-/// assert!(LocalPos::all().any(|pos| chunk.get(pos) == blocks.grass));
+/// // Layer -1 is all stone under the whole world.
+/// let chunk = generate_chunk(1, ChunkPos::new(-1, -1, 2), &blocks);
+/// assert!(LocalPos::all().all(|pos| chunk.get(pos) == blocks.stone));
 /// ```
 pub fn generate_chunk(seed: u32, pos: ChunkPos, blocks: &TerrainBlocks) -> Chunk {
-    let mut chunk = Chunk::new();
-    if pos.y > HIGHEST_CHUNK_LAYER {
-        return chunk;
+    generate(seed, pos, blocks, true)
+}
+
+/// [`generate_chunk`] without the trees: the terrain a level-of-detail tile of level 0 shows.
+#[cfg(test)]
+pub(crate) fn generate_chunk_without_trees(
+    seed: u32,
+    pos: ChunkPos,
+    blocks: &TerrainBlocks,
+) -> Chunk {
+    generate(seed, pos, blocks, false)
+}
+
+fn generate(seed: u32, pos: ChunkPos, blocks: &TerrainBlocks, with_trees: bool) -> Chunk {
+    match shortcut(pos, blocks) {
+        Some(chunk) => chunk,
+        None => ColumnFill::new(seed, [pos.x, pos.z], blocks, with_trees).chunk(pos.y, blocks),
     }
-    let below_world = pos.y < LOWEST_CHUNK_LAYER;
-    let [origin_x, origin_y, origin_z] = pos.origin();
-    let floor_row = floor_row_in_chunk(origin_y);
-    for z in 0..CHUNK_SIZE {
-        for x in 0..CHUNK_SIZE {
-            if below_world {
-                fill_range(&mut chunk, x, z, 0..CHUNK_SIZE, blocks.bedrock);
-                continue;
-            }
-            // Saturating, like `ChunkPos::origin`: far outside the usable world the
-            // terrain degrades but nothing wraps or panics.
-            let world_x = origin_x.saturating_add(x as i32);
-            let world_z = origin_z.saturating_add(z as i32);
-            let height = surface_height(seed, world_x, world_z);
-            fill_column(&mut chunk, x, z, origin_y, height, blocks);
-            if let Some(row) = floor_row {
-                fill_range(&mut chunk, x, z, row..row + 1, blocks.bedrock);
+}
+
+/// Generates the chunks of the layers `layers` of the column of chunks `(cx, cz)`, trees
+/// included, lowest layer first: the same chunks as [`generate_chunk`] one by one, but the
+/// landscape of the column's 1,024 block columns and its trees are worked out once for all
+/// the layers, not once per layer (the streaming of a column does this for every layer of its
+/// span and its four neighbours).
+///
+/// # Example
+///
+/// ```
+/// use vox_world::{generate_chunk, generate_column, BlockId, ChunkPos, LocalPos, TerrainBlocks};
+///
+/// let blocks = TerrainBlocks {
+///     grass: BlockId(1),
+///     dirt: BlockId(2),
+///     stone: BlockId(3),
+///     sand: BlockId(4),
+///     gravel: BlockId(5),
+///     snow: BlockId(6),
+///     water: BlockId(7),
+///     log: BlockId(8),
+///     leaves: BlockId(9),
+///     bedrock: BlockId(10),
+/// };
+/// let column = generate_column(1, 2, -1, 1..=3, &blocks);
+/// let single = generate_chunk(1, ChunkPos::new(2, 2, -1), &blocks);
+/// assert!(LocalPos::all().all(|pos| column[1].get(pos) == single.get(pos)));
+/// ```
+pub fn generate_column(
+    seed: u32,
+    cx: i32,
+    cz: i32,
+    layers: RangeInclusive<i32>,
+    blocks: &TerrainBlocks,
+) -> Vec<Chunk> {
+    let mut fill: Option<ColumnFill> = None;
+    layers
+        .map(|layer| {
+            let pos = ChunkPos::new(cx, layer, cz);
+            shortcut(pos, blocks).unwrap_or_else(|| {
+                fill.get_or_insert_with(|| ColumnFill::new(seed, [cx, cz], blocks, true))
+                    .chunk(layer, blocks)
+            })
+        })
+        .collect()
+}
+
+/// The chunk at `pos` if it needs no landscape: outside the world, or all air above every
+/// mountain and tree, or all stone under every sea floor (the world floor row bedrock).
+fn shortcut(pos: ChunkPos, blocks: &TerrainBlocks) -> Option<Chunk> {
+    if pos.y > HIGHEST_CHUNK_LAYER {
+        return Some(Chunk::new());
+    }
+    if pos.y < LOWEST_CHUNK_LAYER {
+        return Some(solid_chunk(blocks.bedrock));
+    }
+    let origin_y = pos.origin()[1];
+    if origin_y > HIGHEST_BLOCK_Y {
+        return Some(Chunk::new());
+    }
+    if origin_y + CHUNK_SIZE_I32 - 1 <= ALWAYS_STONE_Y {
+        let mut chunk = solid_chunk(blocks.stone);
+        fill_floor_row(&mut chunk, floor_row_in_chunk(origin_y), blocks.bedrock);
+        return Some(chunk);
+    }
+    None
+}
+
+/// The landscape of one column of chunks, evaluated once: what every layer of it is filled from.
+struct ColumnFill {
+    /// World position of the column's lowest x and z.
+    origin: [i32; 2],
+    /// The ground, water and layer blocks of the 32 x 32 block columns, `z` rows of `x`.
+    columns: Vec<(ColumnInfo, Layers)>,
+    /// The trees that reach the column, found when the first layer that can hold one is made.
+    trees: Option<Vec<Tree>>,
+    landscape: Landscape,
+    seed: u32,
+    with_trees: bool,
+}
+
+impl ColumnFill {
+    fn new(seed: u32, column: [i32; 2], blocks: &TerrainBlocks, with_trees: bool) -> Self {
+        let origin = column.map(|c| c.saturating_mul(CHUNK_SIZE_I32));
+        // The trees of neighbouring columns reach into this one, so the lakes (which decide
+        // where trees may stand) are needed a margin further out.
+        let margin = if with_trees { TREE_MARGIN } else { 0 };
+        // Saturating, like `ChunkPos::origin`: far outside the usable world the terrain
+        // degrades but nothing wraps or panics.
+        let last = CHUNK_SIZE_I32 - 1;
+        let landscape = Landscape::for_area(
+            seed,
+            origin.map(|o| o.saturating_sub(margin)),
+            origin.map(|o| o.saturating_add(last + margin)),
+        );
+        // HOT PATH: one column evaluation per block column, 1,024 per column of chunks, shared
+        // by every layer of it.
+        let mut columns = Vec::with_capacity(CHUNK_SIZE * CHUNK_SIZE);
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let info = landscape.column(
+                    origin[0].saturating_add(x as i32),
+                    origin[1].saturating_add(z as i32),
+                );
+                columns.push((info, Layers::of(&info, blocks)));
             }
         }
+        Self {
+            origin,
+            columns,
+            trees: None,
+            landscape,
+            seed,
+            with_trees,
+        }
     }
-    chunk
+
+    /// The chunk of layer `layer`. Layers outside the world are never asked for (the shortcuts
+    /// answer them).
+    fn chunk(&mut self, layer: i32, blocks: &TerrainBlocks) -> Chunk {
+        let mut chunk = Chunk::new();
+        let origin_y = layer.saturating_mul(CHUNK_SIZE_I32);
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let (info, layers) = &self.columns[z * CHUNK_SIZE + x];
+                fill_column(&mut chunk, x, z, origin_y, info, layers, blocks.water);
+            }
+        }
+        fill_floor_row(&mut chunk, floor_row_in_chunk(origin_y), blocks.bedrock);
+        if self.with_trees && may_hold_trees(origin_y) {
+            let (landscape, seed, origin) = (&self.landscape, self.seed, self.origin);
+            let trees = self
+                .trees
+                .get_or_insert_with(|| trees_around(landscape, seed, origin));
+            stamp(
+                &mut chunk,
+                trees,
+                [origin[0], origin_y, origin[1]],
+                blocks.log,
+                blocks.leaves,
+            );
+        }
+        chunk
+    }
 }
 
 /// The height inside a chunk whose lowest block is at `base_y` of the row at
@@ -203,92 +378,129 @@ fn floor_row_in_chunk(base_y: i32) -> Option<usize> {
         .then(|| clamp_to_chunk(row))
 }
 
+/// Fills the row `row` of every column with `bedrock`, if the chunk holds the world floor.
+fn fill_floor_row(chunk: &mut Chunk, row: Option<usize>, bedrock: BlockId) {
+    if let Some(row) = row {
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                fill_range(chunk, x, z, row..row + 1, bedrock);
+            }
+        }
+    }
+}
+
 /// How far past the 32 x 32 columns of a chunk column [`column_span`] looks for the lowest
 /// height: one block, because a side face is exposed by the neighbour next to it.
 const SPAN_BORDER: i32 = 1;
 
 /// The chunk layers (chunk `y` coordinates, inclusive) of the column of chunks `(cx, cz)` that
-/// can hold a visible face. Every layer below the range is all solid and every layer above it
-/// is all air, so they have no faces and need not be generated, stored or meshed.
+/// can hold a visible face. Every layer below the range is all non-air (stone, ground and
+/// water) and every layer above it is all air, so they have no faces and need not be
+/// generated, stored or meshed.
 ///
-/// With `lowest` the lowest surface height among the column's 32 x 32 blocks and the
-/// [`SPAN_BORDER`] ring around them, and `highest` the highest of the 32 x 32 blocks: a top
-/// face sits at a block column's own height, and a side face lies above the lower of two
-/// neighbouring heights, so every face is in `lowest..=highest`. The range is the layers of
-/// those two heights, clamped to the world ([`contains_chunk_layer`](crate::contains_chunk_layer)). It is derived from
-/// the generator's own heights, so it stays right when [`MIN_SURFACE`] or [`MAX_SURFACE`]
-/// change; it is only valid while terrain is a heightmap (no caves or overhangs).
+/// With `lowest` the lowest top (ground or water surface) among the column's 32 x 32 blocks and
+/// the [`SPAN_BORDER`] ring around them, and `highest` the highest top of the 32 x 32 blocks, or
+/// the top of a tree that can stand in the 32 x 32 columns widened by the tree margin: a top
+/// face sits at a block column's own top, and a side face lies above the lower of two
+/// neighbouring tops, so every face is in `lowest..=highest`. The range is the layers of those
+/// two heights, clamped to the world ([`contains_chunk_layer`](crate::contains_chunk_layer)).
+/// It is derived from the generator's own columns, so it stays right when the landscape
+/// changes; it is only valid while terrain is a heightmap (no caves or overhangs). The tree
+/// part is a bound, not the trees themselves: wherever a tree may stand (grass) it assumes
+/// the tallest one, so a layer may be included although the hash placed no tree in it.
 ///
-/// Costs one noise sample per block column of the 34 x 34 area, about one chunk generation.
+/// Costs one column evaluation per block column of the 36 x 36 area, about one chunk generation.
 ///
 /// # Example
 ///
 /// ```
 /// use vox_world::column_span;
 ///
-/// // Today the surface lies inside layer 0 everywhere.
-/// assert_eq!(column_span(1, 5, -3), 0..=0);
+/// let span = column_span(1, 5, -3);
+/// assert!(span.start() <= span.end());
 /// ```
 pub fn column_span(seed: u32, cx: i32, cz: i32) -> RangeInclusive<i32> {
-    column_span_with(|x, z| surface_height(seed, x, z), cx, cz)
+    let origin_x = cx.saturating_mul(CHUNK_SIZE_I32);
+    let origin_z = cz.saturating_mul(CHUNK_SIZE_I32);
+    let last = CHUNK_SIZE_I32 - 1;
+    let landscape = Landscape::for_area(
+        seed,
+        [
+            origin_x.saturating_sub(TREE_MARGIN),
+            origin_z.saturating_sub(TREE_MARGIN),
+        ],
+        [
+            origin_x.saturating_add(last + TREE_MARGIN),
+            origin_z.saturating_add(last + TREE_MARGIN),
+        ],
+    );
+    column_span_with(|x, z| landscape.column(x, z), cx, cz)
 }
 
-/// [`column_span`] for any heightmap `height(x, z)` (world block columns), so the scan can be
+/// [`column_span`] for any columns `column(x, z)` (world block columns), so the scan can be
 /// tested with a surface that has a pit or a peak exactly where it matters.
-fn column_span_with(height: impl Fn(i32, i32) -> i32, cx: i32, cz: i32) -> RangeInclusive<i32> {
+fn column_span_with(
+    column: impl Fn(i32, i32) -> ColumnInfo,
+    cx: i32,
+    cz: i32,
+) -> RangeInclusive<i32> {
     let origin_x = cx.saturating_mul(CHUNK_SIZE_I32);
     let origin_z = cz.saturating_mul(CHUNK_SIZE_I32);
     let inner = 0..CHUNK_SIZE_I32;
+    let ring = -SPAN_BORDER..CHUNK_SIZE_I32 + SPAN_BORDER;
     let mut lowest = i32::MAX;
     let mut highest = i32::MIN;
-    for dz in -SPAN_BORDER..CHUNK_SIZE_I32 + SPAN_BORDER {
-        for dx in -SPAN_BORDER..CHUNK_SIZE_I32 + SPAN_BORDER {
-            let sample = height(origin_x.saturating_add(dx), origin_z.saturating_add(dz));
-            lowest = lowest.min(sample);
+    for dz in -TREE_MARGIN..CHUNK_SIZE_I32 + TREE_MARGIN {
+        for dx in -TREE_MARGIN..CHUNK_SIZE_I32 + TREE_MARGIN {
+            let info = column(origin_x.saturating_add(dx), origin_z.saturating_add(dz));
+            if ring.contains(&dx) && ring.contains(&dz) {
+                lowest = lowest.min(info.top());
+            }
             if inner.contains(&dx) && inner.contains(&dz) {
-                highest = highest.max(sample);
+                highest = highest.max(top_with_tree(&info));
+            } else if info.biome.has_trees() {
+                // Outside the column only a tree's leaves can reach in.
+                highest = highest.max(top_with_tree(&info));
             }
         }
     }
     span_of(lowest, highest)
 }
 
-/// The chunk layers of the surface heights `lowest..=highest`, clamped to the world.
+/// The chunk layers of the heights `lowest..=highest`, clamped to the world.
 fn span_of(lowest: i32, highest: i32) -> RangeInclusive<i32> {
     let layer = |height: i32| chunk_layer_of(height).clamp(LOWEST_CHUNK_LAYER, HIGHEST_CHUNK_LAYER);
     layer(lowest)..=layer(highest)
 }
 
-/// World height of the grass block in the world column `(x, z)`, always in
-/// `MIN_SURFACE..=MAX_SURFACE`.
-pub(crate) fn surface_height(seed: u32, x: i32, z: i32) -> i32 {
-    let span = (MAX_SURFACE - MIN_SURFACE) as f32;
-    // Adding 0.5 and truncating rounds to nearest for non-negative values.
-    let offset = (octave_sum(seed, x, z) * span + 0.5) as i32;
-    (MIN_SURFACE as i32 + offset).min(MAX_SURFACE as i32)
-}
-
 /// Writes one column of a chunk whose lowest block is at world height `base_y`.
 ///
 /// The layer boundaries are worked out once, as heights inside the chunk, and each layer
-/// is then filled by a plain loop: stone below `stone_end`, dirt up to `dirt_end`, one grass
-/// block, and air above, which is left as it is. The boundaries are clamped to the chunk,
-/// so a chunk that holds only part of the column (or none of it) gets an empty range.
+/// is then filled by a plain loop: stone below `stone_end`, filler up to `filler_end`, one
+/// surface block, water up to the water level, and air above, which is left as it is. The
+/// boundaries are clamped to the chunk, so a chunk that holds only part of the column (or
+/// none of it) gets an empty range.
 fn fill_column(
     chunk: &mut Chunk,
     x: usize,
     z: usize,
     base_y: i32,
-    height: i32,
-    blocks: &TerrainBlocks,
+    info: &ColumnInfo,
+    layers: &Layers,
+    water: BlockId,
 ) {
-    let grass = height.saturating_sub(base_y);
-    let stone_end = clamp_to_chunk(grass.saturating_sub(DIRT_DEPTH_I32));
-    let dirt_end = clamp_to_chunk(grass);
-    fill_range(chunk, x, z, 0..stone_end, blocks.stone);
-    fill_range(chunk, x, z, stone_end..dirt_end, blocks.dirt);
-    if (0..CHUNK_SIZE_I32).contains(&grass) {
-        fill_range(chunk, x, z, dirt_end..dirt_end + 1, blocks.grass);
+    let surface = info.ground.saturating_sub(base_y);
+    let stone_end = clamp_to_chunk(surface.saturating_sub(FILLER_DEPTH));
+    let filler_end = clamp_to_chunk(surface);
+    fill_range(chunk, x, z, 0..stone_end, layers.stone);
+    fill_range(chunk, x, z, stone_end..filler_end, layers.filler);
+    if (0..CHUNK_SIZE_I32).contains(&surface) {
+        fill_range(chunk, x, z, filler_end..filler_end + 1, layers.surface);
+    }
+    if info.has_water() {
+        let water_start = clamp_to_chunk(surface.saturating_add(1));
+        let water_end = clamp_to_chunk(info.water_level.saturating_sub(base_y).saturating_add(1));
+        fill_range(chunk, x, z, water_start..water_end, water);
     }
 }
 
@@ -315,107 +527,22 @@ fn fill_range(
     }
 }
 
-/// Weighted sum of noise octaves, normalized to `0.0..=1.0`.
-fn octave_sum(seed: u32, x: i32, z: i32) -> f32 {
-    let mut sum = 0.0;
-    for (index, (cell, weight)) in OCTAVES.iter().enumerate() {
-        // Each octave gets its own hash stream so the layers do not line up. The index
-        // goes through `mix` first, so octave 1 of one seed is not octave 0 of the next.
-        let octave_seed = mix(seed ^ mix(index as u32));
-        sum += weight * smooth_noise(octave_seed, x, z, *cell);
-    }
-    (sum / WEIGHT_SUM).clamp(0.0, 1.0)
-}
-
-/// Value noise: lattice values every `cell` blocks, blended with smoothstep.
-///
-/// Coordinates may be negative: floor division puts the lattice cell and the position
-/// inside it on the right side of zero, so the noise is continuous across the origin.
-/// Cell sizes are powers of two, where the arithmetic shift is the floor division and the
-/// mask is the euclidean remainder (a test checks both against `div_euclid` and
-/// `rem_euclid`); the shift and mask are about 30 percent cheaper than a signed division
-/// per chunk, measured. The
-/// lattice hash takes the cell as `u32` by two's complement, which leaves the values for
-/// non-negative coordinates exactly as they were before negative ones were supported.
-fn smooth_noise(seed: u32, x: i32, z: i32, cell: i32) -> f32 {
-    let shift = cell.trailing_zeros();
-    let (lx, lz) = ((x >> shift) as u32, (z >> shift) as u32);
-    // Integer remainders divided by the cell size are exact in f32 for these small values.
-    let tx = smoothstep((x & (cell - 1)) as f32 / cell as f32);
-    let tz = smoothstep((z & (cell - 1)) as f32 / cell as f32);
-    let near = lerp(
-        lattice_value(seed, lx, lz),
-        lattice_value(seed, lx.wrapping_add(1), lz),
-        tx,
-    );
-    let far = lerp(
-        lattice_value(seed, lx, lz.wrapping_add(1)),
-        lattice_value(seed, lx.wrapping_add(1), lz.wrapping_add(1)),
-        tx,
-    );
-    lerp(near, far, tz)
-}
-
-/// Number of hash bits that become the noise value. 24 is the width of the `f32`
-/// mantissa, so every such integer converts to `f32` exactly.
-const LATTICE_BITS: u32 = 24;
-
-/// `2^LATTICE_BITS` as `f32`: dividing a [`LATTICE_BITS`]-bit integer by it gives
-/// `0.0..1.0`. A power of two, so the division is exact too.
-const LATTICE_SCALE: f32 = (1_u32 << LATTICE_BITS) as f32;
-
-/// The 32-bit golden-ratio multiplier (`2^32 / phi`, Knuth's multiplicative hashing). It
-/// spreads the x coordinate over all bits before it is combined with z and the seed.
-const GOLDEN_RATIO_32: u32 = 0x9E37_79B1;
-
-/// Pseudo-random value in `0.0..1.0` for a lattice point.
-fn lattice_value(seed: u32, x: u32, z: u32) -> f32 {
-    let hash = mix(x.wrapping_mul(GOLDEN_RATIO_32) ^ mix(z ^ mix(seed)));
-    // Keep the top bits: they are the best mixed ones.
-    (hash >> (u32::BITS - LATTICE_BITS)) as f32 / LATTICE_SCALE
-}
-
-/// Shifts and multipliers of the `lowbias32` mix, in the order of [`mix`]. They are the
-/// constants found by Chris Wellons' search for a 32-bit hash with good avalanche
-/// (<https://nullprogram.com/blog/2018/07/31/>); other values would hash worse.
-/// The three right shifts of the mix.
-const MIX_SHIFTS: [u32; 3] = [16, 15, 16];
-/// The two multipliers of the mix.
-const MIX_MULTIPLIERS: [u32; 2] = [0x7FEB_352D, 0x846C_A68B];
-
-/// The `lowbias32` integer mix by Chris Wellons: a cheap 32-bit hash with good avalanche.
-fn mix(mut value: u32) -> u32 {
-    value ^= value >> MIX_SHIFTS[0];
-    value = value.wrapping_mul(MIX_MULTIPLIERS[0]);
-    value ^= value >> MIX_SHIFTS[1];
-    value = value.wrapping_mul(MIX_MULTIPLIERS[1]);
-    value ^ (value >> MIX_SHIFTS[2])
-}
-
-/// Smooth ease curve for `t` in `0.0..=1.0`: zero slope at both ends.
-fn smoothstep(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Linear interpolation from `a` to `b`.
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bounds::{HIGHEST_CHUNK_LAYER, LOWEST_CHUNK_LAYER};
+    use crate::landscape::Biome;
     use crate::mesh::{Face, build_mesh};
     use crate::world::Neighbours;
 
     const BEDROCK: BlockId = TEST_BLOCKS.bedrock;
-    const GRASS: BlockId = TEST_BLOCKS.grass;
-    const DIRT: BlockId = TEST_BLOCKS.dirt;
     const STONE: BlockId = TEST_BLOCKS.stone;
+    const WATER: BlockId = TEST_BLOCKS.water;
+    const LOG: BlockId = TEST_BLOCKS.log;
+    const LEAVES: BlockId = TEST_BLOCKS.leaves;
 
-    // The tests always use `TEST_BLOCKS` (ids 1 to 4, see there), so these
-    // shadow the public functions with the blocks filled in.
+    // The tests always use `TEST_BLOCKS` (see there), so these shadow the public functions
+    // with the blocks filled in.
     fn generate_terrain(seed: u32) -> Chunk {
         super::generate_terrain(seed, &TEST_BLOCKS)
     }
@@ -424,37 +551,135 @@ mod tests {
         super::generate_chunk(seed, pos, &TEST_BLOCKS)
     }
 
-    fn block_at(chunk: &Chunk, x: usize, y: usize, z: usize) -> BlockId {
-        LocalPos::new(x, y, z).map_or(BlockId::AIR, |pos| chunk.get(pos))
-    }
-
-    /// Surface height of a column read back from the chunk: the grass block's `y`.
-    fn grass_heights(chunk: &Chunk, x: usize, z: usize) -> Vec<usize> {
-        (0..CHUNK_SIZE)
-            .filter(|&y| block_at(chunk, x, y, z) == GRASS)
-            .collect()
+    fn without_trees(seed: u32, pos: ChunkPos) -> Chunk {
+        generate_chunk_without_trees(seed, pos, &TEST_BLOCKS)
     }
 
     fn same_blocks(a: &Chunk, b: &Chunk) -> bool {
         LocalPos::all().all(|pos| a.get(pos) == b.get(pos))
     }
 
-    #[test]
-    fn block_at_depth_agrees_with_fill_column() {
-        for height in [-70, -3, 0, 5, 9, 31, 32, 40] {
-            for base_y in [-64, -32, 0, 32] {
-                let mut chunk = Chunk::new();
-                fill_column(&mut chunk, 0, 0, base_y, height, &TEST_BLOCKS);
+    /// The chunk position of the spawn point of `seed`: a chunk with a surface, with grass.
+    fn spawn_chunk(seed: u32) -> ChunkPos {
+        ChunkPos::containing(spawn_point(seed)).0
+    }
+
+    /// The column info of a world column, computed on its own.
+    fn info_at(seed: u32, x: i32, z: i32) -> ColumnInfo {
+        Landscape::for_area(seed, [x, z], [x, z]).column(x, z)
+    }
+
+    /// The block the layer rule gives at world height `y` of a column, written out by hand
+    /// from the module's documentation (no shared helper but `Layers::of`).
+    fn expected_block(info: &ColumnInfo, y: i32) -> BlockId {
+        let layers = Layers::of(info, &TEST_BLOCKS);
+        if y == WORLD_FLOOR_Y {
+            BEDROCK
+        } else if y > info.top() {
+            BlockId::AIR
+        } else if y > info.ground {
+            WATER
+        } else if y == info.ground {
+            layers.surface
+        } else if y >= info.ground - FILLER_DEPTH {
+            layers.filler
+        } else {
+            STONE
+        }
+    }
+
+    /// Every block of the tree-less chunk `pos` against the rule, with literal world
+    /// coordinates (32 blocks per chunk).
+    fn assert_chunk_follows_the_rule(seed: u32, pos: ChunkPos) {
+        let chunk = without_trees(seed, pos);
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let info = info_at(seed, pos.x * 32 + x as i32, pos.z * 32 + z as i32);
                 for y in 0..CHUNK_SIZE {
-                    let world_y = base_y + y as i32;
+                    let world_y = pos.y * 32 + y as i32;
+                    let block = LocalPos::new(x, y, z).map(|p| chunk.get(p)).unwrap();
                     assert_eq!(
-                        block_at(&chunk, 0, y, 0),
-                        block_at_depth(height - world_y, &TEST_BLOCKS),
-                        "height {height}, y {world_y}"
+                        block,
+                        expected_block(&info, world_y),
+                        "seed {seed} chunk {pos:?} block ({x}, {y}, {z}) of {info:?}"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn block_at_depth_agrees_with_fill_column() {
+        let info = |ground: i32, water_level: i32| ColumnInfo {
+            ground,
+            water_level,
+            biome: Biome::Plains,
+        };
+        for ground in [-70, -3, 0, 5, 9, 31, 32, 40] {
+            for base_y in [-64, -32, 0, 32] {
+                let mut chunk = Chunk::new();
+                let info = info(ground, ground);
+                let layers = Layers::of(&info, &TEST_BLOCKS);
+                fill_column(&mut chunk, 0, 0, base_y, &info, &layers, WATER);
+                for y in 0..CHUNK_SIZE {
+                    let world_y = base_y + y as i32;
+                    assert_eq!(
+                        LocalPos::new(0, y, 0).map(|p| chunk.get(p)).unwrap(),
+                        block_at_depth(ground - world_y, &layers),
+                        "ground {ground}, y {world_y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn water_fills_from_the_ground_up_to_the_water_level_only() {
+        let info = ColumnInfo {
+            ground: 61,
+            water_level: SEA_LEVEL,
+            biome: Biome::River,
+        };
+        let layers = Layers::of(&info, &TEST_BLOCKS);
+        let mut chunk = Chunk::new();
+        fill_column(&mut chunk, 3, 4, 48, &info, &layers, WATER);
+        let at = |y: i32| chunk.get(LocalPos::new(3, (y - 48) as usize, 4).unwrap());
+        assert_eq!(at(61), TEST_BLOCKS.sand);
+        assert_eq!(at(62), WATER);
+        assert_eq!(at(64), WATER);
+        assert_eq!(at(65), BlockId::AIR);
+        assert_eq!(at(60), TEST_BLOCKS.sand);
+        assert_eq!(at(57), STONE);
+    }
+
+    #[test]
+    fn the_surface_blocks_follow_the_biome() {
+        let layers = |biome, ground| {
+            let info = ColumnInfo {
+                ground,
+                water_level: SEA_LEVEL.max(ground),
+                biome,
+            };
+            Layers::of(&info, &TEST_BLOCKS)
+        };
+        assert_eq!(layers(Biome::Plains, 70).surface, TEST_BLOCKS.grass);
+        assert_eq!(layers(Biome::Forest, 70).filler, TEST_BLOCKS.dirt);
+        assert_eq!(layers(Biome::Desert, 70).surface, TEST_BLOCKS.sand);
+        assert_eq!(layers(Biome::Beach, 65).filler, TEST_BLOCKS.sand);
+        assert_eq!(layers(Biome::Mountains, 100).surface, STONE);
+        assert_eq!(
+            layers(Biome::Mountains, SNOW_LINE).surface,
+            TEST_BLOCKS.snow
+        );
+        assert_eq!(layers(Biome::Mountains, SNOW_LINE).filler, STONE);
+        assert_eq!(
+            layers(Biome::Ocean, SEA_LEVEL - 5).surface,
+            TEST_BLOCKS.sand
+        );
+        assert_eq!(
+            layers(Biome::Ocean, SEA_LEVEL - SAND_DEPTH - 1).surface,
+            TEST_BLOCKS.gravel
+        );
     }
 
     #[test]
@@ -468,61 +693,165 @@ mod tests {
     }
 
     #[test]
-    fn every_column_is_grass_over_dirt_over_stone_under_air() {
+    fn the_terrain_chunk_follows_the_layer_rule_everywhere() {
+        // Surface chunks around the spawn (grass, trees' ground) and a far one, in every
+        // layer that holds land, for several seeds; negative coordinates included.
         for seed in [1, 2, 99] {
-            let chunk = generate_terrain(seed);
-            for z in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
-                    let grass = grass_heights(&chunk, x, z);
-                    assert_eq!(grass.len(), 1, "column ({x}, {z}) of seed {seed}");
-                    assert_column_layers(&chunk, x, z, grass[0]);
+            let spawn = spawn_chunk(seed);
+            for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+                for layer in 0..=6 {
+                    assert_chunk_follows_the_rule(
+                        seed,
+                        ChunkPos::new(spawn.x + dx, layer, spawn.z + dz),
+                    );
                 }
             }
         }
-    }
-
-    fn assert_column_layers(chunk: &Chunk, x: usize, z: usize, top: usize) {
-        for y in 0..CHUNK_SIZE {
-            let expected = if y > top {
-                BlockId::AIR
-            } else if y == top {
-                GRASS
-            } else if y + DIRT_DEPTH >= top {
-                DIRT
-            } else {
-                STONE
-            };
-            assert_eq!(block_at(chunk, x, y, z), expected, "at ({x}, {y}, {z})");
+        for pos in [
+            ChunkPos::new(-5, 2, 3),
+            ChunkPos::new(2, 2, -7),
+            ChunkPos::new(-1, 1, -1),
+            ChunkPos::new(40, 3, -40),
+        ] {
+            assert_chunk_follows_the_rule(1, pos);
         }
     }
 
     #[test]
-    fn surface_height_stays_in_stated_range() {
-        for seed in 0..20 {
-            let chunk = generate_terrain(seed);
-            for z in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
-                    let top = grass_heights(&chunk, x, z)[0];
-                    assert!((MIN_SURFACE..=MAX_SURFACE).contains(&top));
+    fn a_wide_world_has_trees_and_water_in_its_chunks() {
+        let mut counts = [0_usize; 2];
+        for z in -12..12 {
+            for x in -12..12 {
+                for layer in 0..=3 {
+                    let chunk = generate_chunk(1, ChunkPos::new(x, layer, z));
+                    for pos in LocalPos::all() {
+                        match chunk.get(pos) {
+                            LOG => counts[0] += 1,
+                            WATER => counts[1] += 1,
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
+        assert!(counts.iter().all(|&c| c > 0), "logs, water: {counts:?}");
     }
 
     #[test]
-    fn terrain_is_not_flat() {
-        let chunk = generate_terrain(1);
-        let mut heights: Vec<usize> = (0..CHUNK_SIZE)
-            .flat_map(|z| (0..CHUNK_SIZE).map(move |x| (x, z)))
-            .map(|(x, z)| grass_heights(&chunk, x, z)[0])
-            .collect();
-        heights.sort_unstable();
-        heights.dedup();
-        assert!(
-            heights.len() >= 3,
-            "only {} distinct heights",
-            heights.len()
-        );
+    fn mountain_peaks_are_capped_with_snow() {
+        // Finds the highest ground of a wide scan and generates the chunks around it.
+        let (mut best, mut at) = (0, (0, 0));
+        for z in (-4000..4000).step_by(16) {
+            for x in (-4000..4000).step_by(16) {
+                let ground = info_at(1, x, z).ground;
+                if ground > best {
+                    (best, at) = (ground, (x, z));
+                }
+            }
+        }
+        assert!(best >= SNOW_LINE, "highest ground {best}");
+        let (pos, _) = ChunkPos::containing([at.0, best, at.1]);
+        let chunk = generate_chunk(1, pos);
+        assert!(LocalPos::all().any(|p| chunk.get(p) == TEST_BLOCKS.snow));
+    }
+
+    #[test]
+    fn trees_only_add_logs_and_leaves_in_air() {
+        // The chunk with trees differs from the tree-less one only in cells that were air
+        // and became log or leaves; some chunks have trees.
+        let mut with_trees = 0;
+        for seed in [1, 2, 3] {
+            let spawn = spawn_chunk(seed);
+            for (dx, dz) in [(0, 0), (1, 1), (-2, 0), (0, 3)] {
+                let pos = ChunkPos::new(spawn.x + dx, spawn.y, spawn.z + dz);
+                let (plain, full) = (without_trees(seed, pos), generate_chunk(seed, pos));
+                for p in LocalPos::all() {
+                    if plain.get(p) != full.get(p) {
+                        assert!(plain.get(p).is_air(), "{pos:?} {p:?}");
+                        assert!(matches!(full.get(p), LOG | LEAVES));
+                        with_trees += 1;
+                    }
+                }
+            }
+        }
+        assert!(with_trees > 0);
+    }
+
+    #[test]
+    fn trees_straddle_chunk_borders_and_both_chunks_draw_them() {
+        // Leaves on both sides of a border at the same height and row: a tree that
+        // crosses a border is drawn by both chunks, each from the hash alone.
+        let spawn = spawn_chunk(1);
+        let mut pairs = 0;
+        for dz in -2..2 {
+            for dx in -10..10 {
+                let a = generate_chunk(1, ChunkPos::new(spawn.x + dx, spawn.y, spawn.z + dz));
+                let b = generate_chunk(1, ChunkPos::new(spawn.x + dx + 1, spawn.y, spawn.z + dz));
+                for z in 0..CHUNK_SIZE {
+                    for y in 0..CHUNK_SIZE {
+                        let last = LocalPos::new(CHUNK_SIZE - 1, y, z).unwrap();
+                        let first = LocalPos::new(0, y, z).unwrap();
+                        if a.get(last) == LEAVES && b.get(first) == LEAVES {
+                            pairs += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(pairs > 0, "no tree crosses a border near the spawn");
+    }
+
+    #[test]
+    fn every_chunk_is_generated_independently_of_its_neighbours() {
+        // The generator has no state: asking for a chunk twice, in any order, gives the same
+        // blocks, trees included.
+        let spawn = spawn_chunk(3);
+        let first = generate_chunk(3, spawn);
+        let _other = generate_chunk(3, ChunkPos::new(spawn.x + 1, spawn.y, spawn.z));
+        assert!(same_blocks(&first, &generate_chunk(3, spawn)));
+    }
+
+    /// A tree's top in this chunk: the highest log and its leaves are in the chunk, and
+    /// leaves surround the top log (the crown), for the trees that are whole inside it.
+    #[test]
+    fn a_tree_has_four_to_seven_logs_under_a_crown_of_leaves() {
+        let pos = ChunkPos::new(spawn_chunk(1).x, spawn_chunk(1).y, spawn_chunk(1).z);
+        let chunk = generate_chunk(1, pos);
+        let mut found = false;
+        for z in 3..CHUNK_SIZE - 3 {
+            for x in 3..CHUNK_SIZE - 3 {
+                // The lowest log of a column stands on the ground; count the logs above it.
+                let column: Vec<BlockId> = (0..CHUNK_SIZE)
+                    .map(|y| chunk.get(LocalPos::new(x, y, z).unwrap()))
+                    .collect();
+                let Some(first) = column.iter().position(|&b| b == LOG) else {
+                    continue;
+                };
+                let logs = column[first..].iter().take_while(|&&b| b == LOG).count();
+                let top = first + logs - 1;
+                if top + 3 >= CHUNK_SIZE {
+                    continue;
+                }
+                found = true;
+                assert!((4..=7).contains(&logs), "{logs} logs at ({x}, {z})");
+                assert_ne!(column[first - 1], BlockId::AIR);
+                let crown = |dx: i32, dy: i32, dz: i32| {
+                    chunk.get(
+                        LocalPos::new(
+                            (x as i32 + dx) as usize,
+                            (top as i32 + dy) as usize,
+                            (z as i32 + dz) as usize,
+                        )
+                        .unwrap(),
+                    )
+                };
+                assert_eq!(crown(1, 0, 0), LEAVES);
+                assert_eq!(crown(0, 1, 0), LEAVES);
+                assert_eq!(crown(0, 2, 0), LEAVES);
+                assert_eq!(crown(-2, 0, 0), LEAVES);
+            }
+        }
+        assert!(found, "no whole tree in the spawn chunk");
     }
 
     /// FNV-1a over every block and its position in storage order. Unlike a plain sum
@@ -547,19 +876,29 @@ mod tests {
     #[test]
     fn terrain_matches_pinned_fingerprints() {
         // Pins the exact output of the algorithm for two seeds. If you change the noise,
-        // the hash or the layers on purpose, recompute these numbers (the failure prints them).
-        assert_eq!(
-            fingerprint(&generate_terrain(1)),
-            14_581_174_898_471_107_366
-        );
+        // the hash, the layers or the trees on purpose, recompute these numbers (the failure
+        // prints them).
+        assert_eq!(fingerprint(&generate_terrain(1)), 7_196_292_810_354_471_196);
         assert_eq!(
             fingerprint(&generate_terrain(2)),
-            13_175_094_009_649_080_753
+            11_889_291_948_083_898_712
+        );
+    }
+
+    #[test]
+    fn far_chunk_matches_pinned_fingerprint() {
+        // A surface chunk with negative Z, so a change of the floor division or of the way
+        // the lattice hash takes negative cells shows up. Recompute on purpose only.
+        assert_eq!(
+            fingerprint(&generate_chunk(1, ChunkPos::new(1, 2, -1))),
+            10_230_870_403_014_947_642
         );
     }
 
     /// Quads of the greedy mesh of `generate_terrain(1)`.
-    const GREEDY_QUADS: usize = 760;
+    const GREEDY_QUADS: usize = 730;
+    /// Quads of the naive mesh (one per visible face) of `generate_terrain(1)`.
+    const NAIVE_QUADS: usize = 3280;
 
     #[test]
     fn terrain_mesh_has_the_pinned_number_of_quads() {
@@ -572,176 +911,93 @@ mod tests {
             &crate::Neighbours::none(),
             &crate::mesh::identity_textures(),
         );
-        assert_eq!(naive.quad_count(), 4848);
+        assert_eq!(naive.quad_count(), NAIVE_QUADS);
         assert_eq!(
             build_mesh(&chunk, &crate::mesh::identity_textures()).quad_count(),
             GREEDY_QUADS
         );
     }
 
-    /// The most the surface height can change between two adjacent columns. The noise has
-    /// three octaves with weights 4, 2, 1 (sum 7) and cells 16, 8, 4. Value noise with a
-    /// smoothstep blend changes by at most 1.5 times the lattice range (1.0) per cell, so
-    /// per block an octave moves the normalized sum by `weight / 7 * 1.5 / cell`, which is
-    /// 0.0536 for each of the three octaves, 0.161 in total. Times the height span 16 that
-    /// is 2.57 blocks, and rounding to whole blocks adds less than 1 (the clamp only
-    /// shrinks differences): below 3.57, so at most 3.
-    const MAX_STEP: i32 = 3;
-
-    fn chunk_at(seed: u32, x: i32, y: i32, z: i32) -> Chunk {
-        generate_chunk(seed, ChunkPos::new(x, y, z))
-    }
-
-    /// World height of the grass of a column of the chunk at `pos`, read back from the blocks.
-    fn world_grass(chunk: &Chunk, pos: ChunkPos, x: usize, z: usize) -> i32 {
-        let heights = grass_heights(chunk, x, z);
-        assert_eq!(heights.len(), 1, "column ({x}, {z}) of chunk {pos:?}");
-        pos.origin()[1] + heights[0] as i32
-    }
-
-    fn assert_close(a: i32, b: i32, what: &str) {
-        assert!((a - b).abs() <= MAX_STEP, "{what}: heights {a} and {b}");
-    }
-
     #[test]
-    fn origin_chunk_equals_generate_terrain() {
+    fn origin_of_terrain_is_the_chunk_of_the_spawn_point() {
         for seed in [0, 1, 2, 99, u32::MAX] {
             assert!(same_blocks(
-                &generate_chunk(seed, ChunkPos::ORIGIN),
-                &generate_terrain(seed)
+                &generate_terrain(seed),
+                &generate_chunk(seed, spawn_chunk(seed))
             ));
-        }
-    }
-
-    /// Checks that the columns on the shared border of `first` and `second` (where
-    /// `second` lies one chunk further along `face`) are at most `MAX_STEP` apart.
-    fn assert_seam(seed: u32, first: ChunkPos, face: Face) {
-        let second = first.neighbour(face);
-        let (a, b) = (generate_chunk(seed, first), generate_chunk(seed, second));
-        let last = CHUNK_SIZE - 1;
-        for i in 0..CHUNK_SIZE {
-            let ((ax, az), (bx, bz)) = match face {
-                Face::PosX => ((last, i), (0, i)),
-                _ => ((i, last), (i, 0)),
-            };
-            assert_close(
-                world_grass(&a, first, ax, az),
-                world_grass(&b, second, bx, bz),
-                &format!("seed {seed}, {first:?} towards {face:?}, index {i}"),
-            );
-        }
-    }
-
-    #[test]
-    fn heights_are_close_across_chunk_borders() {
-        for seed in [1, 2, 3, 99, 12_345] {
-            assert_seam(seed, ChunkPos::new(0, 0, 0), Face::PosX);
-            assert_seam(seed, ChunkPos::new(-1, 0, 0), Face::PosX);
-            assert_seam(seed, ChunkPos::new(0, 0, 0), Face::PosZ);
-            assert_seam(seed, ChunkPos::new(0, 0, -1), Face::PosZ);
-            assert_seam(seed, ChunkPos::new(-3, 0, -2), Face::PosX);
-        }
-    }
-
-    /// Surface height the generator must use for the column `(x, z)` of the chunk at
-    /// `pos`. The world column is computed here by hand (32 blocks per chunk), not with
-    /// `ChunkPos::origin`, so the test does not share the code it checks.
-    fn expected_height(seed: u32, pos: ChunkPos, x: usize, z: usize) -> i32 {
-        surface_height(seed, pos.x * 32 + x as i32, pos.z * 32 + z as i32)
-    }
-
-    #[test]
-    fn every_column_matches_the_height_of_its_world_column() {
-        for seed in [1, 2, 3, 99] {
-            for (px, pz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1), (3, -2), (-4, -4)] {
-                let pos = ChunkPos::new(px, 0, pz);
-                let chunk = generate_chunk(seed, pos);
-                for z in 0..CHUNK_SIZE {
-                    for x in 0..CHUNK_SIZE {
-                        assert_eq!(
-                            world_grass(&chunk, pos, x, z),
-                            expected_height(seed, pos, x, z),
-                            "seed {seed}, chunk {pos:?}, column ({x}, {z})"
-                        );
-                    }
-                }
-            }
         }
     }
 
     #[test]
     fn border_columns_use_the_world_columns_on_both_sides_of_a_border() {
-        // Literal world columns: chunk (1, 0, 0) starts at world x = 32, chunk (0, 0, 0)
-        // ends at 31 and chunk (-1, 0, 0) ends at -1. A chunk origin that is off by one
-        // column would put a different column in each of these places.
-        for seed in [1, 2, 3, 99] {
+        // Literal world columns: chunk (1, y, 0) starts at world x = 32, chunk (0, y, 0)
+        // ends at 31 and chunk (-1, y, 0) ends at -1. A chunk origin that is off by one
+        // column would put a different column in each of these places. The heights come
+        // from the landscape, the chunk is read back for the highest ground block.
+        let ground_in = |seed: u32, pos: ChunkPos, x: usize, z: usize| {
+            let chunk = without_trees(seed, pos);
+            (0..CHUNK_SIZE)
+                .rev()
+                .map(|y| (y, chunk.get(LocalPos::new(x, y, z).unwrap())))
+                .find(|&(_, b)| b != BlockId::AIR && b != WATER)
+                .map(|(y, _)| pos.y * 32 + y as i32)
+        };
+        for seed in [1, 2] {
             for i in 0..CHUNK_SIZE {
                 let along = i as i32;
-                let at = |x: i32, y: i32, z: i32, cx: usize, cz: usize| {
-                    let pos = ChunkPos::new(x, y, z);
-                    world_grass(&generate_chunk(seed, pos), pos, cx, cz)
-                };
                 let last = CHUNK_SIZE - 1;
-                assert_eq!(at(0, 0, 0, last, i), surface_height(seed, 31, along));
-                assert_eq!(at(1, 0, 0, 0, i), surface_height(seed, 32, along));
-                assert_eq!(at(-1, 0, 0, last, i), surface_height(seed, -1, along));
-                assert_eq!(at(0, 0, 0, i, last), surface_height(seed, along, 31));
-                assert_eq!(at(0, 0, 1, i, 0), surface_height(seed, along, 32));
-                assert_eq!(at(0, 0, -1, i, last), surface_height(seed, along, -1));
-            }
-        }
-    }
-
-    #[test]
-    fn noise_is_continuous_across_zero_in_both_directions() {
-        // A step of one block in world space moves the height by at most `MAX_STEP`,
-        // also from -1 to 0, where floor division switches to the next lattice cell.
-        for seed in [1, 2, 3, 99] {
-            for z in -70..70 {
-                for x in -70..70 {
-                    let here = surface_height(seed, x, z);
-                    assert_close(here, surface_height(seed, x + 1, z), "x step");
-                    assert_close(here, surface_height(seed, x, z + 1), "z step");
+                let check = |pos: ChunkPos, x: usize, z: usize, world_x: i32, world_z: i32| {
+                    let ground = info_at(seed, world_x, world_z).ground;
+                    // Only layers that hold the ground can show it.
+                    if (pos.y * 32..pos.y * 32 + 32).contains(&ground) {
+                        assert_eq!(ground_in(seed, pos, x, z), Some(ground));
+                    }
+                };
+                for y in 0..=5 {
+                    check(ChunkPos::new(0, y, 0), last, i, 31, along);
+                    check(ChunkPos::new(1, y, 0), 0, i, 32, along);
+                    check(ChunkPos::new(-1, y, 0), last, i, -1, along);
+                    check(ChunkPos::new(0, y, 0), i, last, along, 31);
+                    check(ChunkPos::new(0, y, 1), i, 0, along, 32);
+                    check(ChunkPos::new(0, y, -1), i, last, along, -1);
                 }
             }
         }
     }
 
     #[test]
-    fn negative_chunks_have_valid_terrain() {
-        for pos in [
-            ChunkPos::new(-1, 0, -1),
-            ChunkPos::new(-5, 0, 3),
-            ChunkPos::new(2, 0, -7),
-        ] {
-            let chunk = generate_chunk(1, pos);
-            for z in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
-                    let grass = grass_heights(&chunk, x, z);
-                    assert_eq!(grass.len(), 1, "column ({x}, {z}) of {pos:?}");
-                    assert!((MIN_SURFACE..=MAX_SURFACE).contains(&grass[0]));
-                    assert_column_layers(&chunk, x, z, grass[0]);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn chunks_above_the_surface_are_air_and_below_are_stone() {
+    fn chunks_above_everything_are_air_and_below_everything_are_stone() {
         for seed in [1, 2] {
-            let above = chunk_at(seed, 4, 1, -3);
-            let below = chunk_at(seed, 4, -1, -3);
-            let deep = chunk_at(seed, 0, LOWEST_CHUNK_LAYER + 1, 0);
+            let above = generate_chunk(seed, ChunkPos::new(4, HIGHEST_CHUNK_LAYER, -3));
+            let layer_over_peaks = HIGHEST_BLOCK_Y.div_euclid(32) + 1;
+            let over = generate_chunk(seed, ChunkPos::new(4, layer_over_peaks, -3));
+            let below = generate_chunk(seed, ChunkPos::new(4, -1, -3));
+            let deep = generate_chunk(seed, ChunkPos::new(0, LOWEST_CHUNK_LAYER + 1, 0));
             assert!(LocalPos::all().all(|pos| above.get(pos).is_air()));
+            assert!(LocalPos::all().all(|pos| over.get(pos).is_air()));
             assert!(LocalPos::all().all(|pos| below.get(pos) == STONE));
             assert!(LocalPos::all().all(|pos| deep.get(pos) == STONE));
         }
     }
 
     #[test]
+    fn the_fast_paths_equal_the_full_generator() {
+        // The all-air and all-stone shortcuts skip the noise; the layer rule must give the
+        // same blocks (checked on the layers next to the shortcuts' limits).
+        for layer in [
+            -1,
+            0,
+            HIGHEST_BLOCK_Y.div_euclid(32),
+            HIGHEST_BLOCK_Y.div_euclid(32) + 1,
+        ] {
+            assert_chunk_follows_the_rule(1, ChunkPos::new(3, layer, 4));
+        }
+    }
+
+    #[test]
     fn the_floor_row_is_bedrock_and_the_rest_of_the_floor_layer_is_stone() {
         for seed in [1, 2, 99] {
-            let chunk = chunk_at(seed, -3, LOWEST_CHUNK_LAYER, 4);
+            let chunk = generate_chunk(seed, ChunkPos::new(-3, LOWEST_CHUNK_LAYER, 4));
             for pos in LocalPos::all() {
                 let expected = if pos.y() == 0 { BEDROCK } else { STONE };
                 assert_eq!(chunk.get(pos), expected, "seed {seed}, {pos:?}");
@@ -778,6 +1034,16 @@ mod tests {
     }
 
     #[test]
+    fn chunks_at_the_far_end_of_the_x_and_z_range_do_not_panic() {
+        for (x, z) in [(i32::MAX, 0), (i32::MIN, i32::MIN), (0, i32::MAX)] {
+            for layer in [0, 2, 3] {
+                let _ = generate_chunk(1, ChunkPos::new(x, layer, z));
+            }
+            let _ = column_span(1, x, z);
+        }
+    }
+
+    #[test]
     fn span_of_uses_floor_division_for_negative_heights() {
         // Literal layers: floor(-1/32) = -1, floor(-32/32) = -1, floor(-33/32) = -2.
         assert_eq!(span_of(-1, -1), -1..=-1);
@@ -810,9 +1076,18 @@ mod tests {
         );
     }
 
+    /// A column of mountain stone (no trees) with no water at `height`.
+    fn rock(height: i32) -> ColumnInfo {
+        ColumnInfo {
+            ground: height,
+            water_level: height,
+            biome: Biome::Mountains,
+        }
+    }
+
     /// A flat surface at height 40 (layer 1) with one block column changed.
-    fn flat_with(spot: (i32, i32), height: i32) -> impl Fn(i32, i32) -> i32 {
-        move |x, z| if (x, z) == spot { height } else { 40 }
+    fn flat_with(spot: (i32, i32), height: i32) -> impl Fn(i32, i32) -> ColumnInfo {
+        move |x, z| rock(if (x, z) == spot { height } else { 40 })
     }
 
     #[test]
@@ -842,13 +1117,55 @@ mod tests {
         assert_eq!(column_span_with(flat_with((0, 0), peak), 0, 0), 1..=3);
         assert_eq!(column_span_with(flat_with((31, 31), peak), 0, 0), 1..=3);
         // On the ring the peak belongs to the next column; its faces are in that span.
-        for spot in [(-1, 5), (32, 5), (5, -1), (5, 32)] {
+        for spot in [(-1, 5), (32, 5), (5, -1), (5, 32), (-2, -2), (33, 33)] {
             assert_eq!(
                 column_span_with(flat_with(spot, peak), 0, 0),
                 1..=1,
                 "{spot:?}"
             );
         }
+    }
+
+    #[test]
+    fn water_counts_as_the_top_of_a_column() {
+        // A lake bed at 20 under water up to 40: the visible top is 40 (layer 1), not 20.
+        let sea = |_: i32, _: i32| ColumnInfo {
+            ground: 20,
+            water_level: 40,
+            biome: Biome::Ocean,
+        };
+        assert_eq!(column_span_with(sea, 0, 0), 1..=1);
+    }
+
+    #[test]
+    fn a_tree_may_reach_into_the_next_layer_and_over_the_margin() {
+        // Grass at 60 (layer 1, top 60): a tree can reach 60 + TREE_MAX_HEIGHT = 69 (layer 2).
+        let grass = |height: i32| ColumnInfo {
+            ground: height,
+            water_level: SEA_LEVEL.min(height),
+            biome: Biome::Forest,
+        };
+        let flat = |_: i32, _: i32| grass(60);
+        assert_eq!(column_span_with(flat, 0, 0), 1..=2);
+        // Grass 2 columns outside (the margin): its tree's leaves reach in; 3 outside: not.
+        let outside = |spot: (i32, i32)| {
+            move |x: i32, z: i32| {
+                if (x, z) == spot { grass(60) } else { rock(40) }
+            }
+        };
+        assert_eq!(column_span_with(outside((-2, 5)), 0, 0), 1..=2);
+        assert_eq!(column_span_with(outside((33, 5)), 0, 0), 1..=2);
+        assert_eq!(column_span_with(outside((34, 5)), 0, 0), 1..=1);
+        assert_eq!(column_span_with(outside((-3, 5)), 0, 0), 1..=1);
+        // A tree-less column of the same height at the margin counts for nothing.
+        let bare = |x: i32, z: i32| {
+            if (x, z) == (-2, 5) {
+                rock(100)
+            } else {
+                rock(40)
+            }
+        };
+        assert_eq!(column_span_with(bare, 0, 0), 1..=1);
     }
 
     #[test]
@@ -863,12 +1180,15 @@ mod tests {
     }
 
     #[test]
-    fn the_span_is_layer_zero_today() {
-        for seed in [0, 1, 2, 99, u32::MAX] {
-            for (cx, cz) in [(0, 0), (-1, -1), (7, -3), (-20, 15)] {
-                assert_eq!(column_span(seed, cx, cz), 0..=0, "seed {seed} ({cx}, {cz})");
+    fn mountain_columns_have_spans_of_several_layers() {
+        let mut tallest = 0;
+        for cz in -40..40 {
+            for cx in -40..40 {
+                let span = column_span(1, cx, cz);
+                tallest = tallest.max(span.end() - span.start() + 1);
             }
         }
+        assert!(tallest >= 3, "tallest span {tallest} layers");
     }
 
     /// The layer of a height, written out by hand (no `div_euclid`).
@@ -881,55 +1201,86 @@ mod tests {
     }
 
     #[test]
-    fn the_span_covers_exactly_the_layers_of_the_lowest_and_highest_surface() {
-        // Brute force over the 34 x 34 area with literal world coordinates.
+    fn the_span_covers_exactly_the_layers_of_the_lowest_and_highest_top() {
+        // Brute force over the 36 x 36 area with literal world coordinates.
         for seed in [1, 2, 3, 99] {
-            for (cx, cz) in [(0, 0), (1, 0), (-1, 0), (0, -1), (4, 9), (-6, -2)] {
-                let heights = |range: std::ops::RangeInclusive<i32>| {
-                    let (x0, z0) = (cx * 32, cz * 32);
-                    let mut all = Vec::new();
-                    for z in range.clone() {
-                        for x in range.clone() {
-                            all.push(surface_height(seed, x0 + x, z0 + z));
+            for (cx, cz) in [(0, 0), (1, 0), (-1, 0), (0, -1), (4, 9), (-6, -2), (30, 17)] {
+                let (x0, z0) = (cx * 32, cz * 32);
+                let mut lowest = i32::MAX;
+                let mut highest = i32::MIN;
+                for dz in -2..=33 {
+                    for dx in -2..=33 {
+                        let info = info_at(seed, x0 + dx, z0 + dz);
+                        let ring = (-1..=32).contains(&dx) && (-1..=32).contains(&dz);
+                        let inner = (0..=31).contains(&dx) && (0..=31).contains(&dz);
+                        let tree = if info.biome.has_trees() {
+                            info.ground + 9
+                        } else {
+                            info.top()
+                        };
+                        if ring {
+                            lowest = lowest.min(info.top());
+                        }
+                        if inner || info.biome.has_trees() {
+                            highest = highest.max(tree);
                         }
                     }
-                    all
-                };
-                let outer = heights(-1..=32);
-                let inner = heights(0..=31);
+                }
                 let span = column_span(seed, cx, cz);
-                assert_eq!(*span.start(), layer_of(*outer.iter().min().unwrap()));
-                assert_eq!(*span.end(), layer_of(*inner.iter().max().unwrap()));
+                assert_eq!(*span.start(), layer_of(lowest), "seed {seed} ({cx}, {cz})");
+                assert_eq!(*span.end(), layer_of(highest), "seed {seed} ({cx}, {cz})");
             }
         }
     }
 
-    /// The blocks of the layers `LOWEST - 1..=HIGHEST + 1` of one column of chunks.
-    fn column_layers(seed: u32, cx: i32, cz: i32) -> Vec<Chunk> {
-        (LOWEST_CHUNK_LAYER - 1..=HIGHEST_CHUNK_LAYER + 1)
-            .map(|y| generate_chunk(seed, ChunkPos::new(cx, y, cz)))
-            .collect()
+    /// The layers to examine around the span of a column: three either side of it and the
+    /// two ends of the world.
+    fn layers_to_check(span: &RangeInclusive<i32>) -> Vec<i32> {
+        let mut layers: Vec<i32> = (*span.start() - 3..=*span.end() + 3)
+            .filter(|&l| (LOWEST_CHUNK_LAYER..=HIGHEST_CHUNK_LAYER).contains(&l))
+            .collect();
+        layers.extend([LOWEST_CHUNK_LAYER, HIGHEST_CHUNK_LAYER]);
+        layers.sort_unstable();
+        layers.dedup();
+        layers
     }
 
-    fn layer_index(layer: i32) -> usize {
-        usize::try_from(layer - (LOWEST_CHUNK_LAYER - 1)).unwrap()
+    /// Columns of chunks with land, water, mountains and trees: the spawn and what surrounds
+    /// it, plus the columns with the tallest spans found in a scan.
+    fn interesting_columns(seed: u32) -> Vec<(i32, i32)> {
+        let spawn = spawn_chunk(seed);
+        let mut columns = vec![(spawn.x, spawn.z), (spawn.x + 1, spawn.z - 1)];
+        let mut tallest = (0, (0, 0));
+        for cz in -30..30 {
+            for cx in -30..30 {
+                let span = column_span(seed, cx, cz);
+                let height = span.end() - span.start();
+                if height > tallest.0 {
+                    tallest = (height, (cx, cz));
+                }
+            }
+        }
+        columns.push(tallest.1);
+        columns.push((-3, 4));
+        columns
     }
 
     #[test]
     fn layers_outside_the_span_are_solid_below_and_air_above() {
-        for seed in 0..6 {
-            for (cx, cz) in [(0, 0), (3, -4), (-5, 2)] {
+        for seed in 0..4 {
+            for (cx, cz) in interesting_columns(seed) {
                 let span = column_span(seed, cx, cz);
-                for (layer, chunk) in (LOWEST_CHUNK_LAYER - 1..).zip(column_layers(seed, cx, cz)) {
+                for layer in layers_to_check(&span) {
+                    let chunk = generate_chunk(seed, ChunkPos::new(cx, layer, cz));
                     if layer < *span.start() {
                         assert!(
                             LocalPos::all().all(|pos| !chunk.get(pos).is_air()),
-                            "seed {seed} ({cx}, {cz}) layer {layer} below the span"
+                            "seed {seed} ({cx}, {cz}) layer {layer} below the span {span:?}"
                         );
                     } else if layer > *span.end() {
                         assert!(
                             LocalPos::all().all(|pos| chunk.get(pos).is_air()),
-                            "seed {seed} ({cx}, {cz}) layer {layer} above the span"
+                            "seed {seed} ({cx}, {cz}) layer {layer} above the span {span:?}"
                         );
                     }
                 }
@@ -939,33 +1290,39 @@ mod tests {
 
     #[test]
     fn no_layer_outside_the_span_meshes_to_anything() {
+        // Every visible face (water surfaces and trees included) lies inside the span: the
+        // layers outside it, meshed with their generated neighbours, have no quads.
         let textures = crate::mesh::identity_textures();
         let mut mesh = crate::ChunkMesh::default();
-        for seed in 0..8 {
-            for (cx, cz) in [(0, 0), (1, 0), (-1, 3), (6, -6)] {
+        for seed in 0..4 {
+            for (cx, cz) in interesting_columns(seed) {
                 let span = column_span(seed, cx, cz);
-                let own = column_layers(seed, cx, cz);
-                let sides = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-                    .map(|(dx, dz)| column_layers(seed, cx + dx, cz + dz));
-                for layer in LOWEST_CHUNK_LAYER..=HIGHEST_CHUNK_LAYER {
+                let layers = layers_to_check(&span);
+                let chunk_at = |dx: i32, dz: i32, layer: i32| {
+                    generate_chunk(seed, ChunkPos::new(cx + dx, layer, cz + dz))
+                };
+                for &layer in &layers {
                     if span.contains(&layer) {
                         continue;
                     }
-                    let at = layer_index(layer);
-                    let neighbours = Neighbours::new([
-                        Some(&sides[0][at]),
-                        Some(&sides[1][at]),
-                        Some(&own[at + 1]),
-                        Some(&own[at - 1]),
-                        Some(&sides[2][at]),
-                        Some(&sides[3][at]),
-                    ]);
-                    crate::build_mesh_with_neighbours_into(
-                        &own[at],
-                        &neighbours,
-                        &textures,
-                        &mut mesh,
+                    let own = chunk_at(0, 0, layer);
+                    let above = chunk_at(0, 0, layer + 1);
+                    // Below the lowest layer: the bedrock stand-in, like the world's floor.
+                    let below = generate_chunk(
+                        seed,
+                        ChunkPos::new(cx, (layer - 1).max(LOWEST_CHUNK_LAYER - 1), cz),
                     );
+                    let sides =
+                        [(1, 0), (-1, 0), (0, 1), (0, -1)].map(|(dx, dz)| chunk_at(dx, dz, layer));
+                    let neighbours = Neighbours::new([
+                        Some(&sides[0]),
+                        Some(&sides[1]),
+                        Some(&above),
+                        Some(&below),
+                        Some(&sides[2]),
+                        Some(&sides[3]),
+                    ]);
+                    crate::build_mesh_with_neighbours_into(&own, &neighbours, &textures, &mut mesh);
                     assert_eq!(
                         mesh.quad_count(),
                         0,
@@ -977,8 +1334,43 @@ mod tests {
     }
 
     #[test]
+    fn a_generated_column_equals_its_chunks_one_by_one() {
+        for (seed, cx, cz) in [(1, 0, 0), (3, -2, 5), (273, 0, 0), (2, 40, -40)] {
+            let layers = LOWEST_CHUNK_LAYER..=HIGHEST_CHUNK_LAYER + 1;
+            let column = generate_column(seed, cx, cz, layers.clone(), &TEST_BLOCKS);
+            assert_eq!(column.len(), layers.clone().count());
+            for (layer, chunk) in layers.zip(&column) {
+                let single = generate_chunk(seed, ChunkPos::new(cx, layer, cz));
+                assert!(
+                    same_blocks(chunk, &single),
+                    "seed {seed} ({cx}, {cz}) layer {layer}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_trunk_stands_at_the_spawn_column() {
+        for seed in 0..40 {
+            let [x, y, z] = spawn_point(seed);
+            let (pos, local) = ChunkPos::containing([x, y, z]);
+            let chunk = generate_chunk(seed, pos);
+            assert_eq!(chunk.get(local), BlockId::AIR, "seed {seed}");
+            // The column above the spawn holds no log.
+            for dy in 0..9 {
+                let (above, local) = ChunkPos::containing([x, y + dy, z]);
+                assert_ne!(
+                    generate_chunk(seed, above).get(local),
+                    LOG,
+                    "seed {seed} +{dy}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn same_seed_and_far_position_give_identical_chunk() {
-        let far = ChunkPos::new(3, 0, -2);
+        let far = ChunkPos::new(3, 2, -2);
         assert!(same_blocks(
             &generate_chunk(5, far),
             &generate_chunk(5, far)
@@ -987,39 +1379,37 @@ mod tests {
 
     #[test]
     fn different_positions_give_different_chunks() {
-        let here = chunk_at(1, 0, 0, 0);
+        let spawn = spawn_chunk(1);
+        let here = generate_chunk(1, spawn);
         for (x, z) in [(1, 0), (-1, 0), (0, 1), (0, -1), (3, -2)] {
             assert!(
-                !same_blocks(&here, &chunk_at(1, x, 0, z)),
+                !same_blocks(
+                    &here,
+                    &generate_chunk(1, ChunkPos::new(spawn.x + x, spawn.y, spawn.z + z))
+                ),
                 "chunk ({x}, {z})"
             );
         }
     }
 
     #[test]
-    fn far_chunk_matches_pinned_fingerprint() {
-        // Pins a chunk with negative Z, so a change of the floor division or of the way
-        // the lattice hash takes negative cells shows up. Recompute on purpose only.
-        assert_eq!(
-            fingerprint(&chunk_at(1, 1, 0, -1)),
-            13_859_822_351_980_690_189
+    fn faces_of_neighbouring_columns_meet_at_chunk_borders() {
+        // A chunk meshed with its real neighbours has fewer quads than alone: the border
+        // columns of neighbours agree, which is what hides the faces between them.
+        let spawn = spawn_chunk(1);
+        let alone = build_mesh(&generate_chunk(1, spawn), &crate::mesh::identity_textures());
+        let [x, y, z] = [spawn.x, spawn.y, spawn.z];
+        let around: [Chunk; Face::COUNT] =
+            Face::ALL.map(|face| generate_chunk(1, spawn.neighbour(face)));
+        let neighbours =
+            Neighbours::new(Face::ALL.map(|face| Some(&around[usize::from(face.index())])));
+        let mut mesh = crate::ChunkMesh::default();
+        crate::build_mesh_with_neighbours_into(
+            &generate_chunk(1, ChunkPos::new(x, y, z)),
+            &neighbours,
+            &crate::mesh::identity_textures(),
+            &mut mesh,
         );
-    }
-
-    #[test]
-    fn shift_and_mask_equal_floor_division_and_euclidean_remainder() {
-        for (cell, _) in OCTAVES {
-            let shift = cell.trailing_zeros();
-            for x in -200_i32..200 {
-                assert_eq!(x >> shift, x.div_euclid(cell), "x {x}, cell {cell}");
-                assert_eq!(x & (cell - 1), x.rem_euclid(cell), "x {x}, cell {cell}");
-            }
-        }
-    }
-
-    #[test]
-    fn octave_weights_are_normalized() {
-        let total: f32 = OCTAVES.iter().map(|(_, weight)| weight).sum();
-        assert_eq!(WEIGHT_SUM, total);
+        assert!(mesh.quad_count() < alone.quad_count());
     }
 }

@@ -41,7 +41,7 @@ use vox_render::{
     CameraView, DepthMode, Fog, RenderError, RenderStats, Renderer, ShaderSources, TextureLayers,
     create_renderer,
 };
-use vox_world::{BlockRegistry, ChunkMesh, TilePos, World, raycast_with};
+use vox_world::{BlockId, BlockRegistry, ChunkMesh, TilePos, World, raycast_with};
 use winit::application::ApplicationHandler;
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
@@ -68,9 +68,23 @@ const WINDOW_TITLE: &str = "Voxel Adventure";
 const EXIT_USAGE: u8 = 2;
 /// Seed of the terrain that is generated at startup.
 const WORLD_SEED: u32 = 1;
-/// Where the camera starts: above the loaded area, back from the origin chunk (the terrain
-/// lies at heights 8 to 24), so a large part of the area is in view.
-const CAMERA_START: Vec3 = Vec3::new(16.0, 60.0, 90.0);
+/// How far above the spawn point's ground the camera starts, in blocks: high enough to see the
+/// land around it (and the trees, up to 9 blocks tall), low enough to stay among the hills.
+const CAMERA_START_HEIGHT: f32 = 30.0;
+/// How far behind the spawn point (towards +Z) the camera starts, in blocks, so it looks at
+/// the land in front of the spawn from a little way back.
+const CAMERA_START_BACK: f32 = 30.0;
+
+/// Where the camera starts: above the land at the spawn point of `seed` (decision 0017), so the
+/// player always begins over land, whatever the seed.
+fn camera_start(seed: u32) -> Vec3 {
+    let [x, y, z] = vox_world::spawn_point(seed);
+    Vec3::new(
+        x as f32 + 0.5,
+        y as f32 + CAMERA_START_HEIGHT,
+        z as f32 + 0.5 + CAMERA_START_BACK,
+    )
+}
 /// The camera's start yaw in radians; 0 looks along -Z, towards the loaded area.
 const CAMERA_START_YAW: f32 = 0.0;
 /// The camera's start pitch in radians; negative looks down at the terrain.
@@ -210,6 +224,9 @@ struct App {
     /// The span of every loaded column: what physics and editing know of the layers that are
     /// not in `world`. Updated together with `world` from the streaming changes.
     spans: ColumnSpans,
+    /// The liquid block (water): the body passes through it and the edit ray does not stop at
+    /// it, so the player can swim and build under water.
+    liquid: BlockId,
     /// The chunks the player wrote into, whose neighbours must be completed when they stream
     /// in again (decision 0015).
     edited: EditedChunks,
@@ -289,16 +306,21 @@ impl App {
             fill: FillReport::new(),
             world: World::new(),
             spans: ColumnSpans::default(),
+            liquid: content.terrain.water,
             edited: EditedChunks::default(),
             edit_scratch: ChunkMesh::default(),
-            camera: Camera::new(CAMERA_START, CAMERA_START_YAW, CAMERA_START_PITCH),
+            camera: Camera::new(
+                camera_start(WORLD_SEED),
+                CAMERA_START_YAW,
+                CAMERA_START_PITCH,
+            ),
             horizon: 0,
             fog,
             far_plane: view_distance::far_plane(fog),
             // A placeholder: `start` overwrites it from the renderer before the first
             // `set_camera`, and no projection is built before the renderer exists.
             depth_mode: DepthMode::Standard,
-            body: Body::from_eye(CAMERA_START.to_array()),
+            body: Body::from_eye(camera_start(WORLD_SEED).to_array()),
             walking: false,
             controls: Controls::default(),
             input_mode,
@@ -403,6 +425,7 @@ impl App {
                 let space = Space {
                     world: &self.world,
                     spans: &self.spans,
+                    liquid: self.liquid,
                 };
                 self.body.step(space, input, dt);
                 self.camera.set_position(Vec3::from(self.body.eye()));
@@ -556,7 +579,7 @@ impl App {
         let direction = self.camera.forward().to_array();
         // Missing chunks above a loaded column's span are air, so a ray from the flying height
         // reaches the terrain (decision 0015).
-        let lookup = |block| editing::block_for_ray(&self.world, &self.spans, block);
+        let lookup = |block| editing::ray_sees(&self.world, &self.spans, self.liquid, block);
         let Some(hit) = raycast_with(lookup, eye, direction, REACH) else {
             return Ok(());
         };
@@ -906,6 +929,7 @@ impl App {
         let space = Space {
             world: &self.world,
             spans: &self.spans,
+            liquid: self.liquid,
         };
         if body.is_free(space) {
             self.body = body;

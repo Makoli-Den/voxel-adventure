@@ -8,9 +8,9 @@
 //! which is cheap next to meshing.
 
 use vox_world::{
-    CHUNK_SIZE, Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, FaceTextures, MAX_SURFACE,
-    Neighbours, TerrainBlocks, TilePos, World, build_mesh_with_neighbours_into,
-    build_tile_mesh_into, column_span, generate_chunk, generate_lod_chunk, solid_chunk,
+    Chunk, ChunkMesh, ChunkPos, ChunkVertex, Face, FaceTextures, Neighbours, TerrainBlocks,
+    TilePos, World, build_mesh_with_neighbours_into, build_tile_mesh_into, column_span,
+    generate_chunk, generate_column, generate_lod_chunk, solid_chunk,
 };
 
 use super::column::{Column, ColumnSpans, Span};
@@ -44,6 +44,12 @@ impl Terrain {
     /// The blocks of the chunk at `pos` as the generator makes them, before any edit.
     pub fn generate(&self, pos: ChunkPos) -> Chunk {
         generate_chunk(self.seed, pos, &self.blocks)
+    }
+
+    /// The chunks of the layers `span` of `column`, lowest first: [`Self::generate`] for each, with
+    /// the landscape of the column worked out once.
+    pub fn generate_span(&self, column: Column, span: &Span) -> Vec<Chunk> {
+        generate_column(self.seed, column.x, column.z, span.clone(), &self.blocks)
     }
 
     /// The chunk layers of `column` that can show a face (`vox_world::column_span`).
@@ -126,15 +132,21 @@ fn build_span(
     // HOT PATH: runs for every streamed column on a worker thread. The meshes are built into the
     // worker's reused `scratch` (no growth after the first jobs) and only the final exact-size
     // copies are allocated; the solid stand-in is built once, not per job.
-    let chunks: Vec<Chunk> = span
-        .clone()
-        .map(|layer| terrain.generate(column.chunk(layer)))
-        .collect();
+    let chunks = terrain.generate_span(column, &span);
+    // The four neighbouring columns, each generated once for all the layers of the span.
+    let side_columns: [Option<Vec<Chunk>>; Face::COUNT] = Face::ALL.map(|face| {
+        is_horizontal(face).then(|| {
+            let [dx, _, dz] = face.offset().map(i32::from);
+            terrain.generate_span(Column::new(column.x + dx, column.z + dz), &span)
+        })
+    });
     let mut meshes = Vec::with_capacity(chunks.len());
-    for ((layer, chunk), index) in span.clone().zip(&chunks).zip(0_usize..) {
-        let pos = column.chunk(layer);
-        let sides: [Option<Chunk>; Face::COUNT] = Face::ALL
-            .map(|face| is_horizontal(face).then(|| terrain.generate(pos.neighbour(face))));
+    for (chunk, index) in chunks.iter().zip(0_usize..) {
+        let sides: [Option<&Chunk>; Face::COUNT] = Face::ALL.map(|face| {
+            side_columns[usize::from(face.index())]
+                .as_ref()
+                .and_then(|layers| layers.get(index))
+        });
         let above = chunks.get(index + 1);
         let below = index
             .checked_sub(1)
@@ -143,7 +155,7 @@ fn build_span(
         let neighbours = Neighbours::new(Face::ALL.map(|face| match face {
             Face::PosY => above,
             Face::NegY => Some(below),
-            _ => sides[usize::from(face.index())].as_ref(),
+            _ => sides[usize::from(face.index())],
         }));
         build_mesh_with_neighbours_into(chunk, &neighbours, &terrain.textures, scratch);
         meshes.push(finished(scratch));
@@ -156,14 +168,10 @@ fn build_span(
     BuiltColumn { span, layers }
 }
 
-/// Every surface lies in tile layer 0 at every level: the highest surface block is below the
-/// top of a chunk, and a level-`k` tile of layer 0 is `2^k` times taller than a chunk. So the
-/// one layer a tile job builds is the whole span of every tile (decision 0015, "S4 as built":
-/// only layers of the span are meshed). A generator with higher terrain fails this check and
-/// must give tiles a span first.
-const _: () = assert!(MAX_SURFACE < CHUNK_SIZE);
-
-/// The tile layer every level-of-detail tile lives in; see the check above.
+/// The lowest tile layer of every tile column, whose bottom is below all ground. A tile column
+/// has the layers [`vox_world::tile_layers`]: a level-1 tile is 64 blocks tall, so the mountains
+/// (up to block 160) need three of them, and each layer is its own tile and its own job
+/// (decision 0017). The selection and the tracker know tile columns by their layer 0 tile.
 pub const TILE_LAYER: i32 = 0;
 
 /// One unit of work for a streaming worker.
@@ -277,13 +285,10 @@ pub fn remesh(
 
 #[cfg(test)]
 mod tests {
-    use vox_world::{BlockId, CHUNK_VOLUME, LocalPos, build_mesh_into};
+    use vox_world::{BlockId, CHUNK_SIZE, CHUNK_VOLUME, LocalPos, build_mesh_into};
 
     use super::*;
-    use crate::streaming::test_blocks::{BLOCKS, face_textures};
-
-    /// The seed of the tests' terrain.
-    const SEED: u32 = 1;
+    use crate::streaming::test_blocks::{BLOCKS, SEED, TERRAIN_LAYER, face_textures};
 
     fn terrain() -> Terrain {
         Terrain::new(SEED, BLOCKS, face_textures())
@@ -294,11 +299,16 @@ mod tests {
         vox_world::generate_chunk(SEED, pos, &BLOCKS)
     }
 
-    /// The one layer of a column job today (every span is layer 0), with its position.
+    /// The one layer of a column job on the tests' land (every span is [`TERRAIN_LAYER`]), with
+    /// its position.
     fn only_layer(column: Column) -> (ChunkPos, Built) {
         let mut scratch = ChunkMesh::default();
         let built = build_column(&terrain(), column, &mut scratch);
-        assert_eq!(built.span, 0..=0, "column {column:?}");
+        assert_eq!(
+            built.span,
+            TERRAIN_LAYER..=TERRAIN_LAYER,
+            "column {column:?}"
+        );
         let mut layers = built.layers;
         assert_eq!(layers.len(), 1);
         layers.remove(0)
@@ -325,15 +335,28 @@ mod tests {
         mesh
     }
 
+    /// The chunk at column (0, 0) in the terrain layer.
+    fn terrain_origin() -> ChunkPos {
+        ChunkPos::new(0, TERRAIN_LAYER, 0)
+    }
+
+    /// The height of the top row of the terrain layer.
+    fn top_row_y() -> i32 {
+        (TERRAIN_LAYER + 1) * CHUNK_SIZE as i32 - 1
+    }
+
     fn area_3x3() -> impl Iterator<Item = Column> {
         (-1..=1).flat_map(|z| (-1..=1).map(move |x| Column::new(x, z)))
     }
 
-    /// A world holding the generated 3 x 3 area in layer 0.
+    /// A world holding the generated 3 x 3 area in the terrain layer.
     fn world_3x3() -> World {
         let mut world = World::new();
         for column in area_3x3() {
-            world.insert(column.chunk(0), generate_chunk(column.chunk(0)));
+            world.insert(
+                column.chunk(TERRAIN_LAYER),
+                generate_chunk(column.chunk(TERRAIN_LAYER)),
+            );
         }
         world
     }
@@ -342,7 +365,7 @@ mod tests {
     fn the_job_matches_a_mesh_built_by_hand() {
         for column in area_3x3() {
             let (pos, built) = only_layer(column);
-            assert_eq!(pos, column.chunk(0));
+            assert_eq!(pos, column.chunk(TERRAIN_LAYER));
             assert_eq!(built.mesh, by_hand(pos), "column {column:?}");
         }
     }
@@ -377,8 +400,14 @@ mod tests {
                 "terrain chunk {pos:?} has faces"
             );
             assert!(
-                built.mesh.vertices.iter().all(|v| v.face != bottom),
-                "chunk {pos:?} has a downward face"
+                // Leaves hang over air, so a face may look down inside the chunk; none lies on
+                // the chunk's floor plane, where the stand-in (or the chunk below) hides it.
+                built
+                    .mesh
+                    .vertices
+                    .iter()
+                    .all(|v| v.face != bottom || v.position[1] != 0),
+                "chunk {pos:?} has a downward face on its floor"
             );
         }
     }
@@ -388,7 +417,7 @@ mod tests {
         let (_, joined) = only_layer(Column::new(0, 0));
         let mut alone = ChunkMesh::default();
         build_mesh_into(
-            &generate_chunk(ChunkPos::ORIGIN),
+            &generate_chunk(terrain_origin()),
             &terrain().textures,
             &mut alone,
         );
@@ -401,15 +430,23 @@ mod tests {
         let terrain = terrain();
         // A span reaching one layer under and one over the terrain: the layer under is all
         // stone and the layer over all air, so both have empty meshes that cost no upload.
-        let built = build_span(&terrain, Column::new(0, 0), -1..=1, &mut scratch);
+        let built = build_span(
+            &terrain,
+            Column::new(0, 0),
+            TERRAIN_LAYER - 1..=TERRAIN_LAYER + 1,
+            &mut scratch,
+        );
         let layers: Vec<i32> = built.layers.iter().map(|(pos, _)| pos.y).collect();
-        assert_eq!(layers, [-1, 0, 1]);
+        assert_eq!(
+            layers,
+            [TERRAIN_LAYER - 1, TERRAIN_LAYER, TERRAIN_LAYER + 1]
+        );
         assert!(built.layers[0].1.mesh.indices.is_empty());
         assert!(built.layers[2].1.mesh.indices.is_empty());
         assert_eq!(built.mesh_count(), 1);
         // The terrain layer looks the same as in a one-layer job: the chunks above and below
         // hide exactly what the air and the stand-in did.
-        assert_eq!(built.layers[1].1.mesh, by_hand(ChunkPos::ORIGIN));
+        assert_eq!(built.layers[1].1.mesh, by_hand(terrain_origin()));
     }
 
     #[test]
@@ -420,7 +457,7 @@ mod tests {
         let terrain = terrain();
         let mut scratch = ChunkMesh::default();
         let column = Column::new(1, -2);
-        let span = -2..=0;
+        let span = TERRAIN_LAYER - 2..=TERRAIN_LAYER;
         let built = build_span(&terrain, column, span.clone(), &mut scratch);
         let mut world = World::new();
         for (pos, layer) in &built.layers {
@@ -444,9 +481,9 @@ mod tests {
         let mut world = world_3x3();
         let mut spans = ColumnSpans::default();
         for column in area_3x3() {
-            spans.insert(column, 0..=0);
+            spans.insert(column, TERRAIN_LAYER..=TERRAIN_LAYER);
         }
-        let pos = ChunkPos::new(0, -3, 0);
+        let pos = ChunkPos::new(0, TERRAIN_LAYER - 3, 0);
         world.insert(pos, generate_chunk(pos));
         let last = CHUNK_SIZE as i32 - 1;
         let [x, y, z] = pos.origin();
@@ -487,24 +524,24 @@ mod tests {
         let mut world = world_3x3();
         let mut spans = ColumnSpans::default();
         for column in area_3x3() {
-            spans.insert(column, 0..=0);
+            spans.insert(column, TERRAIN_LAYER..=TERRAIN_LAYER);
         }
         let top = CHUNK_SIZE as u8;
-        // A block on the top row of layer 0 (height 31) under the missing layer 1, which is
-        // air: its top face is drawn. A solid stand-in there would hide it.
-        world.set_block([5, 31, 5], BLOCKS.stone);
+        // A block on the top row of the terrain layer under the missing layer above it, which
+        // is air: its top face is drawn. A solid stand-in there would hide it.
+        world.set_block([5, top_row_y(), 5], BLOCKS.stone);
         let mut scratch = ChunkMesh::default();
         assert!(remesh(
             &terrain,
             &world,
             &spans,
-            ChunkPos::ORIGIN,
+            terrain_origin(),
             &mut scratch
         ));
         assert_eq!(quads_on_plane(&scratch, Face::PosY, top), 1);
         // The bottom row of layer -1 lies on the missing layer -2, which is rock: no face
         // looks down. Air there would draw the whole underside.
-        let below = ChunkPos::new(0, -1, 0);
+        let below = ChunkPos::new(0, TERRAIN_LAYER - 1, 0);
         world.insert(below, generate_chunk(below));
         assert!(remesh(&terrain, &world, &spans, below, &mut scratch));
         assert_eq!(quads_on_plane(&scratch, Face::NegY, 0), 0);
@@ -527,7 +564,7 @@ mod tests {
         for pos in LocalPos::all() {
             stone.set(pos, BLOCKS.stone);
         }
-        let pos = ChunkPos::ORIGIN;
+        let pos = terrain_origin();
         let chunk = generate_chunk(pos);
         let sides: Vec<Chunk> = Face::ALL
             .into_iter()
@@ -589,7 +626,7 @@ mod tests {
             &terrain(),
             &World::new(),
             &ColumnSpans::default(),
-            ChunkPos::ORIGIN,
+            terrain_origin(),
             &mut scratch
         ));
         assert_eq!(scratch.indices, vec![7]);
@@ -600,7 +637,7 @@ mod tests {
         let mut scratch = ChunkMesh::default();
         let mut world = world_3x3();
         let (_, before) = only_layer(Column::new(0, 0));
-        let neighbour = ChunkPos::new(1, 0, 0);
+        let neighbour = ChunkPos::new(1, TERRAIN_LAYER, 0);
         remesh(
             &terrain(),
             &world,
@@ -614,13 +651,13 @@ mod tests {
         // changes, and the neighbour on that side now shows a wall where the column was.
         let border_x = CHUNK_SIZE as i32 - 1;
         for y in 0..CHUNK_SIZE as i32 {
-            world.set_block([border_x, y, 0], BlockId::AIR);
+            world.set_block([border_x, TERRAIN_LAYER * 32 + y, 0], BlockId::AIR);
         }
         remesh(
             &terrain(),
             &world,
             &ColumnSpans::default(),
-            ChunkPos::ORIGIN,
+            terrain_origin(),
             &mut scratch,
         );
         assert_ne!(scratch, before.mesh);

@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 
-use vox_world::{CHUNK_SIZE, ChunkPos, MAX_LOD_LEVEL, TilePos};
+use vox_world::{CHUNK_SIZE, ChunkPos, MAX_LOD_LEVEL, TilePos, tile_layer_bound};
 
 /// The chunk layer all selected tiles live in: tiles are horizontal columns, the vertical layers
 /// of a column come from its span (decision 0015).
@@ -249,8 +249,18 @@ fn select_with_radius(camera: ChunkPos, radius: i32, horizon_blocks: i32) -> Vec
     leaves.into_iter().map(|(_, tile)| tile).collect()
 }
 
+/// The meshes a selection can cost: one per leaf of level 0 (a column of chunks) and, per tile
+/// of level 1 or more, one per tile layer that is built ([`tile_layer_bound`]): a tile of
+/// level 1 or 2 is two meshes, not one. This is what the budget [`MAX_LEAVES`] counts.
+pub fn mesh_cost(leaves: &[TilePos]) -> usize {
+    leaves
+        .iter()
+        .map(|tile| tile_layer_bound(tile.level()))
+        .sum()
+}
+
 /// The largest horizon, in whole [`HORIZON_STEP_BLOCKS`], for which a selection at
-/// `view_radius_chunks` has at most [`MAX_LEAVES`] leaves (with the
+/// `view_radius_chunks` costs at most [`MAX_LEAVES`] meshes ([`mesh_cost`], with the
 /// [`LEAF_COUNT_SAFETY_PERCENT`] margin). At most [`MAX_HORIZON_BLOCKS`].
 ///
 /// The game clamps its horizon option to this, so the mesh budget is enforced by code. If even
@@ -261,7 +271,7 @@ fn select_with_radius(camera: ChunkPos, radius: i32, horizon_blocks: i32) -> Vec
 /// millisecond), meant to run when an option changes, not every frame.
 pub fn max_horizon_for(view_radius_chunks: i32) -> i32 {
     let fits = |horizon: i32| {
-        let leaves = select_tiles(ChunkPos::ORIGIN, view_radius_chunks, horizon).len();
+        let leaves = mesh_cost(&select_tiles(ChunkPos::ORIGIN, view_radius_chunks, horizon));
         leaves * (100 + LEAF_COUNT_SAFETY_PERCENT) <= MAX_LEAVES * 100
     };
     let steps = MAX_HORIZON_BLOCKS / HORIZON_STEP_BLOCKS;
@@ -705,13 +715,20 @@ mod tests {
             let horizon = max_horizon_for(radius);
             assert_eq!(horizon % HORIZON_STEP_BLOCKS, 0);
             assert!((HORIZON_STEP_BLOCKS..=MAX_HORIZON_BLOCKS).contains(&horizon));
-            let (total, _) = worst_counts(&cameras, radius, horizon);
-            assert!(total <= MAX_LEAVES, "r{radius} h{horizon}: {total}");
+            let worst_cost = cameras
+                .iter()
+                .map(|camera| mesh_cost(&select_tiles(*camera, radius, horizon)))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                worst_cost <= MAX_LEAVES,
+                "r{radius} h{horizon}: {worst_cost}"
+            );
             // Not needlessly strict: one step more is over the budget for the reference
             // camera (the search's own measure) or already at the maximum.
             if horizon < MAX_HORIZON_BLOCKS {
                 let more = select_tiles(ChunkPos::ORIGIN, radius, horizon + HORIZON_STEP_BLOCKS);
-                assert!(more.len() * (100 + LEAF_COUNT_SAFETY_PERCENT) > MAX_LEAVES * 100);
+                assert!(mesh_cost(&more) * (100 + LEAF_COUNT_SAFETY_PERCENT) > MAX_LEAVES * 100);
             }
         }
     }
