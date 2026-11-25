@@ -11,13 +11,16 @@
 //! stand-in below ([`solid_chunk`], [`build_tile_mesh_into`]), plus [`skirt_quads`] to count
 //! the walls that close the cracks between levels.
 
+use std::ops::RangeInclusive;
+
 use crate::block::BlockId;
 use crate::bounds::{CHUNK_SIZE_I32, WORLD_FLOOR_Y};
 use crate::chunk::{CHUNK_SIZE, Chunk, LocalPos};
 use crate::chunk_pos::ChunkPos;
+use crate::landscape::{LAKE_CELL, LAKE_CELLS_PER_AXIS, Landscape, MAX_SURFACE, SEA_LEVEL};
 use crate::mesh::{ChunkMesh, Face, VERTICES_PER_QUAD, build_mesh_with_neighbours_into};
 use crate::registry::FaceTextures;
-use crate::terrain::{TerrainBlocks, block_at_depth, surface_height};
+use crate::terrain::{Layers, TerrainBlocks, block_at_depth};
 use crate::world::Neighbours;
 
 /// The coarsest level. Its cells are `2^4 = 16` blocks and its tile covers
@@ -126,31 +129,101 @@ fn surface_cell(height: i32, level: u8) -> i32 {
     height.saturating_add(half_cell(cell)).div_euclid(cell)
 }
 
-/// Generates the terrain of the tile `tile` as a chunk of cells. The same arguments always
-/// give the same chunk, and level 0 equals [`generate_chunk`](crate::generate_chunk).
+/// The tile layers (tile `y` coordinates, inclusive) of level `level` that can hold terrain:
+/// from layer 0, whose bottom is below the lowest possible ground, to the layer of the highest
+/// possible ground cell ([`MAX_SURFACE`]). A level-1 tile is 64 blocks tall, so the mountains
+/// (up to block 160) need layers 0 to 2; at level 3 and 4 layer 0 holds everything. A tile
+/// of any level shows its terrain in these layers.
 ///
-/// A cell column samples the surface height `h` **once**, at its centre block: the block
+/// # Example
+///
+/// ```
+/// use vox_world::tile_layers;
+///
+/// assert_eq!(tile_layers(1), 0..=2);
+/// assert_eq!(tile_layers(4), 0..=0);
+/// ```
+pub fn tile_layers(level: u8) -> RangeInclusive<i32> {
+    let top_cell = surface_cell(MAX_SURFACE, level);
+    0..=top_cell.div_euclid(CHUNK_SIZE_I32)
+}
+
+/// The tile layers of tiles of `level` that can show a face: the layers of [`tile_layers`]
+/// minus those under the sea, which are uniform and cost neither a job nor a mesh.
+///
+/// Every column's top (ground or water) is at least [`SEA_LEVEL`], so every cell row under the
+/// one that holds the sea level is solid with solid neighbours, in every column: no face. The
+/// first layer is the one that holds that row. The layers above are not skipped: whether a
+/// tile has mountains in it is not known without sampling its columns (a bound from the
+/// lattice values of the mountain field is always above the threshold, because the threshold
+/// is close to the field's median, measured), so a tile of flat land still has a layer for
+/// the mountains that may be there; its job finds it empty.
+///
+/// # Example
+///
+/// ```
+/// use vox_world::tile_layers_in;
+///
+/// // Level 1 tiles are 64 blocks tall; the sea level (64) is the bottom of layer 1.
+/// assert_eq!(tile_layers_in(1), 1..=2);
+/// assert_eq!(tile_layers_in(4), 0..=0);
+/// ```
+pub fn tile_layers_in(level: u8) -> RangeInclusive<i32> {
+    let first = surface_cell(SEA_LEVEL, level).div_euclid(CHUNK_SIZE_I32);
+    first..=*tile_layers(level).end()
+}
+
+/// The number of layers in [`tile_layers_in`] for a tile of `level`: what the mesh budget of a
+/// selection counts per tile (a tile of level 0 is one column of chunks, counted as one).
+///
+/// # Example
+///
+/// ```
+/// use vox_world::tile_layer_bound;
+///
+/// assert_eq!(tile_layer_bound(0), 1);
+/// assert!(tile_layer_bound(1) >= tile_layer_bound(4));
+/// ```
+pub fn tile_layer_bound(level: u8) -> usize {
+    if level == 0 {
+        return 1;
+    }
+    tile_layers_in(level).count()
+}
+
+/// Generates the terrain of the tile `tile` as a chunk of cells, without trees. The same
+/// arguments always give the same chunk, and level 0 equals the terrain of
+/// [`generate_chunk`](crate::generate_chunk) with its trees left out (tiles ignore trees at
+/// every level; the full-detail chunks draw them).
+///
+/// A cell column samples the landscape **once**, at its centre block: the block
 /// `2^level / 2` blocks in from the cell's lowest corner on X and Z (the block just above
 /// the middle, since a cell has an even number of blocks; at level 0 that is the block
-/// itself). The cells are solid up to and including row `surface_cell(h)` (see that
-/// function: `h / 2^level` rounded to nearest, ties up, floor-based for negative heights).
-/// Which block a solid cell holds follows the full-detail column:
+/// itself). With `g` the ground height and `t` the top (the water surface where the column
+/// has water, else `g`), the cells are solid up to and including row `surface_cell(t)` (see
+/// that function: `t / 2^level` rounded to nearest, ties up, floor-based for negative
+/// heights). Which block a solid cell holds follows the full-detail column:
 ///
-/// - the top solid cell is `blocks.grass`;
-/// - a cell below it takes the block the full-detail column has at the cell's highest
-///   block, but at most one below the surface (so a cell never shows grass under the top),
-///   by the same layer rule as the generator (`blocks.dirt` within the dirt depth,
-///   `blocks.stone` deeper). The dirt layer is 3 blocks, thinner than a cell at coarse
-///   levels, so the cell under the grass is dirt in most columns at every level (stone in
-///   the columns where it is more than 3 blocks below the surface) and deeper cells are stone;
+/// - the cells between the ground cell (`surface_cell(g)`) and the top cell are water,
+///   the top cell included;
+/// - the ground cell is the biome's surface block;
+/// - a cell below the ground cell takes the block the full-detail column has at the cell's
+///   highest block, but at most one below the ground, by the same layer rule as the generator
+///   (filler within the filler depth, stone deeper). The filler layer is 3 blocks, thinner
+///   than a cell at coarse levels, so the cell under the surface is filler in most columns at
+///   every level and deeper cells are stone;
 /// - the cell row that holds [`WORLD_FLOOR_Y`] and every row below it is `blocks.bedrock`;
-/// - everything above the top solid cell is air.
+/// - everything above the top cell is air.
+///
+/// At coarse levels a shallow river or lake can round away (its water surface and its
+/// ground fall in the same cell row), so far away only the seas and the big lakes show water.
 ///
 /// The result is correct for any tile layer, the way [`generate_chunk`](crate::generate_chunk)
 /// is: a layer above every surface is all air, a layer below the floor all bedrock, so a
-/// worker can ask for any layer without first checking the world bounds.
+/// worker can ask for any layer without first checking the world bounds. [`tile_layers`]
+/// says which layers can hold terrain.
 ///
-/// The cost is 1,024 noise samples and one fill, about that of one chunk.
+/// The cost is 1,024 column evaluations and one fill, about that of one chunk.
 ///
 /// # Example
 ///
@@ -161,11 +234,18 @@ fn surface_cell(height: i32, level: u8) -> i32 {
 ///     grass: BlockId(1),
 ///     dirt: BlockId(2),
 ///     stone: BlockId(3),
-///     bedrock: BlockId(4),
+///     sand: BlockId(4),
+///     gravel: BlockId(5),
+///     snow: BlockId(6),
+///     water: BlockId(7),
+///     log: BlockId(8),
+///     leaves: BlockId(9),
+///     bedrock: BlockId(10),
 /// };
-/// // Level 2: cells of 4 blocks, so this tile covers 128 x 128 x 128 blocks.
-/// let tile = generate_lod_chunk(1, TilePos::new(2, ChunkPos::ORIGIN), &blocks);
-/// assert!(LocalPos::all().any(|pos| tile.get(pos) == blocks.grass));
+/// // Level 2: cells of 4 blocks, so this tile covers 128 x 128 x 128 blocks. Layer 0 holds
+/// // the deep ground, so it has stone.
+/// let tile = generate_lod_chunk(1, TilePos::new(2, ChunkPos::new(0, 0, 0)), &blocks);
+/// assert!(LocalPos::all().any(|pos| tile.get(pos) == blocks.stone));
 /// ```
 pub fn generate_lod_chunk(seed: u32, tile: TilePos, blocks: &TerrainBlocks) -> Chunk {
     let mut chunk = Chunk::new();
@@ -174,20 +254,31 @@ pub fn generate_lod_chunk(seed: u32, tile: TilePos, blocks: &TerrainBlocks) -> C
     let [origin_x, _, origin_z] = tile.origin();
     let base_row = i64::from(tile.pos().y) * CHUNK_SIZE_I64;
     let floor_row = i64::from(WORLD_FLOOR_Y).div_euclid(i64::from(cell));
+    let last = tile.extent() - 1;
+    let landscape = Landscape::for_area(
+        seed,
+        [origin_x, origin_z],
+        [origin_x.saturating_add(last), origin_z.saturating_add(last)],
+    );
+    // HOT PATH: 1,024 column evaluations per tile, the same cost as one chunk; the cells of
+    // a column are written by one loop.
     for z in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
             // Saturating like `generate_chunk`, so a far tile degrades without wrapping.
             let centre_x = origin_x.saturating_add(cell_offset(x, cell));
             let centre_z = origin_z.saturating_add(cell_offset(z, cell));
-            let height = surface_height(seed, centre_x, centre_z);
+            let info = landscape.column(centre_x, centre_z);
             let column = CellColumn {
                 base_row,
-                top_row: i64::from(surface_cell(height, level)),
+                top_row: i64::from(surface_cell(info.top(), level)),
+                ground_row: i64::from(surface_cell(info.ground, level)),
                 floor_row,
-                height,
+                ground: info.ground,
                 cell,
+                layers: Layers::of(&info, blocks),
+                water: blocks.water,
             };
-            fill_cell_column(&mut chunk, x, z, &column, blocks);
+            fill_cell_column(&mut chunk, x, z, &column, blocks.bedrock);
         }
     }
     chunk
@@ -200,35 +291,40 @@ fn cell_offset(index: usize, cell: i32) -> i32 {
     index as i32 * cell + half_cell(cell)
 }
 
+// A tile is scanned for lakes as one area. Tiles are aligned to their own extent, a power of
+// two, so a tile no wider than the lake cells the landscape keeps touches at most that many.
+const _: () =
+    assert!(CHUNK_SIZE_I32 * cell_size(MAX_LOD_LEVEL) <= LAKE_CELL * LAKE_CELLS_PER_AXIS as i32);
+
 /// What [`fill_cell_column`] needs to know about one column of cells.
 struct CellColumn {
     /// Cell row of the tile's lowest cell row.
     base_row: i64,
-    /// Cell row of the surface cell (the grass).
+    /// Cell row of the top cell (the water surface, or the ground cell).
     top_row: i64,
+    /// Cell row of the ground cell, which holds the surface block.
+    ground_row: i64,
     /// Cell row that holds the world floor.
     floor_row: i64,
-    /// Surface height in blocks, sampled at the column's centre.
-    height: i32,
+    /// Ground height in blocks, sampled at the column's centre.
+    ground: i32,
     /// Cell size in blocks.
     cell: i32,
+    /// The blocks of the column's layers.
+    layers: Layers,
+    /// The water block.
+    water: BlockId,
 }
 
-/// Writes the solid cells of one column: rows from the tile's bottom up to the surface cell
+/// Writes the solid cells of one column: rows from the tile's bottom up to the top cell
 /// or the tile's top, whichever is lower. Rows above are left as air.
-fn fill_cell_column(
-    chunk: &mut Chunk,
-    x: usize,
-    z: usize,
-    column: &CellColumn,
-    blocks: &TerrainBlocks,
-) {
+fn fill_cell_column(chunk: &mut Chunk, x: usize, z: usize, column: &CellColumn, bedrock: BlockId) {
     let highest = (column.top_row - column.base_row).min(CHUNK_SIZE_I64 - 1);
     if highest < 0 {
         return;
     }
     for local in 0..=highest {
-        let block = cell_block(column.base_row + local, column, blocks);
+        let block = cell_block(column.base_row + local, column, bedrock);
         // `local` is in `0..32` and `x`, `z` come from the tile loops, so `new` cannot fail;
         // the library never panics, so the impossible case is skipped.
         if let Some(pos) = LocalPos::new(x, local as usize, z) {
@@ -237,23 +333,26 @@ fn fill_cell_column(
     }
 }
 
-/// The block of the solid cell at `row` (at or below the surface cell), see
+/// The block of the solid cell at `row` (at or below the top cell), see
 /// [`generate_lod_chunk`] for the rules.
-fn cell_block(row: i64, column: &CellColumn, blocks: &TerrainBlocks) -> BlockId {
+fn cell_block(row: i64, column: &CellColumn, bedrock: BlockId) -> BlockId {
     if row <= column.floor_row {
-        return blocks.bedrock;
+        return bedrock;
     }
-    if row == column.top_row {
-        return blocks.grass;
+    if row > column.ground_row {
+        return column.water;
+    }
+    if row == column.ground_row {
+        return column.layers.surface;
     }
     let cell = i64::from(column.cell);
     let highest_block = row * cell + (cell - 1);
-    // At most one below the surface: a cell under the top is never grass.
-    let sampled = highest_block.min(i64::from(column.height) - 1);
-    // At least 1 because `sampled <= height - 1`; the conversion cannot fail for heights and
+    // At most one below the ground: a cell under the ground cell is never the surface.
+    let sampled = highest_block.min(i64::from(column.ground) - 1);
+    // At least 1 because `sampled <= ground - 1`; the conversion cannot fail for heights and
     // rows near the world, and the fallback (a very deep cell: stone) is only a guard.
-    let depth = i32::try_from(i64::from(column.height) - sampled).unwrap_or(i32::MAX);
-    block_at_depth(depth, blocks)
+    let depth = i32::try_from(i64::from(column.ground) - sampled).unwrap_or(i32::MAX);
+    block_at_depth(depth, &column.layers)
 }
 
 /// A chunk made of `block` only. The stand-in below a tile (use the bedrock block) so the
@@ -310,13 +409,15 @@ mod tests {
 
     use super::*;
     use crate::bounds::{HIGHEST_CHUNK_LAYER, LOWEST_CHUNK_LAYER};
+    use crate::landscape::ColumnInfo;
     use crate::mesh::identity_textures;
-    use crate::terrain::{TEST_BLOCKS, generate_chunk};
+    use crate::terrain::{TEST_BLOCKS, generate_chunk_without_trees};
 
     const GRASS: BlockId = TEST_BLOCKS.grass;
     const DIRT: BlockId = TEST_BLOCKS.dirt;
     const STONE: BlockId = TEST_BLOCKS.stone;
     const BEDROCK: BlockId = TEST_BLOCKS.bedrock;
+    const WATER: BlockId = TEST_BLOCKS.water;
 
     fn lod(seed: u32, level: u8, x: i32, y: i32, z: i32) -> Chunk {
         generate_lod_chunk(
@@ -351,12 +452,14 @@ mod tests {
                 -1,
                 0,
                 1,
+                2,
+                3,
                 HIGHEST_CHUNK_LAYER,
                 HIGHEST_CHUNK_LAYER + 1,
             ] {
                 for (x, z) in [(0, 0), (-1, 0), (3, -2), (-17, 40), (1000, -1000)] {
                     let pos = ChunkPos::new(x, layer, z);
-                    let expected = generate_chunk(seed, pos, &TEST_BLOCKS);
+                    let expected = generate_chunk_without_trees(seed, pos, &TEST_BLOCKS);
                     let tile = generate_lod_chunk(seed, TilePos::chunk(pos), &TEST_BLOCKS);
                     assert!(same(&expected, &tile), "seed {seed}, chunk {pos:?}");
                 }
@@ -438,151 +541,246 @@ mod tests {
         }
     }
 
-    /// Height of the surface at world column `(x, z)` the way the generator samples it, but
-    /// from a literal world coordinate (never from the tile code under test).
-    fn height_at(seed: u32, x: i32, z: i32) -> i32 {
-        surface_height(seed, x, z)
+    /// The landscape column at a literal world column `(x, z)`, computed on its own (never
+    /// from the tile code under test).
+    fn info_at(seed: u32, x: i32, z: i32) -> ColumnInfo {
+        Landscape::for_area(seed, [x, z], [x, z]).column(x, z)
+    }
+
+    /// The cells of one column of the tile column `(tx, tz)` of `level`, from row 0 of tile
+    /// layer 0 up through the highest layer that can hold terrain: `rows[i]` is cell row `i`.
+    fn cell_column(seed: u32, level: u8, tx: i32, tz: i32, x: usize, z: usize) -> Vec<BlockId> {
+        let mut rows = Vec::new();
+        for layer in tile_layers(level) {
+            let tile = lod(seed, level, tx, layer, tz);
+            rows.extend((0..CHUNK_SIZE).map(|y| at(&tile, x, y, z)));
+        }
+        rows
+    }
+
+    /// Index of the topmost non-air cell of a cell column.
+    fn top_of(rows: &[BlockId]) -> usize {
+        rows.iter().rposition(|b| !b.is_air()).unwrap()
+    }
+
+    /// The world column of the centre of cell `(x, z)` of the level's tile column `(tx, tz)`:
+    /// the tile's origin plus the cell's start plus half a cell, written out by hand.
+    fn centre_of(level: u8, tx: i32, tz: i32, x: usize, z: usize) -> (i32, i32) {
+        let cell = 1_i32 << level;
+        let extent = 32 * cell;
+        (
+            tx * extent + x as i32 * cell + cell / 2,
+            tz * extent + z as i32 * cell + cell / 2,
+        )
     }
 
     #[test]
-    fn cell_columns_sample_the_centre_block_of_the_cell() {
-        // Level 2, tile (1, 0, -1): its origin is block (128, 0, -128), a cell is 4 blocks,
-        // so cell (5, ., 7) has its centre block at x = 128 + 5*4 + 2 = 150 and
-        // z = -128 + 7*4 + 2 = -98.
-        let seed = 7;
-        let tile = lod(seed, 2, 1, 0, -1);
-        let height = height_at(seed, 150, -98);
-        let expected_top = usize::try_from(surface_cell(height, 2)).unwrap();
-        assert_eq!(top_row(&tile, 5, 7), Some(expected_top));
-        assert_eq!(at(&tile, 5, expected_top, 7), GRASS);
-        // And the corner cells: (0, 0) centres at (130, -126), (31, 31) at (254, -2).
-        for ((x, z), (wx, wz)) in [((0, 0), (130, -126)), ((31, 31), (254, -2))] {
-            let row = surface_cell(height_at(seed, wx, wz), 2) as usize;
-            assert_eq!(top_row(&tile, x, z), Some(row), "cell ({x}, {z})");
+    fn tile_layers_reach_the_highest_ground() {
+        assert_eq!(tile_layers(0), 0..=5);
+        assert_eq!(tile_layers(1), 0..=2);
+        assert_eq!(tile_layers(2), 0..=1);
+        assert_eq!(tile_layers(3), 0..=0);
+        assert_eq!(tile_layers(4), 0..=0);
+        for level in 0..=MAX_LOD_LEVEL {
+            // The layer after the last one is air for every column: the highest top cell.
+            let top_cell = i64::from(surface_cell(MAX_SURFACE, level));
+            let last = i64::from(*tile_layers(level).end());
+            assert!(top_cell < (last + 1) * 32 && top_cell >= last * 32);
         }
     }
 
     #[test]
-    fn surface_cell_is_grass_and_cells_below_are_dirt_or_stone() {
+    fn cell_columns_sample_the_centre_block_of_the_cell() {
+        // Level 2, tile (1, ., -1): its origin is block (128, ., -128), a cell is 4 blocks,
+        // so cell (5, ., 7) has its centre block at x = 128 + 5*4 + 2 = 150 and
+        // z = -128 + 7*4 + 2 = -98.
+        let seed = 7;
+        assert_eq!(centre_of(2, 1, -1, 5, 7), (150, -98));
+        for ((x, z), (wx, wz)) in [
+            ((5, 7), (150, -98)),
+            ((0, 0), (130, -126)),
+            ((31, 31), (254, -2)),
+        ] {
+            let top = info_at(seed, wx, wz).top();
+            let rows = cell_column(seed, 2, 1, -1, x, z);
+            assert_eq!(
+                top_of(&rows),
+                surface_cell(top, 2) as usize,
+                "cell ({x}, {z})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ground_cell_is_the_surface_water_is_above_it_and_filler_or_stone_below() {
         for level in 1..=MAX_LOD_LEVEL {
-            let tile = lod(3, level, -2, 0, 5);
-            let mut dirt = 0;
+            let (tx, tz) = (-2, 5);
+            let mut filler = 0;
+            let mut water = 0;
             for z in 0..CHUNK_SIZE {
                 for x in 0..CHUNK_SIZE {
-                    let top = top_row(&tile, x, z).expect("every column has a surface");
-                    assert_eq!(at(&tile, x, top, z), GRASS);
-                    for y in 0..top {
-                        let block = at(&tile, x, y, z);
+                    let (wx, wz) = centre_of(level, tx, tz, x, z);
+                    let info = info_at(3, wx, wz);
+                    let layers = crate::terrain::Layers::of(&info, &TEST_BLOCKS);
+                    let rows = cell_column(3, level, tx, tz, x, z);
+                    let ground = surface_cell(info.ground, level) as usize;
+                    let top = surface_cell(info.top(), level) as usize;
+                    assert_eq!(top_of(&rows), top, "level {level} ({x}, {z})");
+                    assert_eq!(rows[ground], layers.surface, "level {level} ({x}, {z})");
+                    for (row, block) in rows.iter().enumerate().take(top + 1).skip(ground + 1) {
+                        assert_eq!(*block, WATER, "level {level} ({x}, {z}) row {row}");
+                        water += 1;
+                    }
+                    for (row, block) in rows.iter().enumerate().take(ground) {
                         assert!(
-                            block == DIRT || block == STONE,
-                            "level {level} ({x},{y},{z})"
+                            *block == layers.filler || *block == layers.stone || *block == BEDROCK,
+                            "level {level} ({x},{row},{z})"
                         );
-                        dirt += usize::from(block == DIRT);
+                        filler += usize::from(*block == layers.filler);
                     }
                 }
             }
-            // The dirt layer is 3 blocks: the cell under the top is dirt in most columns.
-            assert!(dirt > 0, "level {level}");
+            // The filler layer is 3 blocks: the cell under the surface is filler in most columns.
+            assert!(filler > 0, "level {level}");
+            let _ = water;
         }
     }
 
     #[test]
     fn cells_below_the_surface_follow_the_block_rule_at_their_top_block() {
-        // Independent of `block_at_depth`: dirt if the cell's highest block (capped one
-        // below the surface) is within 3 blocks of the surface, else stone.
+        // Independent of `block_at_depth`: filler if the cell's highest block (capped one
+        // below the ground) is within 3 blocks of the ground, else stone.
         let seed = 5;
         for level in 1..=MAX_LOD_LEVEL {
             let cell = cell_size(level);
-            let tile = lod(seed, level, 0, 0, 0);
-            for z in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
-                    let wx = x as i32 * cell + cell / 2;
-                    let wz = z as i32 * cell + cell / 2;
-                    let height = height_at(seed, wx, wz);
-                    let top = top_row(&tile, x, z).unwrap();
-                    for y in 0..top {
-                        let highest = (y as i32 * cell + cell - 1).min(height - 1);
-                        let expected = if height - highest <= 3 { DIRT } else { STONE };
-                        assert_eq!(at(&tile, x, y, z), expected, "level {level} ({x},{y},{z})");
+            for z in (0..CHUNK_SIZE).step_by(3) {
+                for x in (0..CHUNK_SIZE).step_by(3) {
+                    let (wx, wz) = centre_of(level, 0, 0, x, z);
+                    let info = info_at(seed, wx, wz);
+                    let layers = crate::terrain::Layers::of(&info, &TEST_BLOCKS);
+                    let rows = cell_column(seed, level, 0, 0, x, z);
+                    let ground_row = surface_cell(info.ground, level) as usize;
+                    for (row, block) in rows.iter().enumerate().take(ground_row) {
+                        if (row as i32) * cell <= WORLD_FLOOR_Y {
+                            continue;
+                        }
+                        let highest = (row as i32 * cell + cell - 1).min(info.ground - 1);
+                        let expected = if info.ground - highest <= 3 {
+                            layers.filler
+                        } else {
+                            layers.stone
+                        };
+                        assert_eq!(*block, expected, "level {level} ({x},{row},{z})");
                     }
                 }
             }
         }
     }
 
-    /// The block of cell row `row` of a column with surface height `height` at `level`.
-    fn column_block(height: i32, level: u8, row: i64) -> BlockId {
+    /// The block of cell row `row` of a column with ground height `ground` and top `top` at
+    /// `level`, grass over dirt, with water.
+    fn column_block(ground: i32, top: i32, level: u8, row: i64) -> BlockId {
         let column = CellColumn {
             base_row: 0,
-            top_row: i64::from(surface_cell(height, level)),
+            top_row: i64::from(surface_cell(top, level)),
+            ground_row: i64::from(surface_cell(ground, level)),
             floor_row: WORLD_FLOOR_Y.div_euclid(cell_size(level)).into(),
-            height,
+            ground,
             cell: cell_size(level),
+            layers: crate::terrain::Layers {
+                surface: GRASS,
+                filler: DIRT,
+                stone: STONE,
+            },
+            water: WATER,
         };
-        cell_block(row, &column, &TEST_BLOCKS)
+        cell_block(row, &column, BEDROCK)
     }
 
     #[test]
     fn hand_computed_columns() {
         // Height 21, level 2 (cells of 4): the surface row is (21 + 2) / 4 = 5. Row 4 has its
         // highest block at 19, 2 below the surface: dirt. Row 3: block 15, 6 below: stone.
-        assert_eq!(column_block(21, 2, 5), GRASS);
-        assert_eq!(column_block(21, 2, 4), DIRT);
-        assert_eq!(column_block(21, 2, 3), STONE);
+        assert_eq!(column_block(21, 21, 2, 5), GRASS);
+        assert_eq!(column_block(21, 21, 2, 4), DIRT);
+        assert_eq!(column_block(21, 21, 2, 3), STONE);
         // Height 9, level 1 (cells of 2): surface row (9 + 1) / 2 = 5, whose cell reaches
         // block 11. Row 4 reaches block 9 = the surface, capped to 8 (never grass under the
         // top): dirt. Row 3: block 7, 2 below: dirt. Row 2: block 5, 4 below: stone.
-        assert_eq!(column_block(9, 1, 5), GRASS);
-        assert_eq!(column_block(9, 1, 4), DIRT);
-        assert_eq!(column_block(9, 1, 3), DIRT);
-        assert_eq!(column_block(9, 1, 2), STONE);
+        assert_eq!(column_block(9, 9, 1, 5), GRASS);
+        assert_eq!(column_block(9, 9, 1, 4), DIRT);
+        assert_eq!(column_block(9, 9, 1, 3), DIRT);
+        assert_eq!(column_block(9, 9, 1, 2), STONE);
         // Level 0 is the plain layer rule: height 9, rows 8..=6 dirt, 5 stone.
-        assert_eq!(column_block(9, 0, 9), GRASS);
-        assert_eq!(column_block(9, 0, 6), DIRT);
-        assert_eq!(column_block(9, 0, 5), STONE);
+        assert_eq!(column_block(9, 9, 0, 9), GRASS);
+        assert_eq!(column_block(9, 9, 0, 6), DIRT);
+        assert_eq!(column_block(9, 9, 0, 5), STONE);
+    }
+
+    #[test]
+    fn hand_computed_columns_with_water() {
+        // Ground 61 under water up to 64. Level 0: 62..=64 water, 61 the surface.
+        for row in 62..=64 {
+            assert_eq!(column_block(61, 64, 0, row), WATER);
+        }
+        assert_eq!(column_block(61, 64, 0, 61), GRASS);
+        assert_eq!(column_block(61, 64, 0, 60), DIRT);
+        // Level 2 (cells of 4): ground row (61 + 2) / 4 = 15, top row (64 + 2) / 4 = 16: one
+        // water cell on top of the surface cell; level 3 (cells of 8): both are row 8, so
+        // a shallow river rounds away and shows its bed.
+        assert_eq!(column_block(61, 64, 2, 16), WATER);
+        assert_eq!(column_block(61, 64, 2, 15), GRASS);
+        assert_eq!(column_block(61, 64, 3, 8), GRASS);
+        // A deep sea: ground 30, water 64, level 2: rows 9..=16 are water over the floor cell 8.
+        assert_eq!(column_block(30, 64, 2, 16), WATER);
+        assert_eq!(column_block(30, 64, 2, 9), WATER);
+        assert_eq!(column_block(30, 64, 2, 8), GRASS);
     }
 
     #[test]
     fn tiles_are_fixed_to_the_world_grid() {
         let seed = 11;
-        // Level 1: tile (1, 0, 0) cell (0, 3) has its centre block at x = 64 + 1,
-        // z = 3*2 + 1; tile (-1, 0, 0) cell (31, 0) at x = -64 + 62 + 1 = -1, z = 1.
-        let east = lod(seed, 1, 1, 0, 0);
-        let west = lod(seed, 1, -1, 0, 0);
+        // Level 1: tile (1, ., 0) cell (0, 3) has its centre block at x = 64 + 1,
+        // z = 3*2 + 1; tile (-1, ., 0) cell (31, 0) at x = -64 + 62 + 1 = -1, z = 1.
+        assert_eq!(centre_of(1, 1, 0, 0, 3), (65, 7));
+        assert_eq!(centre_of(1, -1, 0, 31, 0), (-1, 1));
+        let east = cell_column(seed, 1, 1, 0, 0, 3);
+        let west = cell_column(seed, 1, -1, 0, 31, 0);
         assert_eq!(
-            top_row(&east, 0, 3),
-            Some(surface_cell(height_at(seed, 65, 7), 1) as usize)
+            top_of(&east),
+            surface_cell(info_at(seed, 65, 7).top(), 1) as usize
         );
         assert_eq!(
-            top_row(&west, 31, 0),
-            Some(surface_cell(height_at(seed, -1, 1), 1) as usize)
+            top_of(&west),
+            surface_cell(info_at(seed, -1, 1).top(), 1) as usize
         );
     }
 
     #[test]
-    fn border_cells_stay_close_to_the_full_detail_heights() {
-        // A level-1 cell covers two block columns; its row times 2 is within one block of
-        // the height at its centre (rounding), and adjacent block columns of the terrain
-        // differ by at most 3 (seam bound in `terrain`), so it stays within 4 of both.
-        const BOUND: i32 = 4;
-        let seed = 2;
-        let tile = lod(seed, 1, 0, 0, 0);
-        for index in 0..CHUNK_SIZE {
-            for (cx, cz) in [
-                (index, 0),
-                (index, CHUNK_SIZE - 1),
-                (0, index),
-                (CHUNK_SIZE - 1, index),
-            ] {
-                let row = top_row(&tile, cx, cz).unwrap() as i32;
-                for dx in 0..2 {
-                    for dz in 0..2 {
-                        let full = height_at(seed, cx as i32 * 2 + dx, cz as i32 * 2 + dz);
-                        assert!((row * 2 - full).abs() <= BOUND, "cell ({cx}, {cz})");
+    fn level_zero_with_water_and_mountains_equals_the_chunk_in_every_layer_of_a_column() {
+        // The cells of level 0 are the blocks of the tree-less chunk, layer by layer, over a
+        // sea shore and a mountain: every column of chunks that has a span of 3 layers or more.
+        let seed = 1;
+        let mut checked = 0;
+        'scan: for cz in -30..30 {
+            for cx in -30..30 {
+                let span = crate::terrain::column_span(seed, cx, cz);
+                if span.end() - span.start() >= 2 {
+                    for layer in span {
+                        let pos = ChunkPos::new(cx, layer, cz);
+                        let expected =
+                            crate::terrain::generate_chunk_without_trees(seed, pos, &TEST_BLOCKS);
+                        let tile = generate_lod_chunk(seed, TilePos::chunk(pos), &TEST_BLOCKS);
+                        assert!(same(&expected, &tile), "{pos:?}");
+                    }
+                    checked += 1;
+                    if checked == 3 {
+                        break 'scan;
                     }
                 }
             }
         }
+        assert_eq!(checked, 3);
     }
 
     #[test]
@@ -609,7 +807,7 @@ mod tests {
             let below = lod(1, level, 0, floor_layer - 1, 0);
             assert!(LocalPos::all().all(|pos| below.get(pos) == BEDROCK));
             // The first layer that starts above the highest possible surface.
-            let ceiling_layer = (crate::terrain::MAX_SURFACE as i32).div_euclid(extent) + 1;
+            let ceiling_layer = crate::terrain::MAX_SURFACE.div_euclid(extent) + 1;
             for layer in [ceiling_layer, ceiling_layer + 7, i32::MAX] {
                 let above = lod(1, level, 0, layer, 0);
                 assert!(
@@ -744,35 +942,41 @@ mod tests {
         assert!(skirts < mesh.quad_count());
     }
 
-    /// Decision 0015 keeps neighbour-blind skirts while they are under this share of a
-    /// tile's quads (levels 1 to 3).
-    const SKIRT_SHARE_LIMIT: f64 = 0.40;
+    /// The tile layer that holds the highest cell of a tile column: the layer with the surface
+    /// of its crown (the lower layers are solid below it).
+    fn crown_layer(seed: u32, level: u8, x: i32, z: i32) -> i32 {
+        tile_layers(level)
+            .rev()
+            .find(|&layer| {
+                let tile = lod(seed, level, x, layer, z);
+                LocalPos::all().any(|pos| !tile.get(pos).is_air())
+            })
+            .unwrap()
+    }
 
-    /// A level-4 tile is nearly flat (cells of 16 blocks against hills of 16 blocks), so its
-    /// few quads are mostly walls and the share says nothing; it is judged by its absolute
-    /// cost instead. The largest tile over the seeds and the 3 x 3 tiles tested has 45 quads,
-    /// far below the 760 quads of a full-detail chunk; this bound is a round number above
-    /// twice that.
-    const LEVEL_4_MAX_QUADS: usize = 100;
-
-    /// The seeds of the share test.
+    /// The seeds of the skirt test.
     const SHARE_SEEDS: [u32; 5] = [1, 2, 3, 17, 99];
 
+    /// Decision 0017: the most quads of a tile's crown layer over the seeds and tiles tested.
+    /// Measured (the test prints the numbers with `--nocapture`): the most was 1,202 quads at
+    /// level 3 in rugged mountains; the bound is a round number above it.
+    const TILE_MAX_QUADS: usize = 2000;
+
     #[test]
-    fn skirt_share_stays_under_the_limit_at_levels_1_to_3_and_level_4_is_cheap() {
+    fn tiles_stay_far_cheaper_than_a_chunk_at_every_level() {
         for seed in SHARE_SEEDS {
             for level in 1..=MAX_LOD_LEVEL {
                 for x in -1..=1 {
                     for z in -1..=1 {
-                        let mesh = mesh_chunk(&lod(seed, level, x, 0, z));
+                        let layer = crown_layer(seed, level, x, z);
+                        let mesh = mesh_chunk(&lod(seed, level, x, layer, z));
                         let quads = mesh.quad_count();
-                        let share = skirt_quads(&mesh) as f64 / quads as f64;
-                        println!("seed {seed} level {level} ({x},{z}): {quads} quads, {share:.3}");
-                        if level < MAX_LOD_LEVEL {
-                            assert!(share < SKIRT_SHARE_LIMIT, "seed {seed}, level {level}");
-                        } else {
-                            assert!(quads < LEVEL_4_MAX_QUADS, "seed {seed}");
-                        }
+                        let skirts = skirt_quads(&mesh);
+                        println!(
+                            "seed {seed} level {level} ({x},{z}) layer {layer}: {quads} quads, {skirts} skirts"
+                        );
+                        assert!(quads < TILE_MAX_QUADS, "seed {seed}, level {level}");
+                        assert!(skirts <= quads);
                     }
                 }
             }
@@ -795,5 +999,43 @@ mod tests {
         assert_eq!(TilePos::new(u8::MAX, pos).level(), MAX_LOD_LEVEL);
         assert_eq!(TilePos::chunk(pos).level(), 0);
         assert_eq!(TilePos::chunk(pos).pos(), pos);
+    }
+
+    #[test]
+    fn tile_layers_in_skips_the_layers_under_the_sea() {
+        // Level 1 (layers of 64 blocks): the sea level is row 32, the first row of layer 1.
+        assert_eq!(tile_layers_in(1), 1..=2);
+        assert_eq!(tile_layers_in(2), 0..=1);
+        assert_eq!(tile_layers_in(3), 0..=0);
+        assert_eq!(tile_layers_in(4), 0..=0);
+    }
+
+    #[test]
+    fn tile_layer_bounds_count_the_kept_layers() {
+        assert_eq!(tile_layer_bound(0), 1);
+        assert_eq!(tile_layer_bound(1), 2);
+        assert_eq!(tile_layer_bound(2), 2);
+        assert_eq!(tile_layer_bound(3), 1);
+        assert_eq!(tile_layer_bound(MAX_LOD_LEVEL), 1);
+    }
+
+    #[test]
+    fn the_skipped_layers_are_solid_everywhere() {
+        // Every layer of `tile_layers` under `tile_layers_in` is all solid, for tiles of every
+        // level over several seeds and places: no face, so no job and no mesh is needed.
+        for level in 1..=MAX_LOD_LEVEL {
+            let kept = tile_layers_in(level);
+            for seed in [1, 2, 273] {
+                for (x, z) in [(0, 0), (-1, 2), (3, -3), (7, 5), (-9, -9)] {
+                    for layer in tile_layers(level).filter(|l| l < kept.start()) {
+                        let cells = lod(seed, level, x, layer, z);
+                        assert!(
+                            LocalPos::all().all(|p| !cells.get(p).is_air()),
+                            "seed {seed} level {level} ({x}, {z}) layer {layer}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

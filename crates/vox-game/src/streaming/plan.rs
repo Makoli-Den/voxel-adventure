@@ -26,7 +26,7 @@
 
 use std::collections::HashSet;
 
-use vox_world::{ChunkPos, MAX_LOD_LEVEL, TilePos};
+use vox_world::{ChunkPos, MAX_LOD_LEVEL, TilePos, tile_layers_in};
 
 use super::area;
 use super::column::Column;
@@ -53,6 +53,9 @@ pub struct Plan {
     tiles: Vec<Near<TilePos>>,
     /// The same tiles, to look up.
     tile_set: HashSet<TilePos>,
+    /// The selected tile columns (the leaves of level 1 or more, at their selection's layer),
+    /// which are what a column of chunks is covered by.
+    leaf_set: HashSet<TilePos>,
 }
 
 impl Plan {
@@ -67,9 +70,18 @@ impl Plan {
         };
         let (level0, coarse): (Vec<TilePos>, Vec<TilePos>) =
             leaves.into_iter().partition(|tile| tile.level() == 0);
+        let leaf_set = coarse.iter().copied().collect();
+        // Every layer of a tile column that can show a face is a tile of its own, at the
+        // column's distance.
         let tiles: Vec<Near<TilePos>> = coarse
             .into_iter()
-            .map(|tile| (lod::distance_squared(camera, tile), tile))
+            .flat_map(|tile| {
+                let distance = lod::distance_squared(camera, tile);
+                tile_layers_in(tile.level()).map(move |layer| {
+                    let pos = ChunkPos::new(tile.pos().x, layer, tile.pos().z);
+                    (distance, TilePos::new(tile.level(), pos))
+                })
+            })
             .collect();
         let mut plan = Self {
             centre,
@@ -77,6 +89,7 @@ impl Plan {
             columns: Vec::new(),
             leaf_columns: level0.iter().map(|tile| Column::of(tile.pos())).collect(),
             tile_set: tiles.iter().map(|(_, tile)| *tile).collect(),
+            leaf_set,
             tiles,
         };
         plan.columns = plan.wanted_columns(camera);
@@ -129,7 +142,7 @@ impl Plan {
     pub fn covers(&self, column: Column) -> bool {
         (1..=MAX_LOD_LEVEL).any(|level| {
             let pos = ChunkPos::new(column.x >> level, TILE_LAYER, column.z >> level);
-            self.tile_set.contains(&TilePos::new(level, pos))
+            self.leaf_set.contains(&TilePos::new(level, pos))
         })
     }
 }
@@ -219,5 +232,37 @@ mod tests {
         );
         assert!(plan.covers(column));
         assert!(plan.keeps_tile(tile));
+    }
+
+    /// The meshes a plan can make: a column of chunks per level-0 leaf and a mesh per tile
+    /// layer of the tiles of level 1 or more (the layers of the plan, not only the leaves).
+    fn plan_meshes(plan: &Plan) -> usize {
+        plan.leaf_columns.len() + plan.tiles().len()
+    }
+
+    #[test]
+    fn the_real_tile_layer_meshes_of_a_plan_stay_inside_the_budget() {
+        // The budget counts meshes, not leaves: summed over the real layers of the plan, at the
+        // largest radius with its clamped horizon (MAX_LEAVES) and at the game's defaults
+        // (radius 8, horizon 2048: 1,500 meshes).
+        use crate::streaming::lod::{MAX_LEAVES, max_horizon_for};
+        const DEFAULT_BUDGET: usize = 1500;
+        let largest = 16;
+        for (radius, horizon, budget) in [
+            (largest, max_horizon_for(largest), MAX_LEAVES),
+            (RADIUS, DEFAULT_HORIZON_BLOCKS, DEFAULT_BUDGET),
+        ] {
+            for centre in [
+                Column::new(0, 0),
+                Column::new(-37, 51),
+                Column::new(250, -9),
+            ] {
+                let meshes = plan_meshes(&Plan::new(centre, radius, horizon));
+                assert!(
+                    meshes <= budget,
+                    "radius {radius}, horizon {horizon}, {centre:?}: {meshes} > {budget}"
+                );
+            }
+        }
     }
 }

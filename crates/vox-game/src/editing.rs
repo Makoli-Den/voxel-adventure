@@ -116,6 +116,23 @@ pub fn block_for_ray(world: &World, spans: &ColumnSpans, position: [i32; 3]) -> 
     (chunk.y > *span.end()).then_some(BlockId::AIR)
 }
 
+/// What the player's ray passes or hits at `position`: [`block_for_ray`], except that the
+/// `liquid` counts as air, so the ray goes through water and hits what lies under it. That
+/// lets the player dig and build under water; placing against the sea floor puts the block into
+/// the water above it.
+pub fn ray_sees(
+    world: &World,
+    spans: &ColumnSpans,
+    liquid: BlockId,
+    position: [i32; 3],
+) -> Option<BlockId> {
+    block_for_ray(world, spans, position).map(
+        |block| {
+            if block == liquid { BlockId::AIR } else { block }
+        },
+    )
+}
+
 /// The chunks of the loaded columns that the player has written a block into.
 ///
 /// Only these can differ from the generator, so only they can expose a wall of a column that
@@ -374,8 +391,7 @@ mod tests {
     /// The eye of the tests: in the middle of block (0, 1, 0).
     const EYE: [f32; 3] = [0.5, 1.5, 0.5];
 
-    /// The seed of the tests' terrain.
-    const SEED: u32 = 1;
+    use crate::streaming::test_blocks::{SEED, TERRAIN_LAYER};
 
     fn body(eye: [f32; 3]) -> Body {
         Body::from_eye(eye)
@@ -788,10 +804,10 @@ mod tests {
         let streamed = loaded.world.len();
         // The shaft runs down the block column (0, _, 0): a corner of four chunk columns, so its
         // -X and -Z walls lie in the neighbouring columns, and it crosses every layer border.
-        let top = (0..CHUNK_SIZE as i32)
+        let top = terrain_rows()
             .rev()
             .find(|&y| loaded.world.block_at([0, y, 0]) != Some(BlockId::AIR))
-            .expect("the surface lies in layer 0");
+            .expect("the surface lies in the terrain layer");
         let player = body([100.5, 100.5, 100.5]);
         for y in (WORLD_FLOOR_Y..=top).rev() {
             let target = hit([0, y, 0], Face::PosY, 1.0);
@@ -836,20 +852,26 @@ mod tests {
 
         // Memory: the shaft created its own chunk and the two neighbours behind its -X and -Z
         // walls in every layer below the terrain layer, nothing else.
-        let layers_below = usize::try_from(-LOWEST_CHUNK_LAYER).unwrap_or(0);
+        let layers_below = usize::try_from(TERRAIN_LAYER - LOWEST_CHUNK_LAYER).unwrap_or(0);
         assert_eq!(loaded.world.len() - streamed, 3 * layers_below);
     }
 
-    /// The height of the highest solid block of the block column `(x, z)` in layer 0.
+    /// The block heights of the terrain layer.
+    fn terrain_rows() -> std::ops::Range<i32> {
+        let size = CHUNK_SIZE as i32;
+        TERRAIN_LAYER * size..(TERRAIN_LAYER + 1) * size
+    }
+
+    /// The height of the highest solid block of the block column `(x, z)` in the terrain layer.
     fn surface(world: &World, x: i32, z: i32) -> i32 {
-        (0..CHUNK_SIZE as i32)
+        terrain_rows()
             .rev()
             .find(|&y| {
                 world
                     .block_at([x, y, z])
                     .is_some_and(|block| !block.is_air())
             })
-            .expect("the surface lies in layer 0")
+            .expect("the surface lies in the terrain layer")
     }
 
     #[test]
@@ -906,8 +928,10 @@ mod tests {
             &loaded.edited,
             &[neighbour],
         );
-        // Layers -1 and -2 of the neighbour, and the shaft's chunks beside them.
-        assert_eq!(to_remesh.len(), 4);
+        // The neighbour's layers under the terrain layer down to the shaft's bottom layer (-2),
+        // and the shaft's chunks beside them.
+        let layers_under = usize::try_from(TERRAIN_LAYER + 2).unwrap_or(0);
+        assert_eq!(to_remesh.len(), 2 * layers_under);
         for pos in to_remesh {
             assert!(remesh(
                 &terrain,
@@ -920,7 +944,7 @@ mod tests {
         }
 
         // Every wall block under the terrain layer shows its face towards the shaft again.
-        for y in BOTTOM..0 {
+        for y in BOTTOM..TERRAIN_LAYER * 32 {
             let wall = [-1, y, 0];
             assert_eq!(loaded.world.block_at(wall), Some(BLOCKS.stone), "y {y}");
             let chunk = ChunkPos::containing(wall).0;
@@ -1073,10 +1097,10 @@ mod tests {
 
     #[test]
     fn a_ray_from_the_flying_height_reaches_the_terrain() {
-        // The eye at height 60 lies in layer 1, which no column of the area holds.
+        // The eye lies in the layer above the terrain layer, which no column of the area holds.
         let terrain = terrain();
         let loaded = loaded_3x3(&terrain);
-        let eye = [5.5, 60.5, 5.5];
+        let eye = [5.5, (TERRAIN_LAYER + 1) as f32 * 32.0 + 4.5, 5.5];
         let down = [0.0, -1.0, 0.0];
         let reach = 100.0;
         let lookup = |block| block_for_ray(&loaded.world, &loaded.spans, block);
@@ -1092,11 +1116,13 @@ mod tests {
         let terrain = terrain();
         let loaded = loaded_3x3(&terrain);
         let at = |position| block_for_ray(&loaded.world, &loaded.spans, position);
-        assert_eq!(at([5, 40, 5]), Some(BlockId::AIR));
+        let above = (TERRAIN_LAYER + 1) * 32 + 8;
+        let inside = TERRAIN_LAYER * 32;
+        assert_eq!(at([5, above, 5]), Some(BlockId::AIR));
         assert_eq!(at([5, WORLD_CEILING_Y + 100, 5]), Some(BlockId::AIR));
-        assert_eq!(at([5, -5, 5]), None);
-        assert_eq!(at([500, 40, 5]), None);
-        assert_eq!(at([5, 0, 5]), loaded.world.block_at([5, 0, 5]));
+        assert_eq!(at([5, inside - 5, 5]), None);
+        assert_eq!(at([500, above, 5]), None);
+        assert_eq!(at([5, inside, 5]), loaded.world.block_at([5, inside, 5]));
     }
 
     #[test]
@@ -1433,5 +1459,48 @@ mod tests {
         // `docs/mod-api.md` and decision 0014 say 64 per call and 256 per event.
         assert_eq!(vox_mods::MAX_EDITS_PER_CALL, 64);
         assert_eq!(vox_mods::MAX_EDITS_PER_EVENT, 256);
+    }
+
+    /// The water of the ray tests.
+    const WATER: BlockId = BlockId(7);
+
+    #[test]
+    fn the_ray_passes_through_water_and_hits_the_bed() {
+        // A lake over the terrain layer's ground: water in the cells above the surface.
+        let terrain = terrain();
+        let mut loaded = loaded_3x3(&terrain);
+        let ground = surface(&loaded.world, 5, 5);
+        for y in ground + 1..ground + 4 {
+            loaded.world.set_block([5, y, 5], WATER);
+        }
+        let eye = [5.5, (ground + 8) as f32 + 0.5, 5.5];
+        let down = [0.0, -1.0, 0.0];
+        let lookup = |block| ray_sees(&loaded.world, &loaded.spans, WATER, block);
+        let hit = vox_world::raycast_with(lookup, eye, down, 40.0).expect("the ray hits");
+        // The ray ignores the water and targets the ground; a block placed against it goes
+        // into the water above it.
+        assert_eq!(hit.block, [5, ground, 5]);
+        assert_eq!(hit.adjacent(), [5, ground + 1, 5]);
+        // With the water solid for the ray it would have been the top water block.
+        let solid = |block| block_for_ray(&loaded.world, &loaded.spans, block);
+        let hit = vox_world::raycast_with(solid, eye, down, 40.0).expect("the ray hits");
+        assert_eq!(hit.block, [5, ground + 3, 5]);
+    }
+
+    #[test]
+    fn ray_sees_changes_nothing_but_the_liquid_and_the_unknown_stays_unknown() {
+        let terrain = terrain();
+        let loaded = loaded_3x3(&terrain);
+        let below = TERRAIN_LAYER * 32 - 5;
+        // Rock under the span is not in the world: the ray stops there, as before.
+        assert_eq!(
+            ray_sees(&loaded.world, &loaded.spans, WATER, [5, below, 5]),
+            None
+        );
+        let inside = [5, TERRAIN_LAYER * 32, 5];
+        assert_eq!(
+            ray_sees(&loaded.world, &loaded.spans, WATER, inside),
+            block_for_ray(&loaded.world, &loaded.spans, inside)
+        );
     }
 }

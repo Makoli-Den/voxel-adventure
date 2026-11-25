@@ -10,8 +10,11 @@
 //! What counts as solid (decision 0015): everything below the world's floor; every cell of a
 //! column that is not loaded, at any height, so the player never falls into the void while
 //! chunks stream in and cannot leave the loaded area; in a loaded column nothing at or above
-//! the ceiling, any block that is not air, and in a chunk that is not in the world solid below
-//! the column's span and air above it, which is what the generator has there.
+//! the ceiling, any block that is not air or the liquid, and in a chunk that is not in the world
+//! solid below the column's span and air above it, which is what the generator has there.
+//!
+//! The liquid (water, decision 0017) is not solid: the body enters it, sinks slowly and swims up
+//! while the jump key is held.
 
 use vox_world::{BlockId, ChunkPos, WORLD_CEILING_Y, WORLD_FLOOR_Y, World};
 
@@ -58,6 +61,15 @@ pub const WALK_SPEED: f32 = 5.0;
 /// sub-step stays below one block.
 pub const TERMINAL_VELOCITY: f32 = 50.0;
 
+/// Fastest fall in a liquid, in blocks per second: the body sinks slowly instead of dropping.
+pub const LIQUID_FALL_SPEED: f32 = 3.0;
+/// Upward speed while the jump key is held in a liquid, in blocks per second. Below
+/// [`JUMP_SPEED`]: swimming up is slower than leaping, and the body does not shoot out of the
+/// water.
+pub const SWIM_SPEED: f32 = 4.0;
+/// Share of the walking speed that is kept in a liquid: wading is slower than walking.
+pub const LIQUID_WALK_FACTOR: f32 = 0.6;
+
 /// Longest time of one integration sub-step, in seconds. Splitting a frame in equal parts
 /// no longer than this makes the height of a jump nearly the same at every frame rate.
 const MAX_SUBSTEP_TIME: f32 = 1.0 / 60.0;
@@ -70,6 +82,9 @@ pub struct Space<'a> {
     pub world: &'a World,
     /// The span of every loaded column.
     pub spans: &'a ColumnSpans,
+    /// The liquid block (water): the body passes through it. [`BlockId::AIR`] means the world
+    /// has no liquid.
+    pub liquid: BlockId,
 }
 
 /// What the player asks of the body in one step.
@@ -158,12 +173,31 @@ impl Body {
 
     /// One integration step: velocities first, then the three swept moves.
     fn substep(&mut self, space: Space<'_>, input: WalkInput, dt: f32) {
-        if self.on_ground && input.jump {
+        let swimming = self.touches_liquid(space);
+        if swimming && input.jump {
+            // With the head out of the water the stroke becomes a jump, so a swimmer can climb
+            // onto a bank a block above the surface.
+            self.velocity[1] = if self.head_in_liquid(space) {
+                SWIM_SPEED
+            } else {
+                JUMP_SPEED
+            };
+        } else if self.on_ground && input.jump {
             self.velocity[1] = JUMP_SPEED;
         }
-        self.velocity[1] = (self.velocity[1] - GRAVITY * dt).max(-TERMINAL_VELOCITY);
-        self.velocity[0] = input.direction[0] * WALK_SPEED;
-        self.velocity[2] = input.direction[1] * WALK_SPEED;
+        let fall_limit = if swimming {
+            LIQUID_FALL_SPEED
+        } else {
+            TERMINAL_VELOCITY
+        };
+        self.velocity[1] = (self.velocity[1] - GRAVITY * dt).max(-fall_limit);
+        let speed = if swimming {
+            WALK_SPEED * LIQUID_WALK_FACTOR
+        } else {
+            WALK_SPEED
+        };
+        self.velocity[0] = input.direction[0] * speed;
+        self.velocity[2] = input.direction[1] * speed;
 
         // Y first, so `on_ground` describes this step before the sideways moves.
         if self.move_axis(space, 1, self.velocity[1] * dt) {
@@ -223,6 +257,24 @@ impl Body {
         false
     }
 
+    /// Whether the cell of the box's top (the head) holds the liquid, in any of the columns the
+    /// box covers.
+    fn head_in_liquid(&self, space: Space<'_>) -> bool {
+        let (x, z) = (
+            covered_cells(self.min[0], SIZE[0]),
+            covered_cells(self.min[2], SIZE[2]),
+        );
+        let head = covered_cells(self.min[1], SIZE[1]).1;
+        (x.0..=x.1).any(|cx| (z.0..=z.1).any(|cz| is_liquid(space, [cx, head, cz])))
+    }
+
+    /// Whether any cell the box overlaps holds the liquid.
+    fn touches_liquid(&self, space: Space<'_>) -> bool {
+        let [x, y, z] = [0, 1, 2].map(|axis| covered_cells(self.min[axis], SIZE[axis]));
+        (x.0..=x.1)
+            .any(|cx| (y.0..=y.1).any(|cy| (z.0..=z.1).any(|cz| is_liquid(space, [cx, cy, cz]))))
+    }
+
     /// Whether a solid block lies within [`GROUND_PROBE`] below the box.
     fn ground_below(&self, space: Space<'_>) -> bool {
         self.slab_is_solid(space, 1, (self.min[1] - GROUND_PROBE).floor() as i32)
@@ -280,11 +332,17 @@ pub fn is_solid(space: Space<'_>, position: [i32; 3]) -> bool {
         return false;
     }
     if let Some(block) = space.world.block_at(position) {
-        return block != BlockId::AIR;
+        return block != BlockId::AIR && block != space.liquid;
     }
     // A layer inside the span is always in the world once the column is loaded; were one
     // missing, solid keeps the player from falling through it.
     chunk.y <= *span.end()
+}
+
+/// Whether the cell at `position` holds the liquid: a loaded block equal to
+/// [`Space::liquid`] (never air, so a space without liquid has none).
+pub fn is_liquid(space: Space<'_>, position: [i32; 3]) -> bool {
+    space.liquid != BlockId::AIR && space.world.block_at(position) == Some(space.liquid)
 }
 
 #[cfg(test)]
@@ -293,6 +351,8 @@ mod tests {
 
     /// Any solid block: physics only asks whether a cell is air.
     const SOLID: BlockId = BlockId(3);
+    /// The liquid of the tests (water).
+    const LIQUID: BlockId = BlockId(7);
 
     use super::*;
 
@@ -321,6 +381,7 @@ mod tests {
             Space {
                 world: &self.world,
                 spans: &self.spans,
+                liquid: LIQUID,
             }
         }
     }
@@ -331,6 +392,11 @@ mod tests {
     /// The layer-0 chunks of the columns around the origin (-1..=1 in X and Z), each filled by
     /// `fill(world_x, world_y, world_z)`, with every such column loaded with the span of layer 0.
     fn world_with(fill: impl Fn(i32, i32, i32) -> bool) -> Scene {
+        world_with_blocks(|x, y, z| if fill(x, y, z) { SOLID } else { BlockId::AIR })
+    }
+
+    /// Like [`world_with`], with the block of every cell chosen by `fill`.
+    fn world_with_blocks(fill: impl Fn(i32, i32, i32) -> BlockId) -> Scene {
         let mut world = World::new();
         let mut spans = ColumnSpans::default();
         for cx in -1..=1 {
@@ -339,12 +405,9 @@ mod tests {
                 for x in 0..SIDE {
                     for y in 0..SIDE {
                         for z in 0..SIDE {
-                            let (wx, wy, wz) = (cx * SIDE + x, y, cz * SIDE + z);
-                            if fill(wx, wy, wz) {
-                                if let Some(pos) = LocalPos::new(x as usize, y as usize, z as usize)
-                                {
-                                    chunk.set(pos, SOLID);
-                                }
+                            let block = fill(cx * SIDE + x, y, cz * SIDE + z);
+                            if let Some(pos) = LocalPos::new(x as usize, y as usize, z as usize) {
+                                chunk.set(pos, block);
                             }
                         }
                     }
@@ -872,4 +935,183 @@ mod tests {
         assert!(PLAYER_WIDTH < 1.0 && PLAYER_HEIGHT < 2.0);
         assert!(TERMINAL_VELOCITY * MAX_SUBSTEP_TIME < 1.0);
     };
+
+    /// Stone below height 10 and water from 10 up to (not including) 20: a pool 10 deep.
+    fn pool() -> Scene {
+        world_with_blocks(|_, y, _| match y {
+            ..10 => SOLID,
+            10..20 => LIQUID,
+            _ => BlockId::AIR,
+        })
+    }
+
+    /// The vertical velocity of `body`, which only this module reads.
+    fn vertical_speed(body: &Body) -> f32 {
+        body.velocity[1]
+    }
+
+    #[test]
+    fn water_is_not_solid_and_a_body_fits_inside_it() {
+        let world = pool();
+        assert!(!is_solid(world.space(), [0, 15, 0]));
+        assert!(is_liquid(world.space(), [0, 15, 0]));
+        assert!(!is_liquid(world.space(), [0, 25, 0]));
+        assert!(!is_liquid(world.space(), [0, 5, 0]));
+        assert!(body_at([0.5, 12.0, 0.5]).is_free(world.space()));
+        // A space without liquid has none, even where the world holds air (id 0).
+        let none = Space {
+            liquid: BlockId::AIR,
+            ..world.space()
+        };
+        assert!(!is_liquid(none, [0, 25, 0]));
+        // And water is solid again for a space whose liquid is another block.
+        let other = Space {
+            liquid: BlockId(9),
+            ..world.space()
+        };
+        assert!(is_solid(other, [0, 15, 0]));
+    }
+
+    #[test]
+    fn a_body_sinks_slowly_through_water_and_rests_on_the_bed() {
+        let world = pool();
+        let mut body = body_at([0.5, 40.0, 0.5]);
+        // Falls through the air first, then enters the water at the speed of a fall.
+        let mut slowest = 0.0_f32;
+        let mut entered = false;
+        for _ in 0..(6.0 / FRAME) as u32 {
+            body.step(world.space(), WalkInput::default(), FRAME);
+            if feet(&body)[1] < 19.0 {
+                entered = true;
+                slowest = slowest.min(vertical_speed(&body));
+            }
+        }
+        assert!(entered);
+        assert!(
+            slowest >= -LIQUID_FALL_SPEED - EPS,
+            "sank at {slowest} blocks per second"
+        );
+        assert!(body.on_ground());
+        assert!(
+            (feet(&body)[1] - 10.0).abs() < 2.0 * SKIN,
+            "{:?}",
+            feet(&body)
+        );
+    }
+
+    #[test]
+    fn a_fall_into_water_is_cut_to_the_sinking_speed_at_once() {
+        let world = pool();
+        let mut body = body_at([0.5, 60.0, 0.5]);
+        // 40 blocks of air: well above the sinking speed when the water is reached.
+        loop {
+            body.step(world.space(), WalkInput::default(), FRAME);
+            if feet(&body)[1] < 19.5 {
+                break;
+            }
+        }
+        body.step(world.space(), WalkInput::default(), FRAME);
+        assert!(vertical_speed(&body) >= -LIQUID_FALL_SPEED - EPS);
+    }
+
+    #[test]
+    fn the_jump_key_swims_up_to_the_surface_and_holds_the_body_there() {
+        let world = pool();
+        let mut body = body_at([0.5, 10.0, 0.5]);
+        let swim = WalkInput {
+            jump: true,
+            ..WalkInput::default()
+        };
+        run(&mut body, &world, swim, 1.0);
+        // Rising at about SWIM_SPEED: after a second the feet are well up the pool.
+        assert!(
+            feet(&body)[1] > 10.0 + SWIM_SPEED * 0.5,
+            "{:?}",
+            feet(&body)
+        );
+        run(&mut body, &world, swim, 5.0);
+        // At the top the head is out of the water, so each stroke is a jump: the body hops
+        // around the surface (20) and neither sinks to the bed nor leaves for good.
+        let top = feet(&body)[1];
+        assert!((17.0..23.0).contains(&top), "feet at {top}");
+    }
+
+    #[test]
+    fn the_jump_key_on_dry_ground_still_jumps() {
+        let world = flat();
+        let mut body = body_at([0.5, 10.0, 0.5]);
+        run(&mut body, &world, WalkInput::default(), 0.5);
+        let jump = WalkInput {
+            jump: true,
+            ..WalkInput::default()
+        };
+        body.step(world.space(), jump, FRAME);
+        assert!(vertical_speed(&body) > 0.0);
+    }
+
+    #[test]
+    fn wading_is_slower_than_walking() {
+        let walk_distance = |world: &Scene, y: f32| {
+            let mut body = body_at([0.5, y, 0.5]);
+            run(&mut body, world, WalkInput::default(), 0.5);
+            let start = feet(&body)[0];
+            run(&mut body, world, walk(1.0, 0.0), 1.0);
+            feet(&body)[0] - start
+        };
+        let on_land = walk_distance(&flat(), 10.0);
+        let in_water = walk_distance(&pool(), 10.0);
+        assert!((on_land - WALK_SPEED).abs() < 0.2, "{on_land}");
+        assert!(
+            (in_water - WALK_SPEED * LIQUID_WALK_FACTOR).abs() < 0.2,
+            "{in_water}"
+        );
+    }
+
+    #[test]
+    fn a_swimmer_climbs_out_onto_a_bank_one_block_above_the_water() {
+        // The pool from x = 3 on is stone up to height 21: a bank one block over the water
+        // (the surface is 20).
+        let world = world_with_blocks(|x, y, _| match y {
+            ..10 => SOLID,
+            10..20 if x < 3 => LIQUID,
+            20..21 if x >= 3 => SOLID,
+            10..20 => SOLID,
+            _ => BlockId::AIR,
+        });
+        let mut body = body_at([0.5, 12.0, 0.5]);
+        let climb = WalkInput {
+            direction: [1.0, 0.0],
+            jump: true,
+        };
+        run(&mut body, &world, climb, 3.0);
+        assert!(
+            feet(&body)[0] > 3.5,
+            "still in the water at {:?}",
+            feet(&body)
+        );
+        // Let go of the keys (the jump key keeps hopping on dry ground): the body rests on the bank.
+        run(&mut body, &world, WalkInput::default(), 1.0);
+        let at = feet(&body);
+        assert!((at[1] - 21.0).abs() < 2.0 * SKIN, "not on the bank: {at:?}");
+        assert!(body.on_ground());
+    }
+
+    #[test]
+    fn without_a_bank_the_swimmer_cannot_leave_the_water_sideways() {
+        // The same pool with a wall of stone two blocks over the water: the stroke jump
+        // (1.2 blocks) cannot clear it.
+        let world = world_with_blocks(|x, y, _| match y {
+            ..10 => SOLID,
+            10..20 if x < 3 => LIQUID,
+            10..23 => SOLID,
+            _ => BlockId::AIR,
+        });
+        let mut body = body_at([0.5, 12.0, 0.5]);
+        let climb = WalkInput {
+            direction: [1.0, 0.0],
+            jump: true,
+        };
+        run(&mut body, &world, climb, 6.0);
+        assert!(feet(&body)[0] < 3.0, "{:?}", feet(&body));
+    }
 }

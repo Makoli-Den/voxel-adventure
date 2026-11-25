@@ -207,12 +207,25 @@ impl ChunkStreamer {
 pub(crate) mod test_blocks {
     use vox_world::{BlockId, Face, FaceTextures, TerrainBlocks, TextureLayer};
 
-    /// The ids of the tests' blocks: the ones the game's registry hands out.
+    /// The seed of the streaming tests' terrain. At this seed the columns around the origin
+    /// (x -2 to 3, z -3 to 3) are land, plains and forest, every one with the span
+    /// [`TERRAIN_LAYER`] alone (found by a scan, so the tests need no mountains or sea).
+    pub const SEED: u32 = 273;
+    /// The one chunk layer the tests' land lies in (blocks 64 to 95, just over the sea level).
+    pub const TERRAIN_LAYER: i32 = 2;
+
+    /// The ids of the tests' blocks: the first three are the ones the game's registry hands out.
     pub const BLOCKS: TerrainBlocks = TerrainBlocks {
         grass: BlockId(1),
         dirt: BlockId(2),
         stone: BlockId(3),
-        bedrock: BlockId(4),
+        sand: BlockId(4),
+        gravel: BlockId(5),
+        snow: BlockId(6),
+        water: BlockId(7),
+        log: BlockId(8),
+        leaves: BlockId(9),
+        bedrock: BlockId(10),
     };
 
     /// Blocks the tests' texture table covers: air and every id up to the highest terrain
@@ -244,9 +257,7 @@ mod tests {
 
     /// A small radius keeps the test fast: 13 columns.
     const RADIUS: i32 = 2;
-    /// The seed of the tests' terrain.
-    const SEED: u32 = 1;
-    use super::test_blocks::{BLOCKS, face_textures};
+    use super::test_blocks::{BLOCKS, SEED, face_textures};
 
     fn terrain() -> Arc<Terrain> {
         Arc::new(Terrain::new(SEED, BLOCKS, face_textures()))
@@ -390,6 +401,13 @@ mod tests {
         let selected: Vec<TilePos> = lod::select_tiles(centre.chunk(0), RADIUS, TILE_HORIZON)
             .into_iter()
             .filter(|tile| tile.level() >= 1)
+            // Every layer of a tile column is a tile of its own.
+            .flat_map(|tile| {
+                vox_world::tile_layers_in(tile.level()).map(move |layer| {
+                    let pos = ChunkPos::new(tile.pos().x, layer, tile.pos().z);
+                    TilePos::new(tile.level(), pos)
+                })
+            })
             .collect();
         assert!(!selected.is_empty());
         let mut expected = HashMap::new();

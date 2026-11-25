@@ -22,6 +22,18 @@ pub const GRASS_NAME: &str = "base:grass";
 pub const DIRT_NAME: &str = "base:dirt";
 /// Registry name of the stone block.
 pub const STONE_NAME: &str = "base:stone";
+/// Registry name of the sand block (beaches, deserts, shallow sea floors).
+pub const SAND_NAME: &str = "base:sand";
+/// Registry name of the gravel block (the deep sea floor).
+pub const GRAVEL_NAME: &str = "base:gravel";
+/// Registry name of the snow block (the peaks of the mountains).
+pub const SNOW_NAME: &str = "base:snow";
+/// Registry name of the water block (seas, rivers and lakes).
+pub const WATER_NAME: &str = "base:water";
+/// Registry name of the log block (tree trunks).
+pub const LOG_NAME: &str = "base:log";
+/// Registry name of the leaves block (tree crowns).
+pub const LEAVES_NAME: &str = "base:leaves";
 /// Registry name of the bedrock block, the row at the bottom of the world.
 pub const BEDROCK_NAME: &str = "base:bedrock";
 
@@ -118,6 +130,12 @@ impl Content {
             grass: find(GRASS_NAME)?,
             dirt: find(DIRT_NAME)?,
             stone: find(STONE_NAME)?,
+            sand: find(SAND_NAME)?,
+            gravel: find(GRAVEL_NAME)?,
+            snow: find(SNOW_NAME)?,
+            water: find(WATER_NAME)?,
+            log: find(LOG_NAME)?,
+            leaves: find(LEAVES_NAME)?,
             bedrock: find(BEDROCK_NAME)?,
         };
         let start = find(PLACE_BLOCK_NAME)?;
@@ -169,6 +187,12 @@ mod tests {
             { "name": "dirt", "textures": { "all": "base:d.png" } },
             { "name": "grass", "textures": { "all": "base:g.png" } },
             { "name": "stone", "textures": { "all": "base:s.png" } },
+            { "name": "sand", "textures": { "all": "base:s.png" } },
+            { "name": "gravel", "textures": { "all": "base:s.png" } },
+            { "name": "snow", "textures": { "all": "base:s.png" } },
+            { "name": "water", "textures": { "all": "base:s.png" } },
+            { "name": "log", "textures": { "all": "base:s.png" } },
+            { "name": "leaves", "textures": { "all": "base:s.png" } },
             { "name": "bedrock", "textures": { "all": "base:b.png" } } ] }"#;
         let (startup, dir) = stack_with_blocks("reorder", json);
         let result = Content::new(&startup.stack, &startup.blocks_files);
@@ -268,16 +292,30 @@ mod tests {
         let content = content();
         let bedrock = content.terrain.bedrock;
         assert_eq!(content.registry.name(bedrock), Some(BEDROCK_NAME));
-        // Appended, so the ids of every earlier block stayed as they were.
-        assert!(bedrock.0 > content.terrain.stone.0);
-        assert_eq!(usize::from(bedrock.0), content.registry.len() - 1);
+        // Appended after the blocks of the first version (id 8), so the ids of every earlier
+        // block stayed as they were; the landscape blocks come after it.
+        assert_eq!(bedrock, BlockId(8));
+        assert!(content.terrain.water.0 > bedrock.0 && content.terrain.gravel.0 > bedrock.0);
+        assert_eq!(
+            content.registry.name(content.terrain.water),
+            Some(WATER_NAME)
+        );
     }
 
     #[test]
     fn the_new_base_blocks_are_placeable_by_name() {
         let content = content();
         let mut selection = content.selection.clone();
-        for name in ["base:sand", "base:cobblestone", "base:planks", "base:log"] {
+        for name in [
+            "base:sand",
+            "base:cobblestone",
+            "base:planks",
+            "base:log",
+            "base:water",
+            "base:leaves",
+            "base:snow",
+            "base:gravel",
+        ] {
             let id = content.registry.id(name).unwrap();
             let before = selection.clone();
             // Walk the wheel until the block is selected; a block that is not placeable would

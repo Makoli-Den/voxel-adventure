@@ -252,16 +252,28 @@ mod tests {
     /// is drawn by exactly one of a loaded column or a loaded tile, and no column anywhere is
     /// drawn twice.
     fn assert_partition(game: &Game, centre: Column, horizon: i32) {
-        let size = |tile: &TilePos| 1_i32 << tile.level();
         let mut cover_count = std::collections::HashMap::<Column, usize>::new();
+        // Every tile column is drawn by all its layers that can show a face, and counts once.
+        let tile_columns: HashSet<(u8, i32, i32)> = game
+            .tiles
+            .iter()
+            .map(|tile| (tile.level(), tile.pos().x, tile.pos().z))
+            .collect();
         for tile in &game.tiles {
-            assert!(tile.level() >= 1 && tile.pos().y == TILE_LAYER);
-            for dz in 0..size(tile) {
-                for dx in 0..size(tile) {
-                    let column = Column::new(
-                        tile.pos().x * size(tile) + dx,
-                        tile.pos().z * size(tile) + dz,
-                    );
+            assert!(
+                tile.level() >= 1
+                    && vox_world::tile_layers_in(tile.level()).contains(&tile.pos().y)
+            );
+        }
+        for &(level, x, z) in &tile_columns {
+            for layer in vox_world::tile_layers_in(level) {
+                let pos = vox_world::ChunkPos::new(x, layer, z);
+                assert!(game.tiles.contains(&TilePos::new(level, pos)));
+            }
+            let size = 1_i32 << level;
+            for dz in 0..size {
+                for dx in 0..size {
+                    let column = Column::new(x * size + dx, z * size + dz);
                     *cover_count.entry(column).or_default() += 1;
                 }
             }

@@ -22,6 +22,10 @@
         "bottom": "base:textures/block/log_top.png"
       }
     },
-    { "name": "bedrock", "textures": { "all": "base:textures/block/bedrock.png" } }
+    { "name": "bedrock", "textures": { "all": "base:textures/block/bedrock.png" } },
+    { "name": "water", "textures": { "all": "base:textures/block/water.png" } },
+    { "name": "leaves", "textures": { "all": "base:textures/block/leaves.png" } },
+    { "name": "snow", "textures": { "all": "base:textures/block/snow.png" } },
+    { "name": "gravel", "textures": { "all": "base:textures/block/gravel.png" } }
   ]
 }

@@ -17,7 +17,9 @@ use vox_world::{
 };
 use vox_world::{MAX_LOD_LEVEL, TilePos, build_tile_mesh_into, generate_lod_chunk, skirt_quads};
 use vox_world::{Neighbours, build_mesh, build_mesh_into, build_mesh_with_neighbours_into};
-use vox_world::{TerrainBlocks, column_span, generate_chunk, generate_terrain};
+use vox_world::{
+    SEA_LEVEL, TerrainBlocks, column_span, generate_chunk, generate_terrain, spawn_point,
+};
 
 /// The terrain blocks of the benchmarks. Plain ids: the generator only writes numbers, so no
 /// registry is needed to time it.
@@ -25,7 +27,13 @@ const TERRAIN: TerrainBlocks = TerrainBlocks {
     grass: BlockId(1),
     dirt: BlockId(2),
     stone: BlockId(3),
-    bedrock: BlockId(4),
+    sand: BlockId(4),
+    gravel: BlockId(5),
+    snow: BlockId(6),
+    water: BlockId(7),
+    log: BlockId(8),
+    leaves: BlockId(9),
+    bedrock: BlockId(10),
 };
 /// Blocks the benchmark table covers: air and every id up to bedrock, the highest terrain
 /// block (checked below); the solid and checkerboard cases use ids among them.
@@ -182,9 +190,11 @@ const LOD_GENERATE_LEVELS: [u8; 3] = [1, LOD_MESH_LEVEL, MAX_LOD_LEVEL];
 /// Converts a share (0 to 1) to percent for printing.
 const PERCENT: f64 = 100.0;
 
-/// The tile position of the LOD cases: the origin tile of its level, where the terrain lies.
+/// The tile position of the LOD cases: the origin tile column of its level, in the layer that
+/// holds the sea level, where the land and the water surface lie.
 fn lod_tile(level: u8) -> TilePos {
-    TilePos::new(level, ChunkPos::ORIGIN)
+    let extent = TilePos::new(level, ChunkPos::ORIGIN).extent();
+    TilePos::new(level, ChunkPos::new(0, SEA_LEVEL.div_euclid(extent), 0))
 }
 
 /// Times a LOD tile meshed alone (skirts on every side, solid bedrock below), on one reused
@@ -248,15 +258,19 @@ fn bench_mesh_neighbours(c: &mut Criterion) {
 fn bench_terrain(c: &mut Criterion) {
     let mut group = c.benchmark_group("terrain");
     group.throughput(Throughput::Elements(CHUNK_VOLUME as u64));
+    // The chunk with the spawn point (grass, trees), found once: `generate_terrain` also
+    // searches for the spawn point, which would be timed too.
+    let surface = ChunkPos::containing(spawn_point(SEED)).0;
     group.bench_function("generate_seed_1", |b| {
-        b.iter(|| generate_terrain(black_box(SEED), &TERRAIN))
+        b.iter(|| generate_chunk(black_box(SEED), black_box(surface), &TERRAIN))
     });
-    // A chunk away from the origin, with a negative coordinate: the same work, other noise cells.
+    // A chunk of the land layer away from the origin, with a negative coordinate: the same work,
+    // other noise cells.
     group.bench_function("generate_chunk_far", |b| {
         b.iter(|| {
             generate_chunk(
                 black_box(SEED),
-                black_box(ChunkPos::new(3, 0, -2)),
+                black_box(ChunkPos::new(3, 2, -2)),
                 &TERRAIN,
             )
         })
@@ -267,7 +281,7 @@ fn bench_terrain(c: &mut Criterion) {
             b.iter(|| generate_lod_chunk(black_box(SEED), lod_tile(level), &TERRAIN))
         });
     }
-    // The column span: 34 x 34 height samples, the worker's extra cost per column (decision 0015).
+    // The column span: 36 x 36 column evaluations, the worker's extra cost per column (decision 0015).
     group.bench_function("column_span", |b| {
         b.iter(|| column_span(black_box(SEED), black_box(3), black_box(-2)))
     });

@@ -23,22 +23,37 @@ fn grass_dirt_and_stone_keep_ids_one_two_three() {
     assert_eq!(registry.id("base:grass"), Some(BlockId(1)));
     assert_eq!(registry.id("base:dirt"), Some(BlockId(2)));
     assert_eq!(registry.id("base:stone"), Some(BlockId(3)));
-    // Air plus the three terrain blocks plus the blocks only the player places plus bedrock.
-    assert_eq!(registry.len(), 1 + 3 + PLAYER_BLOCKS.len() + 1);
-    for name in PLAYER_BLOCKS {
+    // Air plus the three first terrain blocks plus the blocks listed below, bedrock among them.
+    assert_eq!(registry.len(), 1 + 3 + LATER_BLOCKS.len());
+    for name in LATER_BLOCKS {
         assert!(registry.id(name).is_some(), "{name}");
     }
 }
 
-/// The blocks after grass, dirt and stone, in file order: terrain never places them.
-const PLAYER_BLOCKS: [&str; 4] = ["base:sand", "base:cobblestone", "base:planks", "base:log"];
+/// The blocks after grass, dirt and stone, in file order. The first five existed before the
+/// landscape; bedrock and the four blocks after it (decision 0017) were appended, so no id
+/// moved.
+const LATER_BLOCKS: [&str; 9] = [
+    "base:sand",
+    "base:cobblestone",
+    "base:planks",
+    "base:log",
+    "base:bedrock",
+    "base:water",
+    "base:leaves",
+    "base:snow",
+    "base:gravel",
+];
 
 #[test]
-fn bedrock_comes_last_with_its_own_texture() {
+fn bedrock_keeps_id_eight_with_its_own_texture() {
     let (registry, _) = load_blocks(&built_in()).unwrap();
     let bedrock = registry.id("base:bedrock").unwrap();
-    // Appended after every other block, so no earlier id moved.
-    assert_eq!(usize::from(bedrock.0), registry.len() - 1);
+    // Appended after the blocks of the first version, so no earlier id moved; the landscape
+    // blocks come after it.
+    assert_eq!(bedrock, BlockId(8));
+    assert_eq!(registry.id("base:water"), Some(BlockId(9)));
+    assert_eq!(registry.id("base:gravel"), Some(BlockId(12)));
     let layer = registry.face_textures().get(bedrock, Face::PosY);
     assert_ne!(layer, TextureLayer::MISSING);
     assert_ne!(
@@ -78,6 +93,6 @@ fn grass_has_different_top_side_and_bottom_and_dirt_is_shared() {
     assert_eq!(bottom, layer("base:dirt", Face::PosX));
     assert_ne!(top, TextureLayer::MISSING);
     // Missing + grass_top + grass_side + dirt + stone + sand + cobblestone + planks + log_side
-    // + log_top + bedrock.
-    assert_eq!(textures.len(), 11);
+    // + log_top + bedrock + water + leaves + snow + gravel.
+    assert_eq!(textures.len(), 15);
 }
